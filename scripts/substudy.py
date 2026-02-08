@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import json
+import mimetypes
 import re
 import shlex
 import shutil
@@ -12,8 +14,10 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 try:
     import tomllib
@@ -29,6 +33,9 @@ DEFAULT_LEDGER_CSV = Path("data/master_ledger.csv")
 DEFAULT_TIKTOK_VIDEO_URL = "https://www.tiktok.com/@{handle}/video/{id}"
 DEFAULT_PLAYLIST_END = 200
 DEFAULT_ASR_EXTS = ["srt", "vtt"]
+DEFAULT_WEB_HOST = "127.0.0.1"
+DEFAULT_WEB_PORT = 8876
+WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
 
 
 @dataclass
@@ -1088,6 +1095,45 @@ def create_schema(connection: sqlite3.Connection) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_backfill_state_status ON backfill_state(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS video_favorites (
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, video_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS subtitle_bookmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            track TEXT,
+            start_ms INTEGER NOT NULL,
+            end_ms INTEGER NOT NULL,
+            text TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS video_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (source_id, video_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_video_favorites_created_at
+            ON video_favorites(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
+            ON subtitle_bookmarks(source_id, video_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
+            ON video_notes(source_id, video_id, updated_at DESC);
         """
     )
 
@@ -2388,6 +2434,1052 @@ def resolve_output_path(path_value: Path | None, default_path: Path) -> Path:
     return (Path.cwd() / expanded).resolve()
 
 
+def clamp_int(
+    raw_value: str | None,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if raw_value in (None, ""):
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def encode_path_token(path: Path) -> str:
+    payload = str(path).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_path_token(token: str) -> Path | None:
+    if not token:
+        return None
+    padded = token + ("=" * ((4 - len(token) % 4) % 4))
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        return Path(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def parse_subtitle_timestamp_ms(raw_value: str) -> int | None:
+    raw = raw_value.strip().replace(",", ".")
+    if not raw:
+        return None
+
+    parts = raw.split(":")
+    if len(parts) == 2:
+        hours_str = "0"
+        minutes_str, seconds_str = parts
+    elif len(parts) == 3:
+        hours_str, minutes_str, seconds_str = parts
+    else:
+        return None
+
+    try:
+        hours = int(hours_str)
+        minutes = int(minutes_str)
+        seconds = float(seconds_str)
+    except ValueError:
+        return None
+
+    total_ms = int(round(((hours * 3600) + (minutes * 60) + seconds) * 1000))
+    return max(0, total_ms)
+
+
+def parse_subtitle_cues(subtitle_path: Path) -> list[dict[str, Any]]:
+    try:
+        raw_text = subtitle_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    lines = raw_text.replace("\ufeff", "").splitlines()
+    cues: list[dict[str, Any]] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line or line.upper() == "WEBVTT":
+            index += 1
+            continue
+
+        if line.isdigit() and index + 1 < len(lines) and "-->" in lines[index + 1]:
+            index += 1
+            line = lines[index].strip()
+
+        if "-->" not in line:
+            index += 1
+            continue
+
+        start_raw, end_raw = [part.strip() for part in line.split("-->", 1)]
+        start_token = start_raw.split()[0] if start_raw else ""
+        end_token = end_raw.split()[0] if end_raw else ""
+        start_ms = parse_subtitle_timestamp_ms(start_token)
+        end_ms = parse_subtitle_timestamp_ms(end_token)
+        index += 1
+
+        cue_lines: list[str] = []
+        while index < len(lines):
+            cue_line = lines[index].strip()
+            if not cue_line:
+                index += 1
+                break
+            cue_lines.append(cue_line)
+            index += 1
+
+        if start_ms is None or end_ms is None:
+            continue
+        if end_ms < start_ms:
+            start_ms, end_ms = end_ms, start_ms
+
+        cue_text = re.sub(r"<[^>]+>", "", " ".join(cue_lines)).strip()
+        if not cue_text:
+            continue
+        cues.append(
+            {
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "text": cue_text,
+            }
+        )
+
+    return cues
+
+
+def format_ms_to_clock(total_ms: int) -> str:
+    safe_ms = max(0, int(total_ms))
+    total_seconds = safe_ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def collect_video_tracks(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+) -> list[dict[str, str]]:
+    tracks: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+
+    asr_row = connection.execute(
+        """
+        SELECT output_path
+        FROM asr_runs
+        WHERE source_id = ?
+          AND video_id = ?
+          AND status = 'success'
+          AND output_path IS NOT NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (source_id, video_id),
+    ).fetchone()
+    if asr_row is not None:
+        asr_path = Path(str(asr_row[0]))
+        asr_key = str(asr_path)
+        if asr_path.exists() and asr_path.is_file() and asr_key not in seen_paths:
+            seen_paths.add(asr_key)
+            tracks.append(
+                {
+                    "track_id": f"asr:{encode_path_token(asr_path)}",
+                    "kind": "asr",
+                    "label": "ASR",
+                    "path": asr_key,
+                }
+            )
+
+    subtitle_rows = connection.execute(
+        """
+        SELECT language, subtitle_path, ext
+        FROM subtitles
+        WHERE source_id = ?
+          AND video_id = ?
+        ORDER BY language COLLATE NOCASE ASC, subtitle_path ASC
+        """,
+        (source_id, video_id),
+    ).fetchall()
+    for language, subtitle_path_value, ext in subtitle_rows:
+        subtitle_path = Path(str(subtitle_path_value))
+        subtitle_key = str(subtitle_path)
+        if not subtitle_path.exists() or not subtitle_path.is_file():
+            continue
+        if subtitle_key in seen_paths:
+            continue
+        seen_paths.add(subtitle_key)
+        language_label = str(language).strip() if language not in (None, "") else ""
+        ext_label = str(ext).upper() if ext not in (None, "") else subtitle_path.suffix.lstrip(".").upper()
+        label = language_label or f"TikTok ({ext_label or 'SUB'})"
+        tracks.append(
+            {
+                "track_id": f"subtitle:{encode_path_token(subtitle_path)}",
+                "kind": "subtitle",
+                "label": label,
+                "path": subtitle_key,
+            }
+        )
+
+    return tracks
+
+
+def get_track_for_video(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+    track_id: str | None,
+) -> dict[str, str] | None:
+    tracks = collect_video_tracks(connection, source_id, video_id)
+    if not tracks:
+        return None
+    if not track_id:
+        return tracks[0]
+    for track in tracks:
+        if track["track_id"] == track_id:
+            return track
+    return None
+
+
+def serialize_bookmark_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        source_id = str(row["source_id"])
+        video_id = str(row["video_id"])
+        bookmark_id = int(row["id"])
+        track = row["track"]
+        start_ms = int(row["start_ms"])
+        end_ms = int(row["end_ms"])
+        text_value = row["text"]
+        note_value = row["note"]
+        created_at = str(row["created_at"])
+    else:
+        (
+            bookmark_id,
+            source_id,
+            video_id,
+            track,
+            start_ms,
+            end_ms,
+            text_value,
+            note_value,
+            created_at,
+        ) = row
+
+    return {
+        "id": int(bookmark_id),
+        "source_id": str(source_id),
+        "video_id": str(video_id),
+        "track": None if track in (None, "") else str(track),
+        "start_ms": int(start_ms),
+        "end_ms": int(end_ms),
+        "start_label": format_ms_to_clock(int(start_ms)),
+        "end_label": format_ms_to_clock(int(end_ms)),
+        "text": "" if text_value in (None, "") else str(text_value),
+        "note": "" if note_value in (None, "") else str(note_value),
+        "created_at": str(created_at),
+    }
+
+
+def build_web_handler(
+    db_path: Path,
+    static_dir: Path,
+    allowed_source_ids: set[str],
+) -> type[BaseHTTPRequestHandler]:
+    static_root = static_dir.resolve()
+
+    class SubstudyWebHandler(BaseHTTPRequestHandler):
+        server_version = "SubstudyWeb/0.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            sys.stderr.write(
+                f"[web] {self.address_string()} - {fmt % args}\n"
+            )
+
+        def _open_connection(self) -> sqlite3.Connection:
+            connection = sqlite3.connect(str(db_path))
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+
+        def _read_json_body(self) -> dict[str, Any]:
+            raw_length = self.headers.get("Content-Length", "0")
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                content_length = 0
+            if content_length <= 0:
+                return {}
+            raw_body = self.rfile.read(content_length)
+            if not raw_body:
+                return {}
+            try:
+                parsed = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid JSON body: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("JSON body must be an object.")
+            return parsed
+
+        def _send_json(self, payload: Any, status: int = 200) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_error_json(self, status: int, message: str) -> None:
+            self._send_json(
+                {
+                    "error": message,
+                },
+                status=status,
+            )
+
+        def _serve_static_file(self, relative_path: str) -> None:
+            target_path = (static_root / relative_path).resolve()
+            if not str(target_path).startswith(str(static_root)):
+                self._send_error_json(403, "Access denied.")
+                return
+            if not target_path.exists() or not target_path.is_file():
+                self._send_error_json(404, "File not found.")
+                return
+            try:
+                payload = target_path.read_bytes()
+            except OSError:
+                self._send_error_json(500, "Failed to read static file.")
+                return
+
+            content_type = mimetypes.guess_type(str(target_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", f"{content_type}; charset=utf-8" if content_type.startswith("text/") else content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _serve_media_file(self, token: str) -> None:
+            media_path = decode_path_token(token)
+            if media_path is None or not media_path.exists() or not media_path.is_file():
+                self._send_error_json(404, "Media file not found.")
+                return
+
+            try:
+                stat = media_path.stat()
+            except OSError:
+                self._send_error_json(500, "Failed to inspect media file.")
+                return
+
+            file_size = stat.st_size
+            start = 0
+            end = file_size - 1
+            status_code = 200
+
+            range_header = self.headers.get("Range", "").strip()
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                if not match:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                start_token, end_token = match.groups()
+                try:
+                    if start_token and end_token:
+                        start = int(start_token)
+                        end = int(end_token)
+                    elif start_token:
+                        start = int(start_token)
+                        end = file_size - 1
+                    elif end_token:
+                        suffix_size = int(end_token)
+                        start = max(0, file_size - suffix_size)
+                        end = file_size - 1
+                except ValueError:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+
+                if start < 0 or end < start or start >= file_size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{file_size}")
+                    self.end_headers()
+                    return
+                end = min(end, file_size - 1)
+                status_code = 206
+
+            content_length = (end - start) + 1
+            content_type = mimetypes.guess_type(str(media_path))[0] or "application/octet-stream"
+
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(content_length))
+            if status_code == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.end_headers()
+
+            try:
+                with media_path.open("rb") as file:
+                    file.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = file.read(min(1024 * 128, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except OSError:
+                return
+
+        def _is_source_allowed(self, source_id: str) -> bool:
+            if not allowed_source_ids:
+                return True
+            return source_id in allowed_source_ids
+
+        def _normalize_source(self, source_id: Any) -> str | None:
+            if source_id in (None, ""):
+                return None
+            normalized = str(source_id).strip()
+            if not normalized:
+                return None
+            return normalized
+
+        def _fetch_bookmark_by_id(
+            self,
+            connection: sqlite3.Connection,
+            bookmark_id: int,
+        ) -> sqlite3.Row | None:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    source_id,
+                    video_id,
+                    track,
+                    start_ms,
+                    end_ms,
+                    text,
+                    note,
+                    created_at
+                FROM subtitle_bookmarks
+                WHERE id = ?
+                """,
+                (bookmark_id,),
+            ).fetchone()
+
+        def _handle_api_feed(self, query: dict[str, list[str]]) -> None:
+            source_filter = self._normalize_source(query.get("source_id", [None])[0])
+            if source_filter and not self._is_source_allowed(source_filter):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
+            offset = clamp_int(query.get("offset", [None])[0], default=0, minimum=0, maximum=20000)
+
+            where_clauses = [
+                "v.has_media = 1",
+                "v.media_path IS NOT NULL",
+            ]
+            params: list[Any] = []
+            if allowed_source_ids:
+                placeholders = ",".join("?" for _ in sorted(allowed_source_ids))
+                where_clauses.append(f"v.source_id IN ({placeholders})")
+                params.extend(sorted(allowed_source_ids))
+            if source_filter:
+                where_clauses.append("v.source_id = ?")
+                params.append(source_filter)
+
+            with self._open_connection() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        v.source_id,
+                        v.video_id,
+                        v.title,
+                        v.description,
+                        v.uploader,
+                        v.upload_date,
+                        v.duration,
+                        v.webpage_url,
+                        v.media_path,
+                        COALESCE(vf.created_at, '') AS favorite_created_at,
+                        CASE
+                            WHEN vf.video_id IS NULL THEN 0
+                            ELSE 1
+                        END AS is_favorite,
+                        COALESCE(vn.note, '') AS video_note
+                    FROM videos v
+                    LEFT JOIN video_favorites vf
+                      ON vf.source_id = v.source_id
+                     AND vf.video_id = v.video_id
+                    LEFT JOIN video_notes vn
+                      ON vn.source_id = v.source_id
+                     AND vn.video_id = v.video_id
+                    WHERE {" AND ".join(where_clauses)}
+                    ORDER BY
+                        COALESCE(v.upload_date, '') DESC,
+                        v.video_id DESC
+                    LIMIT ?
+                    OFFSET ?
+                    """,
+                    (*params, limit, offset),
+                ).fetchall()
+
+                source_where_clauses = [
+                    "has_media = 1",
+                    "media_path IS NOT NULL",
+                ]
+                source_params: list[Any] = []
+                if allowed_source_ids:
+                    placeholders = ",".join("?" for _ in sorted(allowed_source_ids))
+                    source_where_clauses.append(f"source_id IN ({placeholders})")
+                    source_params.extend(sorted(allowed_source_ids))
+                source_rows = connection.execute(
+                    f"""
+                    SELECT DISTINCT source_id
+                    FROM videos
+                    WHERE {" AND ".join(source_where_clauses)}
+                    ORDER BY source_id ASC
+                    """,
+                    tuple(source_params),
+                ).fetchall()
+                source_ids = [str(row["source_id"]) for row in source_rows]
+
+                videos: list[dict[str, Any]] = []
+                for row in rows:
+                    media_path_value = row["media_path"]
+                    if media_path_value in (None, ""):
+                        continue
+                    media_path = Path(str(media_path_value))
+                    if not media_path.exists() or not media_path.is_file():
+                        continue
+
+                    source_id = str(row["source_id"])
+                    video_id = str(row["video_id"])
+                    tracks = collect_video_tracks(connection, source_id, video_id)
+                    public_tracks = [
+                        {
+                            "track_id": track["track_id"],
+                            "kind": track["kind"],
+                            "label": track["label"],
+                        }
+                        for track in tracks
+                    ]
+                    videos.append(
+                        {
+                            "source_id": source_id,
+                            "video_id": video_id,
+                            "title": "" if row["title"] in (None, "") else str(row["title"]),
+                            "description": (
+                                ""
+                                if row["description"] in (None, "")
+                                else str(row["description"])
+                            ),
+                            "uploader": "" if row["uploader"] in (None, "") else str(row["uploader"]),
+                            "upload_date": "" if row["upload_date"] in (None, "") else str(row["upload_date"]),
+                            "duration": safe_float(row["duration"]),
+                            "webpage_url": (
+                                ""
+                                if row["webpage_url"] in (None, "")
+                                else str(row["webpage_url"])
+                            ),
+                            "media_url": f"/media/{encode_path_token(media_path)}",
+                            "is_favorite": bool(row["is_favorite"]),
+                            "favorite_created_at": (
+                                ""
+                                if row["favorite_created_at"] in (None, "")
+                                else str(row["favorite_created_at"])
+                            ),
+                            "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
+                            "tracks": public_tracks,
+                            "default_track": public_tracks[0]["track_id"] if public_tracks else None,
+                        }
+                    )
+
+            self._send_json(
+                {
+                    "videos": videos,
+                    "count": len(videos),
+                    "sources": source_ids,
+                }
+            )
+
+        def _handle_api_subtitles(self, query: dict[str, list[str]]) -> None:
+            source_id = self._normalize_source(query.get("source_id", [None])[0])
+            video_id = self._normalize_source(query.get("video_id", [None])[0])
+            track_id = self._normalize_source(query.get("track", [None])[0])
+
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            with self._open_connection() as connection:
+                track = get_track_for_video(connection, source_id, video_id, track_id)
+                if track is None:
+                    self._send_json(
+                        {
+                            "source_id": source_id,
+                            "video_id": video_id,
+                            "track_id": None,
+                            "label": "",
+                            "kind": "",
+                            "cues": [],
+                        }
+                    )
+                    return
+
+                track_path = Path(track["path"])
+                cues = parse_subtitle_cues(track_path)
+                self._send_json(
+                    {
+                        "source_id": source_id,
+                        "video_id": video_id,
+                        "track_id": track["track_id"],
+                        "label": track["label"],
+                        "kind": track["kind"],
+                        "cues": cues,
+                    }
+                )
+
+        def _handle_api_bookmarks_get(self, query: dict[str, list[str]]) -> None:
+            source_id = self._normalize_source(query.get("source_id", [None])[0])
+            video_id = self._normalize_source(query.get("video_id", [None])[0])
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+            limit = clamp_int(query.get("limit", [None])[0], default=200, minimum=1, maximum=1000)
+
+            with self._open_connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        source_id,
+                        video_id,
+                        track,
+                        start_ms,
+                        end_ms,
+                        text,
+                        note,
+                        created_at
+                    FROM subtitle_bookmarks
+                    WHERE source_id = ?
+                      AND video_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (source_id, video_id, limit),
+                ).fetchall()
+            bookmarks = [serialize_bookmark_row(row) for row in rows]
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "bookmarks": bookmarks,
+                }
+            )
+
+        def _validate_video_exists(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+        ) -> bool:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM videos
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            return row is not None
+
+        def _handle_api_toggle_favorite(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+
+                existing = connection.execute(
+                    """
+                    SELECT 1
+                    FROM video_favorites
+                    WHERE source_id = ?
+                      AND video_id = ?
+                    LIMIT 1
+                    """,
+                    (source_id, video_id),
+                ).fetchone()
+                if existing is None:
+                    created_at = now_utc_iso()
+                    connection.execute(
+                        """
+                        INSERT INTO video_favorites(source_id, video_id, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (source_id, video_id, created_at),
+                    )
+                    favorited = True
+                else:
+                    connection.execute(
+                        """
+                        DELETE FROM video_favorites
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        """,
+                        (source_id, video_id),
+                    )
+                    favorited = False
+                    created_at = ""
+                connection.commit()
+
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "is_favorite": favorited,
+                    "created_at": created_at,
+                }
+            )
+
+        def _handle_api_upsert_video_note(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            note = "" if payload.get("note") in (None, "") else str(payload.get("note"))
+
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+
+                now_iso = now_utc_iso()
+                if note.strip():
+                    connection.execute(
+                        """
+                        INSERT INTO video_notes (
+                            source_id,
+                            video_id,
+                            note,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(source_id, video_id) DO UPDATE SET
+                            note = excluded.note,
+                            updated_at = excluded.updated_at
+                        """,
+                        (source_id, video_id, note, now_iso, now_iso),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        DELETE FROM video_notes
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        """,
+                        (source_id, video_id),
+                    )
+                connection.commit()
+
+                row = connection.execute(
+                    """
+                    SELECT note, created_at, updated_at
+                    FROM video_notes
+                    WHERE source_id = ?
+                      AND video_id = ?
+                    """,
+                    (source_id, video_id),
+                ).fetchone()
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "note": "" if row is None else str(row["note"]),
+                    "created_at": "" if row is None else str(row["created_at"]),
+                    "updated_at": "" if row is None else str(row["updated_at"]),
+                }
+            )
+
+        def _handle_api_create_bookmark(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            track = self._normalize_source(payload.get("track"))
+            text_value = "" if payload.get("text") in (None, "") else str(payload.get("text"))
+            note_value = "" if payload.get("note") in (None, "") else str(payload.get("note"))
+
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+            try:
+                start_ms = int(payload.get("start_ms"))
+                end_ms = int(payload.get("end_ms"))
+            except (TypeError, ValueError):
+                self._send_error_json(400, "start_ms and end_ms must be integers.")
+                return
+            if end_ms < start_ms:
+                start_ms, end_ms = end_ms, start_ms
+            start_ms = max(0, start_ms)
+            end_ms = max(start_ms, end_ms)
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+                if track:
+                    valid_track = get_track_for_video(connection, source_id, video_id, track)
+                    if valid_track is None:
+                        self._send_error_json(400, "track is invalid for this video.")
+                        return
+
+                created_at = now_utc_iso()
+                cursor = connection.execute(
+                    """
+                    INSERT INTO subtitle_bookmarks (
+                        source_id,
+                        video_id,
+                        track,
+                        start_ms,
+                        end_ms,
+                        text,
+                        note,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_id,
+                        video_id,
+                        track,
+                        start_ms,
+                        end_ms,
+                        text_value,
+                        note_value,
+                        created_at,
+                    ),
+                )
+                bookmark_id = cursor.lastrowid
+                if bookmark_id is None:
+                    self._send_error_json(500, "Failed to create bookmark.")
+                    return
+                connection.commit()
+                row = self._fetch_bookmark_by_id(connection, int(bookmark_id))
+            if row is None:
+                self._send_error_json(500, "Failed to read created bookmark.")
+                return
+            self._send_json(
+                {
+                    "bookmark": serialize_bookmark_row(row),
+                },
+                status=201,
+            )
+
+        def _handle_api_update_bookmark_note(self, bookmark_id: int) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            note_value = "" if payload.get("note") in (None, "") else str(payload.get("note"))
+            with self._open_connection() as connection:
+                existing = self._fetch_bookmark_by_id(connection, bookmark_id)
+                if existing is None:
+                    self._send_error_json(404, "Bookmark not found.")
+                    return
+                source_id = str(existing["source_id"])
+                if not self._is_source_allowed(source_id):
+                    self._send_error_json(403, "Source is not allowed.")
+                    return
+                connection.execute(
+                    """
+                    UPDATE subtitle_bookmarks
+                    SET note = ?
+                    WHERE id = ?
+                    """,
+                    (note_value, bookmark_id),
+                )
+                connection.commit()
+                updated = self._fetch_bookmark_by_id(connection, bookmark_id)
+            if updated is None:
+                self._send_error_json(500, "Failed to update bookmark.")
+                return
+            self._send_json(
+                {
+                    "bookmark": serialize_bookmark_row(updated),
+                }
+            )
+
+        def _handle_api_delete_bookmark(self, bookmark_id: int) -> None:
+            with self._open_connection() as connection:
+                existing = self._fetch_bookmark_by_id(connection, bookmark_id)
+                if existing is None:
+                    self._send_error_json(404, "Bookmark not found.")
+                    return
+                source_id = str(existing["source_id"])
+                if not self._is_source_allowed(source_id):
+                    self._send_error_json(403, "Source is not allowed.")
+                    return
+
+                connection.execute(
+                    "DELETE FROM subtitle_bookmarks WHERE id = ?",
+                    (bookmark_id,),
+                )
+                connection.commit()
+            self._send_json(
+                {
+                    "deleted": True,
+                    "id": bookmark_id,
+                }
+            )
+
+        def do_GET(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            try:
+                if path in ("/", "/index.html"):
+                    self._serve_static_file("index.html")
+                    return
+                if path == "/app.js":
+                    self._serve_static_file("app.js")
+                    return
+                if path == "/styles.css":
+                    self._serve_static_file("styles.css")
+                    return
+                if path.startswith("/media/"):
+                    token = path[len("/media/") :]
+                    self._serve_media_file(token)
+                    return
+                if path == "/api/feed":
+                    self._handle_api_feed(query)
+                    return
+                if path == "/api/subtitles":
+                    self._handle_api_subtitles(query)
+                    return
+                if path == "/api/bookmarks":
+                    self._handle_api_bookmarks_get(query)
+                    return
+                self._send_error_json(404, "Not found.")
+            except BrokenPipeError:
+                return
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_error_json(500, f"Unexpected server error: {exc}")
+
+        def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                if path == "/api/favorites/toggle":
+                    self._handle_api_toggle_favorite()
+                    return
+                if path == "/api/video-note":
+                    self._handle_api_upsert_video_note()
+                    return
+                if path == "/api/bookmarks":
+                    self._handle_api_create_bookmark()
+                    return
+                note_match = re.fullmatch(r"/api/bookmarks/(\d+)/note", path)
+                if note_match:
+                    self._handle_api_update_bookmark_note(int(note_match.group(1)))
+                    return
+                self._send_error_json(404, "Not found.")
+            except BrokenPipeError:
+                return
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_error_json(500, f"Unexpected server error: {exc}")
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                match = re.fullmatch(r"/api/bookmarks/(\d+)", path)
+                if match:
+                    self._handle_api_delete_bookmark(int(match.group(1)))
+                    return
+                self._send_error_json(404, "Not found.")
+            except BrokenPipeError:
+                return
+            except Exception as exc:  # pragma: no cover - defensive
+                self._send_error_json(500, f"Unexpected server error: {exc}")
+
+    return SubstudyWebHandler
+
+
+def run_web_ui(
+    db_path: Path,
+    source_ids: list[str],
+    host: str,
+    port: int,
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db_path)) as bootstrap_connection:
+        create_schema(bootstrap_connection)
+        bootstrap_connection.commit()
+
+    if not WEB_STATIC_DIR.exists():
+        raise FileNotFoundError(f"Web static directory not found: {WEB_STATIC_DIR}")
+
+    handler_cls = build_web_handler(
+        db_path=db_path,
+        static_dir=WEB_STATIC_DIR,
+        allowed_source_ids=set(source_ids),
+    )
+    server = ThreadingHTTPServer((host, port), handler_cls)
+    print(f"[web] serving on http://{host}:{port}")
+    print(f"[web] sources: {', '.join(sorted(source_ids))}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[web] stopped")
+    finally:
+        server.server_close()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Substudy sync and ledger tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2491,6 +3583,16 @@ def parse_args() -> argparse.Namespace:
     )
     downloads_parser.add_argument("--ledger-db", type=Path)
 
+    web_parser = subparsers.add_parser(
+        "web",
+        help="Run local TikTok-style study web UI",
+    )
+    web_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    web_parser.add_argument("--source", action="append", dest="sources")
+    web_parser.add_argument("--ledger-db", type=Path)
+    web_parser.add_argument("--host", default=DEFAULT_WEB_HOST)
+    web_parser.add_argument("--port", type=int, default=DEFAULT_WEB_PORT)
+
     return parser.parse_args()
 
 
@@ -2579,6 +3681,15 @@ def main() -> int:
             db_path=ledger_db_path,
             since_hours=max(1, args.since_hours),
             limit=max(1, args.limit),
+        )
+        return 0
+
+    if args.command == "web":
+        run_web_ui(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            host=str(args.host),
+            port=max(1, min(65535, int(args.port))),
         )
         return 0
 

@@ -11,13 +11,17 @@ Local-first workflow for English study from downloaded short videos.
   - maintaining a master ledger (`SQLite` + `CSV`)
   - incremental ASR subtitle generation
   - download run/error tracking for retry-safe operations
+  - local TikTok-style study web UI (`web`) with favorites/bookmarks/notes
 - macOS automation with two launchd jobs:
   - daily incremental run
   - weekly full-ledger run
 
 ## Layout
 
-- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `downloads`)
+- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `downloads`, `web`)
+- `scripts/web/index.html`: study UI shell
+- `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
+- `scripts/web/styles.css`: TikTok-style vertical feed design
 - `scripts/run_daily_sync.sh`: daily incremental wrapper
 - `scripts/run_weekly_full_sync.sh`: weekly full wrapper (includes `brew upgrade yt-dlp`)
 - `scripts/install_launchd.sh`: install/update launchd jobs
@@ -70,6 +74,33 @@ python3 scripts/substudy.py downloads --since-hours 24
 ```bash
 python3 scripts/substudy.py sync --full-ledger
 ```
+
+8. Launch local study web UI:
+
+```bash
+python3 scripts/substudy.py web --host 127.0.0.1 --port 8876
+```
+
+Open `http://127.0.0.1:8876`.
+
+## Web study features (MVP)
+
+- 9:16 vertical video feed with up/down navigation (`↑/↓`, `J/K`, wheel, swipe)
+- Auto-advance on video end with 3-second countdown and cancel button
+- Continuous playback toggle (`A`)
+- Subtitle overlay + selectable track
+- Subtitle bookmarks:
+  - save current subtitle (`B`)
+  - save playback range (`R` start, `T` save)
+  - bookmark memo per entry
+- Video favorite toggle (`F`)
+- Video memo save
+
+Learning tables added to the same SQLite ledger:
+
+- `video_favorites(source_id, video_id, created_at)`
+- `subtitle_bookmarks(id, source_id, video_id, track, start_ms, end_ms, text, note, created_at)`
+- `video_notes(id, source_id, video_id, note, created_at, updated_at)`
 
 ## Settings that matter
 

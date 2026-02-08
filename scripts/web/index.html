@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Substudy Feed</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="bg-orb bg-orb-a" aria-hidden="true"></div>
+    <div class="bg-orb bg-orb-b" aria-hidden="true"></div>
+
+    <div class="app-shell">
+      <header class="top-bar">
+        <div>
+          <p class="eyebrow">Substudy</p>
+          <h1>TikTok-Style Study Feed</h1>
+        </div>
+        <div class="top-actions">
+          <label class="source-filter">
+            <span>Source</span>
+            <select id="sourceSelect"></select>
+          </label>
+          <button id="autoplayToggle" class="ghost-btn" type="button">連続再生: ON</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="player-column" aria-label="Video Feed">
+          <div class="phone-shell" id="phoneShell">
+            <video id="videoPlayer" playsinline preload="metadata"></video>
+            <div id="subtitleOverlay" class="subtitle-overlay">字幕を読み込み中...</div>
+            <div id="countdownPanel" class="countdown-panel hidden">
+              <span><strong id="countdownValue">3</strong>秒後に次の動画へ</span>
+              <button id="cancelCountdownBtn" type="button">キャンセル</button>
+            </div>
+            <div id="videoMetaDrawer" class="video-meta-drawer">
+              <button id="metaTabBtn" class="meta-tab-btn" type="button" aria-expanded="false">
+                description
+              </button>
+              <div id="metaPanel" class="meta-panel">
+                <p id="metaPrimaryLine" class="meta-primary-line">動画を読み込み中...</p>
+                <p id="metaSecondaryLine" class="meta-secondary-line"></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="player-actions">
+            <button id="prevBtn" type="button">↑ 前へ</button>
+            <button id="seekBackBtn" type="button">← 5秒</button>
+            <button id="playPauseBtn" type="button">再生 / 停止</button>
+            <button id="seekForwardBtn" type="button">5秒 →</button>
+            <button id="nextBtn" type="button">↓ 次へ</button>
+            <button id="favoriteBtn" type="button">☆ ファボ</button>
+            <div class="volume-wrap">
+              <button id="muteBtn" type="button">音量: 100%</button>
+              <input id="volumeSlider" type="range" min="0" max="1" step="0.05" value="1" />
+            </div>
+          </div>
+        </section>
+
+        <section class="study-column" aria-label="Learning Tools">
+          <article class="card">
+            <h3>字幕ブックマーク</h3>
+            <label class="field">
+              <span>字幕トラック</span>
+              <select id="trackSelect"></select>
+            </label>
+            <div class="inline-actions">
+              <button id="bookmarkCueBtn" type="button">現在字幕を保存 (B)</button>
+              <button id="rangeStartBtn" type="button">範囲開始 (R)</button>
+              <button id="bookmarkRangeBtn" type="button">範囲保存 (T)</button>
+            </div>
+            <label class="field">
+              <span>ブックマークメモ</span>
+              <input id="bookmarkNoteInput" type="text" placeholder="メモを追加 (任意)" />
+            </label>
+            <p id="rangeStatus" class="hint">範囲ブックマークは未開始です。</p>
+          </article>
+
+          <article class="card">
+            <h3>動画メモ</h3>
+            <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>
+            <div class="inline-actions">
+              <button id="saveNoteBtn" type="button">動画メモ保存</button>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3>保存済みブックマーク</h3>
+            <div id="bookmarkList" class="bookmark-list"></div>
+          </article>
+
+          <article class="card shortcuts">
+            <h3>ショートカット</h3>
+            <ul>
+              <li>↑ / K: 前の動画</li>
+              <li>↓ / J: 次の動画</li>
+              <li>← / →: 5秒シーク</li>
+              <li>Space: 再生 / 停止</li>
+              <li>F: ファボ切替</li>
+              <li>B: 現在字幕を保存</li>
+              <li>R: 範囲開始</li>
+              <li>T: 範囲を保存</li>
+              <li>A: 連続再生ON/OFF</li>
+              <li>M: ミュート切替</li>
+              <li>C: 自動遷移キャンセル</li>
+            </ul>
+          </article>
+        </section>
+      </main>
+
+      <footer id="statusBar" class="status-bar">初期化中...</footer>
+    </div>
+  </body>
+</html>
