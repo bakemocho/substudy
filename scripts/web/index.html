@@ -22,7 +22,9 @@
             <span>Source</span>
             <select id="sourceSelect"></select>
           </label>
+          <button id="jumpOpenBtn" class="ghost-btn jump-open-btn" type="button">ジャンプ (G)</button>
           <button id="autoplayToggle" class="ghost-btn" type="button">連続再生: ON</button>
+          <button id="shuffleToggle" class="ghost-btn" type="button">シャッフル: OFF</button>
         </div>
       </header>
 
@@ -47,12 +49,17 @@
           </div>
 
           <div class="player-actions">
-            <button id="prevBtn" type="button">↑ 前へ</button>
-            <button id="seekBackBtn" type="button">← 5秒</button>
-            <button id="playPauseBtn" type="button">再生 / 停止</button>
-            <button id="seekForwardBtn" type="button">5秒 →</button>
-            <button id="nextBtn" type="button">↓ 次へ</button>
-            <button id="favoriteBtn" type="button">☆ ファボ</button>
+            <button id="controlsToggleBtn" class="controls-toggle-btn" type="button" aria-expanded="false">
+              操作を表示
+            </button>
+            <div id="mainControls" class="main-controls collapsed">
+              <button id="prevBtn" type="button">↑ 前へ</button>
+              <button id="playPauseBtn" type="button">再生 / 停止</button>
+              <button id="nextBtn" type="button">↓ 次へ</button>
+              <button id="seekBackBtn" type="button">← 5秒</button>
+              <button id="favoriteBtn" type="button">☆ ファボ</button>
+              <button id="seekForwardBtn" type="button">5秒 →</button>
+            </div>
             <div class="volume-wrap">
               <button id="muteBtn" type="button">音量: 100%</button>
               <input id="volumeSlider" type="range" min="0" max="1" step="0.05" value="1" />
@@ -98,6 +105,7 @@
               <li>↑ / K: 前の動画</li>
               <li>↓ / J: 次の動画</li>
               <li>← / →: 5秒シーク</li>
+              <li>G: 動画ジャンプ</li>
               <li>Space: 再生 / 停止</li>
               <li>F: ファボ切替</li>
               <li>B: 現在字幕を保存</li>
@@ -112,6 +120,25 @@
       </main>
 
       <footer id="statusBar" class="status-bar">初期化中...</footer>
+    </div>
+
+    <div id="jumpModal" class="jump-modal hidden" aria-hidden="true">
+      <div class="jump-dialog" role="dialog" aria-modal="true" aria-label="動画ジャンプ">
+        <div class="jump-header">
+          <h2>動画ジャンプ</h2>
+          <button id="jumpCloseBtn" type="button">閉じる (Esc)</button>
+        </div>
+        <p class="jump-hint">
+          `video_id` / TikTok URL / タイトル文字列 / `123` (番号) で検索できます。
+        </p>
+        <input
+          id="jumpInput"
+          type="text"
+          autocomplete="off"
+          placeholder="例: 7603444228575890709 / airports / 120"
+        />
+        <div id="jumpResults" class="jump-results"></div>
+      </div>
     </div>
   </body>
 </html>

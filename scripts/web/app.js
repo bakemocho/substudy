@@ -1,9 +1,14 @@
 const SEEK_SECONDS = 5;
+const CONTROL_TOGGLE_IDLE_MS = 2600;
 
 const state = {
   videos: [],
   sources: [],
   index: 0,
+  shuffleMode: false,
+  shuffleQueue: [],
+  playbackHistory: [],
+  historyPointer: -1,
   cues: [],
   activeCueIndex: -1,
   currentTrackId: null,
@@ -15,11 +20,17 @@ const state = {
   wheelLockUntil: 0,
   touchStartY: null,
   metaExpanded: false,
+  controlsExpanded: localStorage.getItem("substudy.controls_expanded") === "true",
+  controlsFadeTimer: null,
+  jumpResults: [],
+  jumpSelectedIndex: 0,
 };
 
 const elements = {
   sourceSelect: document.getElementById("sourceSelect"),
+  jumpOpenBtn: document.getElementById("jumpOpenBtn"),
   autoplayToggle: document.getElementById("autoplayToggle"),
+  shuffleToggle: document.getElementById("shuffleToggle"),
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
@@ -31,6 +42,8 @@ const elements = {
   metaPanel: document.getElementById("metaPanel"),
   metaPrimaryLine: document.getElementById("metaPrimaryLine"),
   metaSecondaryLine: document.getElementById("metaSecondaryLine"),
+  controlsToggleBtn: document.getElementById("controlsToggleBtn"),
+  mainControls: document.getElementById("mainControls"),
   prevBtn: document.getElementById("prevBtn"),
   seekBackBtn: document.getElementById("seekBackBtn"),
   playPauseBtn: document.getElementById("playPauseBtn"),
@@ -39,6 +52,7 @@ const elements = {
   favoriteBtn: document.getElementById("favoriteBtn"),
   muteBtn: document.getElementById("muteBtn"),
   volumeSlider: document.getElementById("volumeSlider"),
+  playerActions: document.querySelector(".player-actions"),
   trackSelect: document.getElementById("trackSelect"),
   bookmarkCueBtn: document.getElementById("bookmarkCueBtn"),
   rangeStartBtn: document.getElementById("rangeStartBtn"),
@@ -48,6 +62,10 @@ const elements = {
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
+  jumpModal: document.getElementById("jumpModal"),
+  jumpCloseBtn: document.getElementById("jumpCloseBtn"),
+  jumpInput: document.getElementById("jumpInput"),
+  jumpResults: document.getElementById("jumpResults"),
   statusBar: document.getElementById("statusBar"),
 };
 
@@ -118,6 +136,62 @@ function updateAutoplayToggle() {
   elements.autoplayToggle.textContent = `連続再生: ${state.autoplayContinuous ? "ON" : "OFF"}`;
 }
 
+function updateShuffleToggle() {
+  elements.shuffleToggle.textContent = `シャッフル: ${state.shuffleMode ? "ON" : "OFF"}`;
+}
+
+function shuffleIndices(indices) {
+  const cloned = [...indices];
+  for (let idx = cloned.length - 1; idx > 0; idx -= 1) {
+    const randomIdx = Math.floor(Math.random() * (idx + 1));
+    const tmp = cloned[idx];
+    cloned[idx] = cloned[randomIdx];
+    cloned[randomIdx] = tmp;
+  }
+  return cloned;
+}
+
+function refillShuffleQueue(currentIndex) {
+  const candidates = [];
+  for (let idx = 0; idx < state.videos.length; idx += 1) {
+    if (idx !== currentIndex) {
+      candidates.push(idx);
+    }
+  }
+  if (!candidates.length && currentIndex >= 0) {
+    candidates.push(currentIndex);
+  }
+  state.shuffleQueue = shuffleIndices(candidates);
+}
+
+function chooseNextShuffleIndex() {
+  if (!state.videos.length) {
+    return -1;
+  }
+  if (!state.shuffleQueue.length) {
+    refillShuffleQueue(state.index);
+  }
+  const next = state.shuffleQueue.shift();
+  if (typeof next !== "number") {
+    return -1;
+  }
+  return next;
+}
+
+function resetPlaybackTracking(initialIndex) {
+  state.playbackHistory = [initialIndex];
+  state.historyPointer = 0;
+  state.shuffleQueue = [];
+}
+
+function pushHistory(index) {
+  if (state.historyPointer < state.playbackHistory.length - 1) {
+    state.playbackHistory = state.playbackHistory.slice(0, state.historyPointer + 1);
+  }
+  state.playbackHistory.push(index);
+  state.historyPointer = state.playbackHistory.length - 1;
+}
+
 function updatePlayPauseButton() {
   elements.playPauseBtn.textContent = elements.videoPlayer.paused ? "再生" : "停止";
 }
@@ -135,6 +209,46 @@ function updateMetaDrawerState() {
   elements.videoMetaDrawer.classList.toggle("open", state.metaExpanded);
   elements.phoneShell.classList.toggle("meta-open", state.metaExpanded);
   elements.metaTabBtn.setAttribute("aria-expanded", state.metaExpanded ? "true" : "false");
+}
+
+function updateControlsDrawerState() {
+  elements.mainControls.classList.toggle("collapsed", !state.controlsExpanded);
+  elements.controlsToggleBtn.setAttribute("aria-expanded", state.controlsExpanded ? "true" : "false");
+  elements.controlsToggleBtn.textContent = state.controlsExpanded ? "操作を隠す" : "操作を表示";
+}
+
+function toggleControlsDrawer(forceValue = null) {
+  if (typeof forceValue === "boolean") {
+    state.controlsExpanded = forceValue;
+  } else {
+    state.controlsExpanded = !state.controlsExpanded;
+  }
+  localStorage.setItem("substudy.controls_expanded", state.controlsExpanded ? "true" : "false");
+  updateControlsDrawerState();
+  scheduleControlsToggleIdleFade();
+}
+
+function clearControlsToggleIdleFadeTimer() {
+  if (state.controlsFadeTimer !== null) {
+    window.clearTimeout(state.controlsFadeTimer);
+    state.controlsFadeTimer = null;
+  }
+}
+
+function showControlsToggleButton() {
+  elements.controlsToggleBtn.classList.remove("idle-dim");
+}
+
+function scheduleControlsToggleIdleFade() {
+  clearControlsToggleIdleFadeTimer();
+  showControlsToggleButton();
+  if (state.controlsExpanded) {
+    return;
+  }
+  state.controlsFadeTimer = window.setTimeout(() => {
+    elements.controlsToggleBtn.classList.add("idle-dim");
+    state.controlsFadeTimer = null;
+  }, CONTROL_TOGGLE_IDLE_MS);
 }
 
 function shortenForTab(text) {
@@ -181,6 +295,272 @@ function loadVolumeSettings() {
   const storedMuted = localStorage.getItem("substudy.muted") === "true";
   const initialVolume = Number.isFinite(storedVolume) ? storedVolume : 1;
   applyVolumeSettings(initialVolume, storedMuted);
+}
+
+function parseInitialVideoSelectionFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const sourceId = String(params.get("source_id") || "").trim();
+    const videoId = String(params.get("video_id") || "").trim();
+    return {
+      sourceId,
+      videoId,
+    };
+  } catch (_error) {
+    return {
+      sourceId: "",
+      videoId: "",
+    };
+  }
+}
+
+function updateUrlVideoSelection(sourceId = "", videoId = "") {
+  try {
+    const url = new URL(window.location.href);
+    if (sourceId) {
+      url.searchParams.set("source_id", sourceId);
+    } else {
+      url.searchParams.delete("source_id");
+    }
+    if (videoId) {
+      url.searchParams.set("video_id", videoId);
+    } else {
+      url.searchParams.delete("video_id");
+    }
+    const search = url.searchParams.toString();
+    const nextRelativeUrl = `${url.pathname}${search ? `?${search}` : ""}${url.hash || ""}`;
+    window.history.replaceState({}, "", nextRelativeUrl);
+  } catch (_error) {
+    return;
+  }
+}
+
+function isJumpModalOpen() {
+  return !elements.jumpModal.classList.contains("hidden");
+}
+
+function normalizeSearchText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function truncateText(value, maxLength = 120) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}...`;
+}
+
+function parseJumpIndex(queryText) {
+  const value = String(queryText || "").trim();
+  if (!value) {
+    return null;
+  }
+  const match = value.match(/^#?\s*(\d{1,5})(?:\s*\/\s*\d+)?$/);
+  if (!match) {
+    return null;
+  }
+  const index = Number(match[1]) - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= state.videos.length) {
+    return null;
+  }
+  return index;
+}
+
+function extractVideoIdFromQuery(queryText) {
+  const value = String(queryText || "").trim();
+  if (!value) {
+    return null;
+  }
+  const urlMatch = value.match(/\/video\/(\d{10,})/);
+  if (urlMatch) {
+    return urlMatch[1];
+  }
+  const numericMatch = value.match(/^(\d{10,})$/);
+  if (numericMatch) {
+    return numericMatch[1];
+  }
+  return null;
+}
+
+function buildJumpCandidates() {
+  if (!state.videos.length) {
+    return [];
+  }
+
+  const rawQuery = elements.jumpInput.value || "";
+  const query = normalizeSearchText(rawQuery);
+  if (!query) {
+    const start = Math.max(0, state.index - 4);
+    const end = Math.min(state.videos.length, start + 10);
+    const fallback = [];
+    for (let idx = start; idx < end; idx += 1) {
+      fallback.push({
+        index: idx,
+        score: 1,
+        reason: idx === state.index ? "現在位置" : "近くの動画",
+      });
+    }
+    return fallback;
+  }
+
+  const parsedIndex = parseJumpIndex(rawQuery);
+  const videoId = extractVideoIdFromQuery(rawQuery);
+  const candidates = [];
+  const seen = new Set();
+
+  if (parsedIndex !== null) {
+    candidates.push({
+      index: parsedIndex,
+      score: 200,
+      reason: "番号ジャンプ",
+    });
+    seen.add(parsedIndex);
+  }
+
+  for (let idx = 0; idx < state.videos.length; idx += 1) {
+    const video = state.videos[idx];
+    let score = 0;
+    let reason = "";
+    const title = normalizeSearchText(video.title);
+    const description = normalizeSearchText(video.description);
+    const uploader = normalizeSearchText(video.uploader);
+    const sourceId = normalizeSearchText(video.source_id);
+    const indexLabel = String(idx + 1);
+
+    if (videoId && video.video_id === videoId) {
+      score = 190;
+      reason = "video_id 完全一致";
+    } else if (video.video_id === rawQuery.trim()) {
+      score = 180;
+      reason = "video_id 完全一致";
+    } else if (video.video_id.includes(query)) {
+      score = 110;
+      reason = "video_id 部分一致";
+    } else if (title.includes(query)) {
+      score = 90;
+      reason = "タイトル一致";
+    } else if (description.includes(query)) {
+      score = 80;
+      reason = "description一致";
+    } else if (uploader.includes(query)) {
+      score = 70;
+      reason = "投稿者一致";
+    } else if (sourceId.includes(query)) {
+      score = 60;
+      reason = "source一致";
+    } else if (indexLabel === query) {
+      score = 120;
+      reason = "番号一致";
+    }
+
+    if (score <= 0 || seen.has(idx)) {
+      continue;
+    }
+    seen.add(idx);
+    candidates.push({ index: idx, score, reason });
+  }
+
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) {
+      return b.score - a.score;
+    }
+    return Math.abs(a.index - state.index) - Math.abs(b.index - state.index);
+  });
+  return candidates.slice(0, 14);
+}
+
+function renderJumpResults() {
+  elements.jumpResults.textContent = "";
+  if (!state.jumpResults.length) {
+    const empty = document.createElement("p");
+    empty.className = "jump-empty";
+    empty.textContent = "一致する動画がありません。";
+    elements.jumpResults.appendChild(empty);
+    return;
+  }
+
+  for (let idx = 0; idx < state.jumpResults.length; idx += 1) {
+    const result = state.jumpResults[idx];
+    const video = state.videos[result.index];
+    if (!video) {
+      continue;
+    }
+
+    const rowButton = document.createElement("button");
+    rowButton.type = "button";
+    rowButton.className = "jump-result-item";
+    if (idx === state.jumpSelectedIndex) {
+      rowButton.classList.add("active");
+    }
+
+    const title = document.createElement("span");
+    title.className = "jump-result-title";
+    title.textContent = truncateText(video.description || video.title || "(説明なし)", 95);
+
+    const meta = document.createElement("span");
+    meta.className = "jump-result-meta";
+    meta.textContent = `${result.index + 1}/${state.videos.length} • ${video.source_id} • ${video.video_id} • ${result.reason}`;
+
+    rowButton.appendChild(title);
+    rowButton.appendChild(meta);
+    rowButton.addEventListener("click", () => {
+      jumpToIndex(result.index).catch((error) => setStatus(error.message, "error"));
+    });
+    elements.jumpResults.appendChild(rowButton);
+  }
+}
+
+function refreshJumpResults() {
+  state.jumpResults = buildJumpCandidates();
+  state.jumpSelectedIndex = 0;
+  renderJumpResults();
+}
+
+function moveJumpSelection(delta) {
+  if (!state.jumpResults.length) {
+    return;
+  }
+  const next = state.jumpSelectedIndex + delta;
+  state.jumpSelectedIndex = Math.max(0, Math.min(state.jumpResults.length - 1, next));
+  renderJumpResults();
+}
+
+async function jumpToIndex(index) {
+  await openVideo(index, true);
+  closeJumpModal();
+  setStatus(`ジャンプしました: ${index + 1}/${state.videos.length}`, "ok");
+}
+
+async function jumpToSelectedResult() {
+  if (!state.jumpResults.length) {
+    return;
+  }
+  const selected = state.jumpResults[state.jumpSelectedIndex];
+  if (!selected) {
+    return;
+  }
+  await jumpToIndex(selected.index);
+}
+
+function openJumpModal() {
+  if (!state.videos.length) {
+    setStatus("ジャンプ対象の動画がありません。", "error");
+    return;
+  }
+  elements.jumpModal.classList.remove("hidden");
+  elements.jumpModal.setAttribute("aria-hidden", "false");
+  refreshJumpResults();
+  elements.jumpInput.focus();
+  elements.jumpInput.select();
+}
+
+function closeJumpModal() {
+  elements.jumpModal.classList.add("hidden");
+  elements.jumpModal.setAttribute("aria-hidden", "true");
 }
 
 function renderSourceOptions(preferredSource = "") {
@@ -437,17 +817,21 @@ async function removeBookmark(bookmarkId) {
   setStatus("ブックマークを削除しました。", "ok");
 }
 
-async function openVideo(index, autoplay = true) {
+async function openVideo(index, autoplay = true, historyMode = "push") {
   if (!state.videos.length) {
     return;
   }
 
   clearCountdown();
   state.index = Math.max(0, Math.min(index, state.videos.length - 1));
+  if (historyMode === "push") {
+    pushHistory(state.index);
+  }
 
   const video = currentVideo();
   elements.videoPlayer.src = video.media_url;
   elements.videoPlayer.load();
+  updateUrlVideoSelection(video.source_id, video.video_id);
 
   renderVideoMeta(video);
   updateFavoriteButton();
@@ -470,7 +854,8 @@ async function openVideo(index, autoplay = true) {
   setStatus(`動画を表示中: ${video.source_id} (${state.index + 1}/${state.videos.length})`);
 }
 
-async function loadFeed(sourceId = "") {
+async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "") {
+  closeJumpModal();
   const params = new URLSearchParams({ limit: "900", offset: "0" });
   if (sourceId) {
     params.set("source_id", sourceId);
@@ -491,6 +876,10 @@ async function loadFeed(sourceId = "") {
   if (!state.videos.length) {
     elements.videoPlayer.removeAttribute("src");
     elements.videoPlayer.load();
+    updateUrlVideoSelection(sourceId, "");
+    state.playbackHistory = [];
+    state.historyPointer = -1;
+    state.shuffleQueue = [];
     clearSubtitleOverlay("動画がありません");
     setVideoMetaFallback("動画が見つかりません", "0 / 0");
     state.bookmarks = [];
@@ -499,7 +888,17 @@ async function loadFeed(sourceId = "") {
     return;
   }
 
-  await openVideo(0, true);
+  let initialIndex = -1;
+  if (preferredVideoId) {
+    initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoId);
+  }
+  if (initialIndex < 0) {
+    initialIndex = startRandom
+      ? Math.floor(Math.random() * state.videos.length)
+      : 0;
+  }
+  resetPlaybackTracking(initialIndex);
+  await openVideo(initialIndex, true, "keep");
   setStatus(`${state.videos.length}件の動画を読み込みました。`, "ok");
 }
 
@@ -507,22 +906,49 @@ async function nextVideo() {
   if (!state.videos.length) {
     return;
   }
+  if (state.shuffleMode) {
+    if (state.historyPointer < state.playbackHistory.length - 1) {
+      const forwardIndex = state.playbackHistory[state.historyPointer + 1];
+      state.historyPointer += 1;
+      await openVideo(forwardIndex, true, "keep");
+      return;
+    }
+    const nextShuffleIndex = chooseNextShuffleIndex();
+    if (nextShuffleIndex < 0) {
+      setStatus("次の動画が見つかりません。", "info");
+      return;
+    }
+    await openVideo(nextShuffleIndex, true, "push");
+    return;
+  }
+
   if (state.index >= state.videos.length - 1) {
     setStatus("最後の動画です。", "info");
     return;
   }
-  await openVideo(state.index + 1, true);
+  await openVideo(state.index + 1, true, "push");
 }
 
 async function prevVideo() {
   if (!state.videos.length) {
     return;
   }
+  if (state.shuffleMode) {
+    if (state.historyPointer <= 0) {
+      setStatus("これより前の履歴はありません。", "info");
+      return;
+    }
+    state.historyPointer -= 1;
+    const previousIndex = state.playbackHistory[state.historyPointer];
+    await openVideo(previousIndex, true, "keep");
+    return;
+  }
+
   if (state.index <= 0) {
     setStatus("最初の動画です。", "info");
     return;
   }
-  await openVideo(state.index - 1, true);
+  await openVideo(state.index - 1, true, "push");
 }
 
 async function toggleFavorite() {
@@ -679,6 +1105,17 @@ function toggleMute() {
   updateMuteButtonLabel();
 }
 
+function toggleShuffleMode() {
+  state.shuffleMode = !state.shuffleMode;
+  if (!state.shuffleMode) {
+    state.shuffleQueue = [];
+  } else {
+    refillShuffleQueue(state.index);
+  }
+  updateShuffleToggle();
+  setStatus(`シャッフルを${state.shuffleMode ? "ON" : "OFF"}にしました。`, "ok");
+}
+
 function handleWheel(event) {
   const now = Date.now();
   if (now < state.wheelLockUntil) {
@@ -698,6 +1135,14 @@ function handleWheel(event) {
 }
 
 function handleKeydown(event) {
+  if (isJumpModalOpen()) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeJumpModal();
+    }
+    return;
+  }
+
   const activeTag = document.activeElement ? document.activeElement.tagName : "";
   const isTyping = ["INPUT", "TEXTAREA", "SELECT"].includes(activeTag);
   if (isTyping) {
@@ -738,6 +1183,12 @@ function handleKeydown(event) {
   if (key === "f") {
     event.preventDefault();
     toggleFavorite().catch((error) => setStatus(error.message, "error"));
+    return;
+  }
+
+  if (key === "g") {
+    event.preventDefault();
+    openJumpModal();
     return;
   }
 
@@ -816,10 +1267,43 @@ function bindTouchNavigation() {
 }
 
 function bindEvents() {
+  const resetControlsToggleFade = () => scheduleControlsToggleIdleFade();
+
+  elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
+  elements.jumpCloseBtn.addEventListener("click", () => closeJumpModal());
+  elements.jumpModal.addEventListener("click", (event) => {
+    if (event.target === elements.jumpModal) {
+      closeJumpModal();
+    }
+  });
+  elements.jumpInput.addEventListener("input", () => refreshJumpResults());
+  elements.jumpInput.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      moveJumpSelection(1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      moveJumpSelection(-1);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      jumpToSelectedResult().catch((error) => setStatus(error.message, "error"));
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeJumpModal();
+    }
+  });
+
   elements.sourceSelect.addEventListener("change", () => {
     loadFeed(elements.sourceSelect.value).catch((error) => {
       setStatus(error.message, "error");
     });
+    resetControlsToggleFade();
   });
 
   elements.autoplayToggle.addEventListener("click", () => {
@@ -827,23 +1311,47 @@ function bindEvents() {
     localStorage.setItem("substudy.autoplay", state.autoplayContinuous ? "on" : "off");
     updateAutoplayToggle();
     setStatus(`連続再生を${state.autoplayContinuous ? "ON" : "OFF"}にしました。`, "ok");
+    resetControlsToggleFade();
   });
+  elements.shuffleToggle.addEventListener("click", () => {
+    toggleShuffleMode();
+    resetControlsToggleFade();
+  });
+  elements.controlsToggleBtn.addEventListener("click", () => toggleControlsDrawer());
+  elements.controlsToggleBtn.addEventListener("pointerenter", () => showControlsToggleButton());
+  elements.controlsToggleBtn.addEventListener("focus", () => showControlsToggleButton());
+  elements.controlsToggleBtn.addEventListener("blur", () => resetControlsToggleFade());
 
   elements.prevBtn.addEventListener("click", () => {
     prevVideo().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
-  elements.seekBackBtn.addEventListener("click", () => seekBySeconds(-SEEK_SECONDS));
+  elements.seekBackBtn.addEventListener("click", () => {
+    seekBySeconds(-SEEK_SECONDS);
+    resetControlsToggleFade();
+  });
   elements.nextBtn.addEventListener("click", () => {
     nextVideo().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
-  elements.seekForwardBtn.addEventListener("click", () => seekBySeconds(SEEK_SECONDS));
-  elements.playPauseBtn.addEventListener("click", () => togglePlayPause());
+  elements.seekForwardBtn.addEventListener("click", () => {
+    seekBySeconds(SEEK_SECONDS);
+    resetControlsToggleFade();
+  });
+  elements.playPauseBtn.addEventListener("click", () => {
+    togglePlayPause();
+    resetControlsToggleFade();
+  });
   elements.favoriteBtn.addEventListener("click", () => {
     toggleFavorite().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
   elements.metaTabBtn.addEventListener("click", () => toggleMetaDrawer());
 
-  elements.muteBtn.addEventListener("click", () => toggleMute());
+  elements.muteBtn.addEventListener("click", () => {
+    toggleMute();
+    resetControlsToggleFade();
+  });
   elements.volumeSlider.addEventListener("input", () => {
     const volume = Number(elements.volumeSlider.value);
     const safeVolume = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1;
@@ -854,28 +1362,37 @@ function bindEvents() {
     localStorage.setItem("substudy.volume", String(safeVolume));
     localStorage.setItem("substudy.muted", elements.videoPlayer.muted ? "true" : "false");
     updateMuteButtonLabel();
+    resetControlsToggleFade();
   });
 
   elements.trackSelect.addEventListener("change", () => {
     state.currentTrackId = elements.trackSelect.value || null;
     loadTrackCues().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
 
   elements.bookmarkCueBtn.addEventListener("click", () => {
     bookmarkCurrentCue().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
-  elements.rangeStartBtn.addEventListener("click", () => markRangeStart());
+  elements.rangeStartBtn.addEventListener("click", () => {
+    markRangeStart();
+    resetControlsToggleFade();
+  });
   elements.bookmarkRangeBtn.addEventListener("click", () => {
     bookmarkCurrentRange().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
 
   elements.saveNoteBtn.addEventListener("click", () => {
     saveVideoNote().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
   });
 
   elements.cancelCountdownBtn.addEventListener("click", () => {
     clearCountdown();
     setStatus("自動遷移をキャンセルしました。", "ok");
+    resetControlsToggleFade();
   });
 
   elements.videoPlayer.addEventListener("timeupdate", () => updateSubtitleFromPlayback());
@@ -885,6 +1402,7 @@ function bindEvents() {
     localStorage.setItem("substudy.volume", String(elements.videoPlayer.volume || 0));
     localStorage.setItem("substudy.muted", elements.videoPlayer.muted ? "true" : "false");
     updateMuteButtonLabel();
+    resetControlsToggleFade();
   });
   elements.videoPlayer.addEventListener("ended", () => {
     if (!state.autoplayContinuous) {
@@ -898,20 +1416,33 @@ function bindEvents() {
   });
 
   elements.phoneShell.addEventListener("wheel", handleWheel, { passive: true });
+  elements.phoneShell.addEventListener("pointermove", resetControlsToggleFade, { passive: true });
+  if (elements.playerActions) {
+    elements.playerActions.addEventListener("pointermove", resetControlsToggleFade, { passive: true });
+  }
   bindTouchNavigation();
   document.addEventListener("keydown", handleKeydown);
+  document.addEventListener("keydown", resetControlsToggleFade);
 }
 
 async function initialize() {
   updateMetaDrawerState();
+  updateControlsDrawerState();
+  scheduleControlsToggleIdleFade();
   updateAutoplayToggle();
+  updateShuffleToggle();
   loadVolumeSettings();
   updatePlayPauseButton();
   bindEvents();
 
   try {
-    await loadFeed("");
-    setStatus("準備完了。上下移動と左右5秒シークで操作できます。", "ok");
+    const initialSelection = parseInitialVideoSelectionFromUrl();
+    await loadFeed(
+      initialSelection.sourceId,
+      false,
+      initialSelection.videoId
+    );
+    setStatus("準備完了。上下移動・左右5秒シーク・Gジャンプが使えます。", "ok");
   } catch (error) {
     setStatus(error.message, "error");
   }
