@@ -7,9 +7,31 @@ sub_format = "vtt/ttml/best"
 sleep_interval = 2
 max_sleep_interval = 6
 retry_sleep = 5
+playlist_end = 200
 break_on_existing = false
 break_per_input = false
 lazy_playlist = false
+
+# Older-post backfill (reverse incremental)
+backfill_enabled = false
+# backfill_start defaults to playlist_end + 1 when unset
+# backfill_start = 201
+backfill_window = 200
+backfill_windows_per_run = 1
+
+# ASR (subtitles from speech recognition)
+asr_enabled = false
+asr_max_per_run = 20
+asr_timeout_sec = 0
+asr_prefer_exts = ["srt", "vtt"]
+# asr_command = [
+#   "/Users/bakemocho/gitwork_bk/vseg/.venv/bin/python",
+#   "-m", "avseg.main_transcribe",
+#   "--with-subtitles",
+#   "--language", "en",
+#   "--output-dir", "{work_dir}",
+#   "{input_path}",
+# ]
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
 
@@ -28,6 +50,7 @@ media_archive = "storiesofcz.archive.txt"
 subs_archive = "storiesofcz_subs.archive.txt"
 urls_file = "storiesofcz.urls.txt"
 video_id_regex = "_(\\d{19})_"
+asr_dir = "storiesofcz_asr"
 
 # Optional overrides:
 # handle = "storiesofcz"
@@ -35,3 +58,9 @@ video_id_regex = "_(\\d{19})_"
 # break_on_existing = true
 # break_per_input = true
 # lazy_playlist = true
+# playlist_end = 300
+# backfill_enabled = true
+# backfill_start = 301
+# backfill_window = 300
+# backfill_windows_per_run = 2
+# asr_enabled = true
