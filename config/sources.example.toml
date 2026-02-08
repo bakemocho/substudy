@@ -1,0 +1,37 @@
+[global]
+base_data_dir = "/Users/bakemocho/Audio/tiktok/english"
+cookies_from_browser = "chrome"
+video_format = "bv*+ba/best"
+sub_langs = "en.*,en,und"
+sub_format = "vtt/ttml/best"
+sleep_interval = 2
+max_sleep_interval = 6
+retry_sleep = 5
+break_on_existing = false
+break_per_input = false
+lazy_playlist = false
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+
+# Existing on-disk layout (no migration needed):
+data_dir = "/Users/bakemocho/Audio/tiktok/english/storiesofcz"
+media_dir = "storiesofcz"
+subs_dir = "storiesofcz_subs"
+meta_dir = "storiesofcz_meta"
+media_archive = "storiesofcz.archive.txt"
+subs_archive = "storiesofcz_subs.archive.txt"
+urls_file = "storiesofcz.urls.txt"
+video_id_regex = "_(\\d{19})_"
+
+# Optional overrides:
+# handle = "storiesofcz"
+# video_url_template = "https://www.tiktok.com/@{handle}/video/{id}"
+# break_on_existing = true
+# break_per_input = true
+# lazy_playlist = true

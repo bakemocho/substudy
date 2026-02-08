@@ -1,0 +1,8 @@
+config/sources.toml
+data/
+logs/
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
