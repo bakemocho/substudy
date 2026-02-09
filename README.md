@@ -27,6 +27,7 @@ Local-first workflow for English study from downloaded short videos.
 - `scripts/run_daily_sync.sh`: daily incremental wrapper (`sync`/`backfill`/`ledger`/`loudness`/`asr`)
 - `scripts/run_weekly_full_sync.sh`: weekly full wrapper (includes `brew upgrade yt-dlp` + `loudness`)
 - `scripts/install_launchd.sh`: install/update launchd jobs
+- `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
 - `config/sources.example.toml`: example config
 - `data/master_ledger.sqlite`: generated ledger DB
 - `data/master_ledger.csv`: generated ledger CSV

@@ -1261,6 +1261,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
     ensure_videos_loudness_columns(connection)
     ensure_dictionary_schema(connection)
+    ensure_translation_runs_table(connection)
 
 
 def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
@@ -1315,6 +1316,35 @@ def ensure_dictionary_schema(connection: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # Some SQLite builds do not have FTS5 enabled.
         return
+
+
+def ensure_translation_runs_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS translation_runs (
+            run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id       TEXT NOT NULL,
+            video_id        TEXT NOT NULL,
+            source_lang     TEXT NOT NULL DEFAULT 'en',
+            target_lang     TEXT NOT NULL DEFAULT 'ja',
+            source_path     TEXT NOT NULL,
+            output_path     TEXT NOT NULL,
+            cue_count       INTEGER,
+            cue_match       INTEGER,
+            agent           TEXT,
+            method          TEXT,
+            method_version  TEXT,
+            summary         TEXT,
+            status          TEXT NOT NULL DEFAULT 'active',
+            started_at      TEXT,
+            finished_at     TEXT,
+            created_at      TEXT NOT NULL,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_translation_runs_video
+            ON translation_runs(source_id, video_id, target_lang, status);
+        """
+    )
 
 
 def rebuild_dictionary_fts(connection: sqlite3.Connection) -> bool:
