@@ -178,6 +178,29 @@ Check jobs:
 launchctl list | rg substudy
 ```
 
+## Dictionary source prep (EIJIRO)
+
+Use EIJIRO as source data with `cp932` decoding, then keep a UTF-8 normalized copy for editor-friendly access.
+
+- source: `/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
+- normalized copy (local artifact): `data/eijiro-1449.utf8.txt`
+- note: `data/` is gitignored in this repo.
+
+Generate/update normalized copy:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+src = Path('/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT')
+dst = Path('data/eijiro-1449.utf8.txt')
+text = src.read_bytes().decode('cp932')
+text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\x85', '\n')
+dst.parent.mkdir(parents=True, exist_ok=True)
+dst.write_text(text, encoding='utf-8', newline='\n')
+print(dst)
+PY
+```
+
 ## Roadmap: Dictionary + NLP + Translation (planned)
 
 Planned next steps for grammar-aware subtitle study UX.
@@ -224,6 +247,7 @@ Planned next steps for grammar-aware subtitle study UX.
 - Daily/weekly jobs already run `sync/backfill/ledger/loudness/asr`.
 - After manual validation, optionally add `nlp` and `translate` stages as opt-in automation.
 - Keep translation stage disable-by-default until quality and token cost are measured.
+- `bep-eng.txt` is a reading dictionary and is currently out of scope for this pipeline.
 
 ## Add more creators
 
