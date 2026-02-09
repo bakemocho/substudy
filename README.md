@@ -105,6 +105,16 @@ Open `http://127.0.0.1:8876`.
 - Inter-video volume normalization toggle (`N`)
 - Subtitle overlay + selectable track
 - Hover English words in subtitle overlay to open dictionary popup
+- Hover dictionary debug/emulation (CLI):
+  - reproduce lookup terms and ranking for a sentence/word pair
+  - useful for tuning collocation ordering without manual UI retries
+  - example:
+    ```bash
+    python3 scripts/dict_hover_emulator.py \
+      --db data/master_ledger.sqlite \
+      --sentence "So last month I kind of made a fool of myself by um" \
+      --word made
+    ```
 - Subtitle bookmarks:
   - save current subtitle (`B`)
   - save playback range (`R` start, `T` save)

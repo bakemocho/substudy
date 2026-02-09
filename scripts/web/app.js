@@ -7,9 +7,10 @@ const LYRIC_REEL_INERTIA_DECAY = 0.88;
 const LYRIC_REEL_INERTIA_MIN = 0.0007;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
 const DICT_HOVER_LOOP_MIN_MS = 900;
-const DICT_CONTEXT_MAX_CANDIDATES = 6;
+const DICT_CONTEXT_MAX_CANDIDATES = 9;
 const DICT_CONTEXT_PER_TERM_LIMIT = 4;
 const DICT_CONTEXT_TOTAL_LIMIT = 12;
+const DICT_CONTEXT_CORE_MIN_RESULTS = 2;
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
@@ -29,6 +30,23 @@ const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "by",
   "about",
   "into",
+]);
+const DICT_IRREGULAR_BASE_FORMS = new Map([
+  ["made", "make"],
+  ["gone", "go"],
+  ["went", "go"],
+  ["gave", "give"],
+  ["given", "give"],
+  ["took", "take"],
+  ["taken", "take"],
+  ["came", "come"],
+  ["did", "do"],
+  ["done", "do"],
+  ["was", "be"],
+  ["were", "be"],
+  ["been", "be"],
+  ["saw", "see"],
+  ["seen", "see"],
 ]);
 
 const state = {
@@ -75,6 +93,7 @@ const state = {
   dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
+  dictBatchApiAvailable: null,
 };
 
 const elements = {
@@ -872,6 +891,42 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   elements.subtitleDictPopup.style.transform = `translate(-50%, ${translateY})`;
 }
 
+function groupDictionaryRows(rows) {
+  const groups = [];
+  const groupMap = new Map();
+
+  for (const row of rows) {
+    const rowTermNorm = normalizeDictionaryTerm(row?.term_norm || row?.term || "");
+    const key = rowTermNorm || dictionaryResultKey(row);
+    let group = groupMap.get(key);
+    if (!group) {
+      group = {
+        key,
+        term: String(row?.term || row?.term_norm || "").trim(),
+        rowTermNorm,
+        entries: [],
+        entryKeys: new Set(),
+      };
+      groupMap.set(key, group);
+      groups.push(group);
+    }
+
+    const lookupTerm = String(row?.lookup_term || "").trim();
+    const definition = String(row?.definition || "").trim();
+    const entryKey = `${normalizeDictionaryTerm(lookupTerm)}\u0000${definition}`;
+    if (group.entryKeys.has(entryKey)) {
+      continue;
+    }
+    group.entryKeys.add(entryKey);
+    group.entries.push({
+      lookupTerm,
+      definition,
+    });
+  }
+
+  return groups;
+}
+
 function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
   elements.subtitleDictPopup.textContent = "";
   const title = document.createElement("p");
@@ -879,7 +934,8 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
   title.textContent = `Dictionary: ${term}`;
   elements.subtitleDictPopup.appendChild(title);
 
-  if (!rows.length) {
+  const groups = groupDictionaryRows(rows);
+  if (!groups.length) {
     const empty = document.createElement("p");
     empty.className = "subtitle-dict-empty";
     empty.textContent = "辞書エントリが見つかりません。";
@@ -887,33 +943,56 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
   } else {
     const list = document.createElement("div");
     list.className = "subtitle-dict-list";
-    for (const row of rows) {
+    for (const group of groups) {
       const item = document.createElement("article");
       item.className = "subtitle-dict-item";
 
       const label = document.createElement("strong");
-      label.textContent = row.term || term;
+      label.textContent = group.term || term;
       item.appendChild(label);
 
-      const lookupTerm = String(row.lookup_term || "").trim();
-      if (lookupTerm) {
-        const normalizedLookupTerm = normalizeDictionaryTerm(lookupTerm);
-        const normalizedLabel = normalizeDictionaryTerm(row.term || "");
-        if (normalizedLookupTerm && normalizedLookupTerm !== normalizedLabel) {
-          const match = document.createElement("small");
-          match.className = "subtitle-dict-match";
-          match.textContent = `from: ${lookupTerm}`;
-          item.appendChild(match);
+      const fromTerms = new Set();
+      for (const entry of group.entries) {
+        const normalizedLookupTerm = normalizeDictionaryTerm(entry.lookupTerm);
+        if (normalizedLookupTerm && normalizedLookupTerm !== group.rowTermNorm) {
+          fromTerms.add(entry.lookupTerm);
         }
       }
 
-      const detail = document.createElement("span");
-      const rawDefinition = String(row.definition || "").trim();
-      detail.textContent = rawDefinition.length > 260
-        ? `${rawDefinition.slice(0, 260)}...`
-        : rawDefinition;
+      if (fromTerms.size === 1) {
+        const [singleFrom] = Array.from(fromTerms);
+        const match = document.createElement("small");
+        match.className = "subtitle-dict-match";
+        match.textContent = `from: ${singleFrom}`;
+        item.appendChild(match);
+      }
 
-      item.appendChild(detail);
+      const defs = document.createElement("ul");
+      defs.className = "subtitle-dict-def-list";
+      for (const entry of group.entries) {
+        const defItem = document.createElement("li");
+        defItem.className = "subtitle-dict-def-item";
+
+        const detail = document.createElement("span");
+        const rawDefinition = String(entry.definition || "").trim();
+        detail.textContent = rawDefinition.length > 260
+          ? `${rawDefinition.slice(0, 260)}...`
+          : rawDefinition;
+        defItem.appendChild(detail);
+
+        if (fromTerms.size > 1) {
+          const normalizedLookupTerm = normalizeDictionaryTerm(entry.lookupTerm);
+          if (normalizedLookupTerm && normalizedLookupTerm !== group.rowTermNorm) {
+            const from = document.createElement("small");
+            from.className = "subtitle-dict-from";
+            from.textContent = `from: ${entry.lookupTerm}`;
+            defItem.appendChild(from);
+          }
+        }
+        defs.appendChild(defItem);
+      }
+
+      item.appendChild(defs);
       list.appendChild(item);
     }
     elements.subtitleDictPopup.appendChild(list);
@@ -961,12 +1040,119 @@ async function lookupDictionary(term) {
   return payload;
 }
 
+async function lookupDictionaryBatch(terms, limit = DICT_CONTEXT_PER_TERM_LIMIT, exactOnly = false) {
+  if (state.dictBatchApiAvailable === false) {
+    throw new Error("Dictionary batch API is unavailable");
+  }
+  const cleanedTerms = [];
+  const seenTerms = new Set();
+  for (const rawTerm of terms) {
+    const value = String(rawTerm || "").trim();
+    const normalized = normalizeDictionaryTerm(value);
+    if (!value || !normalized || seenTerms.has(normalized)) {
+      continue;
+    }
+    seenTerms.add(normalized);
+    cleanedTerms.push(value);
+  }
+  if (!cleanedTerms.length) {
+    return [];
+  }
+
+  const params = new URLSearchParams();
+  for (const term of cleanedTerms) {
+    params.append("term", term);
+  }
+  params.set("limit", String(Math.max(1, Math.min(20, Number(limit) || DICT_CONTEXT_PER_TERM_LIMIT))));
+  if (exactOnly) {
+    params.set("exact_only", "1");
+  }
+
+  let payload;
+  try {
+    payload = await apiRequest(`/api/dictionary/batch?${params.toString()}`);
+    state.dictBatchApiAvailable = true;
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message.includes("Not found") || message.includes("404")) {
+      state.dictBatchApiAvailable = false;
+    }
+    throw error;
+  }
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  if (!exactOnly) {
+    for (const item of items) {
+      const normalized = normalizeDictionaryTerm(item?.normalized || item?.term || "");
+      if (!normalized) {
+        continue;
+      }
+      state.dictLookupCache.set(normalized, item);
+    }
+  }
+  return items;
+}
+
+function splitNormalizedWords(value) {
+  const normalized = normalizeDictionaryTerm(value);
+  if (!normalized) {
+    return [];
+  }
+  return normalized.split(/\s+/).filter(Boolean);
+}
+
+function deriveDictionaryCoreTerms(baseTerm) {
+  const normalizedBase = normalizeDictionaryTerm(baseTerm);
+  if (!normalizedBase) {
+    return [];
+  }
+
+  const terms = [];
+  const seen = new Set();
+  const add = (value) => {
+    const normalized = normalizeDictionaryTerm(value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    terms.push(normalized);
+  };
+
+  add(normalizedBase);
+  add(DICT_IRREGULAR_BASE_FORMS.get(normalizedBase) || "");
+
+  if (normalizedBase.endsWith("'s")) {
+    add(normalizedBase.slice(0, -2));
+  }
+  if (normalizedBase.endsWith("ies") && normalizedBase.length > 4) {
+    add(`${normalizedBase.slice(0, -3)}y`);
+  }
+  if (normalizedBase.endsWith("ing") && normalizedBase.length > 5) {
+    const stem = normalizedBase.slice(0, -3);
+    add(stem);
+    add(`${stem}e`);
+  }
+  if (normalizedBase.endsWith("ed") && normalizedBase.length > 4) {
+    const stem = normalizedBase.slice(0, -2);
+    add(stem);
+    add(`${stem}e`);
+  }
+  if (normalizedBase.endsWith("es") && normalizedBase.length > 4) {
+    add(normalizedBase.slice(0, -2));
+  }
+  if (normalizedBase.endsWith("s") && normalizedBase.length > 3) {
+    add(normalizedBase.slice(0, -1));
+  }
+
+  return terms.slice(0, 3);
+}
+
 function buildDictionaryLookupTerms(wordEl, baseTerm) {
   const terms = [];
   const seen = new Set();
   const wordNodes = Array.from(elements.subtitleOverlay.querySelectorAll(".subtitle-word"));
   const index = wordNodes.indexOf(wordEl);
   const words = wordNodes.map((node) => String(node.dataset.dictTerm || node.textContent || "").trim());
+  const coreTerms = deriveDictionaryCoreTerms(baseTerm);
 
   const addTerm = (rawTerm) => {
     const value = String(rawTerm || "").trim();
@@ -978,7 +1164,7 @@ function buildDictionaryLookupTerms(wordEl, baseTerm) {
       return;
     }
     seen.add(normalized);
-    terms.push(value);
+    terms.push(normalized);
   };
 
   const addRange = (startIndex, endIndex) => {
@@ -1033,29 +1219,55 @@ function buildDictionaryLookupTerms(wordEl, baseTerm) {
   };
 
   if (index >= 0 && words.length > 0) {
-    // Prefer forward collocation first (e.g. "give back"),
-    // then surrounding context and finally the single word.
     addRange(index, index + 1);
     addRange(index, index + 2);
+    addRange(index, index + 3);
     addCollapsedForwardPhrasalCandidate();
     addCollapsedBackwardPhrasalCandidate();
-    addRange(index - 1, index);
-    addRange(index - 1, index + 1);
-    addRange(index - 2, index);
   }
-  addTerm(baseTerm);
-  if (terms.length <= DICT_CONTEXT_MAX_CANDIDATES) {
-    return terms;
+
+  for (const coreTerm of coreTerms) {
+    addTerm(coreTerm);
   }
-  const topTerms = terms.slice(0, DICT_CONTEXT_MAX_CANDIDATES);
-  const normalizedBaseTerm = normalizeDictionaryTerm(baseTerm);
-  if (normalizedBaseTerm) {
-    const hasBase = topTerms.some((term) => normalizeDictionaryTerm(term) === normalizedBaseTerm);
-    if (!hasBase) {
-      topTerms[topTerms.length - 1] = baseTerm;
+
+  let lookupTerms = terms;
+  if (terms.length > DICT_CONTEXT_MAX_CANDIDATES) {
+    lookupTerms = terms.slice(0, DICT_CONTEXT_MAX_CANDIDATES);
+    let replaceIndex = lookupTerms.length - 1;
+    for (const coreTerm of coreTerms) {
+      if (lookupTerms.includes(coreTerm)) {
+        continue;
+      }
+      if (replaceIndex < 0) {
+        break;
+      }
+      lookupTerms[replaceIndex] = coreTerm;
+      replaceIndex -= 1;
     }
   }
-  return topTerms;
+
+  const contextWordSet = new Set();
+  if (index >= 0 && words.length > 0) {
+    const startIndex = Math.max(0, index - 3);
+    const endIndex = Math.min(words.length - 1, index + 5);
+    for (let wordIndex = startIndex; wordIndex <= endIndex; wordIndex += 1) {
+      const tokens = splitNormalizedWords(words[wordIndex]);
+      for (const token of tokens) {
+        contextWordSet.add(token);
+      }
+    }
+  }
+  for (const coreTerm of coreTerms) {
+    for (const token of splitNormalizedWords(coreTerm)) {
+      contextWordSet.add(token);
+    }
+  }
+
+  return {
+    lookupTerms,
+    coreTerms,
+    contextWordSet,
+  };
 }
 
 function dictionaryResultKey(row) {
@@ -1070,14 +1282,132 @@ function dictionaryResultKey(row) {
   ].join("\u0000");
 }
 
+function scoreDictionaryCandidate(row, lookupTerm, contextWordSet, coreTermSet) {
+  const lookupNormalized = normalizeDictionaryTerm(lookupTerm);
+  const rowTermNormalized = normalizeDictionaryTerm(row?.term_norm || row?.term || "");
+  const lookupWords = splitNormalizedWords(lookupNormalized);
+  const rowWords = splitNormalizedWords(rowTermNormalized);
+
+  let overlapCount = 0;
+  for (const word of rowWords) {
+    if (contextWordSet.has(word)) {
+      overlapCount += 1;
+    }
+  }
+
+  const isCoreLookup = coreTermSet.has(lookupNormalized);
+  const isCoreEntry = isCoreLookup && rowTermNormalized === lookupNormalized;
+  const isExactLookup = lookupNormalized && rowTermNormalized === lookupNormalized;
+  const isPrefixLookup = (
+    !isExactLookup
+    && lookupNormalized
+    && rowTermNormalized.startsWith(`${lookupNormalized} `)
+  );
+
+  let score = 0;
+  score += overlapCount * 100;
+  score += lookupWords.length * 18;
+  score += rowWords.length * 3;
+  if (isExactLookup) {
+    score += 36;
+  }
+  if (isPrefixLookup) {
+    score += 14;
+  }
+  if (isCoreLookup) {
+    score += 10;
+  }
+  if (!isCoreLookup && lookupWords.length <= 2 && overlapCount <= 2) {
+    score -= 40;
+  }
+
+  return {
+    score,
+    lookupNormalized,
+    rowTermNormalized,
+    isCoreEntry,
+    isCoreLookup,
+    overlapCount,
+  };
+}
+
 async function lookupDictionaryWithContext(wordEl, baseTerm) {
-  const lookupTerms = buildDictionaryLookupTerms(wordEl, baseTerm);
-  const mergedRows = [];
+  const context = buildDictionaryLookupTerms(wordEl, baseTerm);
+  const lookupTerms = context.lookupTerms;
+  const coreTermSet = new Set(context.coreTerms);
+  const baseNormalized = context.coreTerms[0] || normalizeDictionaryTerm(baseTerm);
+  const contextTerms = lookupTerms.filter((term) => normalizeDictionaryTerm(term) !== baseNormalized);
+  const basePromise = lookupDictionary(baseNormalized || baseTerm);
+  const contextPromise = (async () => {
+    if (!contextTerms.length) {
+      return new Map();
+    }
+
+    const exactTerms = [];
+    const broadTerms = [];
+    for (const term of contextTerms) {
+      if (splitNormalizedWords(term).length >= 3) {
+        broadTerms.push(term);
+      } else {
+        exactTerms.push(term);
+      }
+    }
+
+    // Fast path: exact for short terms, broader search for longer phrase terms.
+    try {
+      const mapped = new Map();
+      const tasks = [];
+      if (exactTerms.length) {
+        tasks.push(
+          lookupDictionaryBatch(exactTerms, DICT_CONTEXT_PER_TERM_LIMIT, true).then((items) => {
+            for (const item of items) {
+              const key = normalizeDictionaryTerm(item?.term || item?.normalized || "");
+              if (!key || mapped.has(key)) {
+                continue;
+              }
+              mapped.set(key, item);
+            }
+          })
+        );
+      }
+      if (broadTerms.length) {
+        tasks.push(
+          lookupDictionaryBatch(broadTerms, DICT_CONTEXT_PER_TERM_LIMIT, false).then((items) => {
+            for (const item of items) {
+              const key = normalizeDictionaryTerm(item?.term || item?.normalized || "");
+              if (!key || mapped.has(key)) {
+                continue;
+              }
+              mapped.set(key, item);
+            }
+          })
+        );
+      }
+      if (tasks.length) {
+        await Promise.all(tasks);
+      }
+      return mapped;
+    } catch (_error) {
+      // Backward compatible fallback for older running servers.
+      const mapped = new Map();
+      for (const term of contextTerms) {
+        const payload = await lookupDictionary(term);
+        mapped.set(normalizeDictionaryTerm(term), payload);
+      }
+      return mapped;
+    }
+  })();
+
+  const [basePayload, contextPayloadByTerm] = await Promise.all([basePromise, contextPromise]);
+  const candidates = [];
   const seenRows = new Set();
 
   for (const lookupTerm of lookupTerms) {
-    const payload = await lookupDictionary(lookupTerm);
-    const rows = Array.isArray(payload.results) ? payload.results : [];
+    const lookupNormalized = normalizeDictionaryTerm(lookupTerm);
+    const payload = lookupNormalized === baseNormalized
+      ? basePayload
+      : contextPayloadByTerm.get(lookupNormalized);
+    const rows = Array.isArray(payload?.results) ? payload.results : [];
     if (!rows.length) {
       continue;
     }
@@ -1089,19 +1419,85 @@ async function lookupDictionaryWithContext(wordEl, baseTerm) {
         continue;
       }
       seenRows.add(key);
-      mergedRows.push({
+
+      const scored = scoreDictionaryCandidate(
+        row,
+        lookupTerm,
+        context.contextWordSet,
+        coreTermSet,
+      );
+      if (
+        scored.isCoreLookup
+        && !scored.isCoreEntry
+        && splitNormalizedWords(scored.rowTermNormalized).length <= 1
+        && !coreTermSet.has(scored.rowTermNormalized)
+        && scored.overlapCount <= 0
+      ) {
+        continue;
+      }
+      candidates.push({
         ...row,
         lookup_term: lookupTerm,
+        _row_key: key,
+        _score: scored.score,
+        _lookup_normalized: scored.lookupNormalized,
+        _row_term_normalized: scored.rowTermNormalized,
+        _is_core_entry: scored.isCoreEntry,
       });
       insertedForTerm += 1;
-      if (insertedForTerm >= DICT_CONTEXT_PER_TERM_LIMIT || mergedRows.length >= DICT_CONTEXT_TOTAL_LIMIT) {
+      if (insertedForTerm >= DICT_CONTEXT_PER_TERM_LIMIT) {
         break;
       }
     }
-    if (mergedRows.length >= DICT_CONTEXT_TOTAL_LIMIT) {
-      break;
+  }
+
+  candidates.sort((left, right) => {
+    if (right._score !== left._score) {
+      return right._score - left._score;
+    }
+    const leftLookupWords = splitNormalizedWords(left._lookup_normalized).length;
+    const rightLookupWords = splitNormalizedWords(right._lookup_normalized).length;
+    if (rightLookupWords !== leftLookupWords) {
+      return rightLookupWords - leftLookupWords;
+    }
+    return 0;
+  });
+
+  const selected = candidates.slice(0, DICT_CONTEXT_TOTAL_LIMIT);
+  let selectedCoreCount = selected.filter((row) => row._is_core_entry).length;
+  if (selectedCoreCount < DICT_CONTEXT_CORE_MIN_RESULTS) {
+    const selectedKeys = new Set(selected.map((row) => row._row_key));
+    for (const candidate of candidates) {
+      if (!candidate._is_core_entry || selectedKeys.has(candidate._row_key)) {
+        continue;
+      }
+      let replaceIndex = selected.length - 1;
+      while (replaceIndex >= 0 && selected[replaceIndex]._is_core_entry) {
+        replaceIndex -= 1;
+      }
+      if (replaceIndex < 0) {
+        break;
+      }
+      selectedKeys.delete(selected[replaceIndex]._row_key);
+      selected[replaceIndex] = candidate;
+      selectedKeys.add(candidate._row_key);
+      selectedCoreCount += 1;
+      if (selectedCoreCount >= DICT_CONTEXT_CORE_MIN_RESULTS) {
+        break;
+      }
     }
   }
+
+  selected.sort((left, right) => right._score - left._score);
+  const mergedRows = selected.map((row) => {
+    const result = { ...row };
+    delete result._row_key;
+    delete result._score;
+    delete result._lookup_normalized;
+    delete result._row_term_normalized;
+    delete result._is_core_entry;
+    return result;
+  });
 
   return {
     term: baseTerm,

@@ -237,10 +237,34 @@ body {
   letter-spacing: 0.01em;
 }
 
+.subtitle-dict-def-list {
+  margin: 0;
+  padding-left: 1.05rem;
+  display: grid;
+  gap: 5px;
+}
+
+.subtitle-dict-def-item {
+  color: rgba(214, 224, 245, 0.9);
+  font-size: 0.8rem;
+}
+
+.subtitle-dict-def-item::marker {
+  color: rgba(158, 185, 243, 0.8);
+}
+
 .subtitle-dict-item span {
   display: block;
   color: rgba(214, 224, 245, 0.9);
   font-size: 0.8rem;
+}
+
+.subtitle-dict-from {
+  display: block;
+  margin-top: 2px;
+  color: rgba(149, 221, 239, 0.88);
+  font-size: 0.72rem;
+  letter-spacing: 0.01em;
 }
 
 .subtitle-dict-empty {

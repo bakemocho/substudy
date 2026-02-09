@@ -1342,6 +1342,7 @@ def lookup_dictionary_entries(
     connection: sqlite3.Connection,
     term: str,
     limit: int = DEFAULT_DICT_LOOKUP_LIMIT,
+    exact_only: bool = False,
 ) -> dict[str, Any]:
     def read_field(
         row: sqlite3.Row | tuple[Any, ...],
@@ -1389,6 +1390,24 @@ def lookup_dictionary_entries(
 
     selected_rows: list[sqlite3.Row | tuple[Any, ...]] = list(exact_rows)
     seen_ids = {int(read_field(row, 0, "id")) for row in exact_rows}
+
+    if exact_only:
+        results: list[dict[str, Any]] = []
+        for row in selected_rows:
+            results.append(
+                {
+                    "id": int(read_field(row, 0, "id")),
+                    "source_name": str(read_field(row, 1, "source_name")),
+                    "term": str(read_field(row, 2, "term")),
+                    "term_norm": str(read_field(row, 3, "term_norm")),
+                    "definition": str(read_field(row, 4, "definition")),
+                }
+            )
+        return {
+            "term": term,
+            "normalized": normalized,
+            "results": results,
+        }
 
     if len(selected_rows) < safe_limit:
         remaining = safe_limit - len(selected_rows)
@@ -3120,6 +3139,17 @@ def clamp_int(
     return max(minimum, min(maximum, parsed))
 
 
+def parse_bool_flag(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value in (None, ""):
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def encode_path_token(path: Path) -> str:
     payload = str(path).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
@@ -3739,10 +3769,58 @@ def build_web_handler(
                 minimum=1,
                 maximum=20,
             )
+            exact_only = parse_bool_flag(query.get("exact_only", [None])[0], default=False)
 
             with self._open_connection() as connection:
-                payload = lookup_dictionary_entries(connection, term, limit=limit)
+                payload = lookup_dictionary_entries(
+                    connection,
+                    term,
+                    limit=limit,
+                    exact_only=exact_only,
+                )
             self._send_json(payload)
+
+        def _handle_api_dictionary_lookup_batch(self, query: dict[str, list[str]]) -> None:
+            raw_terms = query.get("term", [])
+            if not raw_terms:
+                self._send_error_json(400, "term is required.")
+                return
+            cleaned_terms: list[str] = []
+            seen_terms: set[str] = set()
+            for raw_term in raw_terms:
+                value = str(raw_term).strip()
+                if not value:
+                    continue
+                if value in seen_terms:
+                    continue
+                seen_terms.add(value)
+                cleaned_terms.append(value)
+                if len(cleaned_terms) >= 24:
+                    break
+            if not cleaned_terms:
+                self._send_error_json(400, "term is required.")
+                return
+
+            limit = clamp_int(
+                query.get("limit", [None])[0],
+                default=DEFAULT_DICT_LOOKUP_LIMIT,
+                minimum=1,
+                maximum=20,
+            )
+            exact_only = parse_bool_flag(query.get("exact_only", [None])[0], default=False)
+
+            items: list[dict[str, Any]] = []
+            with self._open_connection() as connection:
+                for term in cleaned_terms:
+                    items.append(
+                        lookup_dictionary_entries(
+                            connection,
+                            term,
+                            limit=limit,
+                            exact_only=exact_only,
+                        )
+                    )
+            self._send_json({"items": items})
 
         def _handle_api_bookmarks_get(self, query: dict[str, list[str]]) -> None:
             source_id = self._normalize_source(query.get("source_id", [None])[0])
@@ -4098,6 +4176,9 @@ def build_web_handler(
                     return
                 if path == "/api/dictionary":
                     self._handle_api_dictionary_lookup(query)
+                    return
+                if path == "/api/dictionary/batch":
+                    self._handle_api_dictionary_lookup_batch(query)
                     return
                 if path == "/api/bookmarks":
                     self._handle_api_bookmarks_get(query)
