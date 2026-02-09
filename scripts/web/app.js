@@ -2,6 +2,7 @@ const SEEK_SECONDS = 5;
 const CONTROL_TOGGLE_IDLE_MS = 2600;
 const LYRIC_WHEEL_STEP_DELTA = 52;
 const LYRIC_WHEEL_IDLE_RESET_MS = 260;
+const LYRIC_REEL_AUTO_CLOSE_MS = 620;
 
 const state = {
   videos: [],
@@ -15,6 +16,8 @@ const state = {
   lyricReelIndex: -1,
   lyricWheelAccumulator: 0,
   lyricWheelResetTimer: null,
+  lyricReelAutoCloseTimer: null,
+  lyricReelResumeOnClose: false,
   cues: [],
   activeCueIndex: -1,
   currentTrackId: null,
@@ -720,15 +723,35 @@ function scheduleLyricWheelAccumulatorReset() {
   }, LYRIC_WHEEL_IDLE_RESET_MS);
 }
 
-function closeLyricReel() {
+function clearLyricReelAutoCloseTimer() {
+  if (state.lyricReelAutoCloseTimer !== null) {
+    window.clearTimeout(state.lyricReelAutoCloseTimer);
+    state.lyricReelAutoCloseTimer = null;
+  }
+}
+
+function scheduleLyricReelAutoClose() {
+  clearLyricReelAutoCloseTimer();
+  state.lyricReelAutoCloseTimer = window.setTimeout(() => {
+    closeLyricReel({ resumePlayback: true });
+  }, LYRIC_REEL_AUTO_CLOSE_MS);
+}
+
+function closeLyricReel(options = {}) {
+  const { resumePlayback = false } = options;
   if (!state.lyricReelActive) {
     return;
   }
+  clearLyricReelAutoCloseTimer();
   resetLyricWheelAccumulator();
   state.lyricReelActive = false;
   elements.phoneShell.classList.remove("lyric-reel-active");
   elements.lyricReelOverlay.classList.add("hidden");
   elements.lyricReelOverlay.setAttribute("aria-hidden", "true");
+  if (resumePlayback && state.lyricReelResumeOnClose) {
+    elements.videoPlayer.play().catch(() => {});
+  }
+  state.lyricReelResumeOnClose = false;
 }
 
 function seekLyricReelToIndex(index) {
@@ -748,11 +771,13 @@ function openLyricReel() {
   if (!state.cues.length) {
     return false;
   }
+  const wasPlaying = !elements.videoPlayer.paused;
   const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
   const activeIndex = findActiveCueIndex(currentMs);
   const initialIndex = activeIndex >= 0 ? activeIndex : findNearestCueIndex(currentMs);
 
   state.lyricReelActive = true;
+  state.lyricReelResumeOnClose = wasPlaying;
   resetLyricWheelAccumulator();
   elements.videoPlayer.pause();
   elements.phoneShell.classList.add("lyric-reel-active");
@@ -1261,6 +1286,7 @@ function handleWheel(event) {
         return;
       }
     }
+    scheduleLyricReelAutoClose();
     state.lyricWheelAccumulator += event.deltaY;
     scheduleLyricWheelAccumulatorReset();
 
@@ -1309,7 +1335,7 @@ function handleKeydown(event) {
   if (state.lyricReelActive) {
     if (event.key === "Escape") {
       event.preventDefault();
-      closeLyricReel();
+      closeLyricReel({ resumePlayback: true });
       return;
     }
     if (event.key === "ArrowDown" || key === "j") {
@@ -1478,7 +1504,7 @@ function bindEvents() {
       closeJumpModal();
     }
   });
-  elements.lyricReelOverlay.addEventListener("click", () => closeLyricReel());
+  elements.lyricReelOverlay.addEventListener("click", () => closeLyricReel({ resumePlayback: true }));
 
   elements.sourceSelect.addEventListener("change", () => {
     loadFeed(elements.sourceSelect.value).catch((error) => {
