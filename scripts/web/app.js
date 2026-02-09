@@ -1,7 +1,6 @@
 const SEEK_SECONDS = 5;
 const CONTROL_TOGGLE_IDLE_MS = 2600;
 const LYRIC_WHEEL_STEP_DELTA = 52;
-const LYRIC_WHEEL_IDLE_RESET_MS = 260;
 const LYRIC_REEL_AUTO_CLOSE_MS = 620;
 
 const state = {
@@ -14,8 +13,9 @@ const state = {
   historyPointer: -1,
   lyricReelActive: false,
   lyricReelIndex: -1,
-  lyricWheelAccumulator: 0,
-  lyricWheelResetTimer: null,
+  lyricReelTargetPosition: -1,
+  lyricReelVisualPosition: -1,
+  lyricReelAnimationFrame: null,
   lyricReelAutoCloseTimer: null,
   lyricReelResumeOnClose: false,
   cues: [],
@@ -681,46 +681,113 @@ function findNearestCueIndex(timeMs) {
   return nearest;
 }
 
-function renderLyricReel() {
+function clampLyricReelPosition(position) {
+  if (!state.cues.length) {
+    return -1;
+  }
+  return Math.max(0, Math.min(state.cues.length - 1, position));
+}
+
+function clearLyricReelAnimationFrame() {
+  if (state.lyricReelAnimationFrame !== null) {
+    window.cancelAnimationFrame(state.lyricReelAnimationFrame);
+    state.lyricReelAnimationFrame = null;
+  }
+}
+
+function getCueStartMsAtLyricPosition(position) {
+  const clamped = clampLyricReelPosition(position);
+  if (clamped < 0) {
+    return 0;
+  }
+  const lower = Math.floor(clamped);
+  const upper = Math.min(state.cues.length - 1, Math.ceil(clamped));
+  if (lower === upper) {
+    return state.cues[lower].start_ms;
+  }
+  const ratio = clamped - lower;
+  const lowerStart = state.cues[lower].start_ms;
+  const upperStart = state.cues[upper].start_ms;
+  return lowerStart + ((upperStart - lowerStart) * ratio);
+}
+
+function renderLyricReelAtPosition(position) {
   elements.lyricReelList.textContent = "";
-  if (!state.cues.length || state.lyricReelIndex < 0) {
+  if (!state.cues.length || position < 0) {
     return;
   }
 
-  const start = Math.max(0, state.lyricReelIndex - 4);
-  const end = Math.min(state.cues.length, state.lyricReelIndex + 5);
+  const center = Math.round(position);
+  const start = Math.max(0, center - 5);
+  const end = Math.min(state.cues.length, center + 6);
+
   for (let idx = start; idx < end; idx += 1) {
     const cue = state.cues[idx];
+    const distance = idx - position;
+    const absDistance = Math.abs(distance);
     const line = document.createElement("p");
     line.className = "lyric-reel-line";
-    if (idx === state.lyricReelIndex) {
+    if (absDistance < 0.42) {
       line.classList.add("active");
-    } else if (Math.abs(idx - state.lyricReelIndex) >= 3) {
+    } else if (absDistance >= 3) {
       line.dataset.distance = "far";
     }
+
+    const translateY = distance * 44;
+    const opacity = Math.max(0.16, 1 - (absDistance * 0.22));
+    const scale = absDistance < 0.42
+      ? 1.035
+      : Math.max(0.82, 1 - (absDistance * 0.06));
+    line.style.transform = `translateY(${translateY.toFixed(1)}px) scale(${scale.toFixed(3)})`;
+    line.style.opacity = opacity.toFixed(3);
+    line.style.zIndex = String(100 - Math.round(absDistance * 10));
     line.textContent = cue.text || "...";
     elements.lyricReelList.appendChild(line);
   }
 }
 
-function clearLyricWheelResetTimer() {
-  if (state.lyricWheelResetTimer !== null) {
-    window.clearTimeout(state.lyricWheelResetTimer);
-    state.lyricWheelResetTimer = null;
+function applyLyricReelVisualPosition(position) {
+  const clamped = clampLyricReelPosition(position);
+  if (clamped < 0) {
+    return;
   }
+  state.lyricReelVisualPosition = clamped;
+  state.lyricReelIndex = Math.max(0, Math.min(state.cues.length - 1, Math.round(clamped)));
+  state.activeCueIndex = state.lyricReelIndex;
+
+  const cueStartMs = getCueStartMsAtLyricPosition(clamped);
+  elements.videoPlayer.currentTime = cueStartMs / 1000;
+  elements.subtitleOverlay.textContent = state.cues[state.lyricReelIndex]?.text || "...";
+  renderLyricReelAtPosition(clamped);
 }
 
-function resetLyricWheelAccumulator() {
-  clearLyricWheelResetTimer();
-  state.lyricWheelAccumulator = 0;
+function animateLyricReel() {
+  const diff = state.lyricReelTargetPosition - state.lyricReelVisualPosition;
+  if (Math.abs(diff) < 0.002) {
+    applyLyricReelVisualPosition(state.lyricReelTargetPosition);
+    clearLyricReelAnimationFrame();
+    return;
+  }
+
+  const nextPosition = state.lyricReelVisualPosition + (diff * 0.24);
+  applyLyricReelVisualPosition(nextPosition);
+  state.lyricReelAnimationFrame = window.requestAnimationFrame(animateLyricReel);
 }
 
-function scheduleLyricWheelAccumulatorReset() {
-  clearLyricWheelResetTimer();
-  state.lyricWheelResetTimer = window.setTimeout(() => {
-    state.lyricWheelAccumulator = 0;
-    state.lyricWheelResetTimer = null;
-  }, LYRIC_WHEEL_IDLE_RESET_MS);
+function setLyricReelTargetPosition(position, immediate = false) {
+  const clamped = clampLyricReelPosition(position);
+  if (clamped < 0) {
+    return;
+  }
+  state.lyricReelTargetPosition = clamped;
+  if (immediate || state.lyricReelVisualPosition < 0) {
+    clearLyricReelAnimationFrame();
+    applyLyricReelVisualPosition(clamped);
+    return;
+  }
+  if (state.lyricReelAnimationFrame === null) {
+    state.lyricReelAnimationFrame = window.requestAnimationFrame(animateLyricReel);
+  }
 }
 
 function clearLyricReelAutoCloseTimer() {
@@ -743,8 +810,10 @@ function closeLyricReel(options = {}) {
     return;
   }
   clearLyricReelAutoCloseTimer();
-  resetLyricWheelAccumulator();
+  clearLyricReelAnimationFrame();
   state.lyricReelActive = false;
+  state.lyricReelTargetPosition = -1;
+  state.lyricReelVisualPosition = -1;
   elements.phoneShell.classList.remove("lyric-reel-active");
   elements.lyricReelOverlay.classList.add("hidden");
   elements.lyricReelOverlay.setAttribute("aria-hidden", "true");
@@ -752,19 +821,6 @@ function closeLyricReel(options = {}) {
     elements.videoPlayer.play().catch(() => {});
   }
   state.lyricReelResumeOnClose = false;
-}
-
-function seekLyricReelToIndex(index) {
-  if (!state.cues.length) {
-    return;
-  }
-  const nextIndex = Math.max(0, Math.min(state.cues.length - 1, index));
-  const cue = state.cues[nextIndex];
-  state.lyricReelIndex = nextIndex;
-  state.activeCueIndex = nextIndex;
-  elements.videoPlayer.currentTime = cue.start_ms / 1000;
-  elements.subtitleOverlay.textContent = cue.text || "...";
-  renderLyricReel();
 }
 
 function openLyricReel() {
@@ -778,12 +834,12 @@ function openLyricReel() {
 
   state.lyricReelActive = true;
   state.lyricReelResumeOnClose = wasPlaying;
-  resetLyricWheelAccumulator();
+  clearLyricReelAnimationFrame();
   elements.videoPlayer.pause();
   elements.phoneShell.classList.add("lyric-reel-active");
   elements.lyricReelOverlay.classList.remove("hidden");
   elements.lyricReelOverlay.setAttribute("aria-hidden", "false");
-  seekLyricReelToIndex(initialIndex >= 0 ? initialIndex : 0);
+  setLyricReelTargetPosition(initialIndex >= 0 ? initialIndex : 0, true);
   return true;
 }
 
@@ -793,12 +849,17 @@ function stepLyricReel(step) {
       return false;
     }
   }
-  const nextIndex = state.lyricReelIndex + step;
-  seekLyricReelToIndex(nextIndex);
+  const base = state.lyricReelTargetPosition >= 0
+    ? state.lyricReelTargetPosition
+    : state.lyricReelIndex;
+  setLyricReelTargetPosition(base + step, false);
   return true;
 }
 
 function updateSubtitleFromPlayback() {
+  if (state.lyricReelActive) {
+    return;
+  }
   if (!state.cues.length) {
     return;
   }
@@ -1251,8 +1312,7 @@ function seekBySeconds(deltaSeconds) {
   if (state.lyricReelActive && state.cues.length) {
     const nearestIndex = findNearestCueIndex(Math.round(next * 1000));
     if (nearestIndex >= 0) {
-      state.lyricReelIndex = nearestIndex;
-      renderLyricReel();
+      setLyricReelTargetPosition(nearestIndex, true);
     }
   }
   updateSubtitleFromPlayback();
@@ -1287,18 +1347,11 @@ function handleWheel(event) {
       }
     }
     scheduleLyricReelAutoClose();
-    state.lyricWheelAccumulator += event.deltaY;
-    scheduleLyricWheelAccumulatorReset();
-
-    const steps = Math.floor(Math.abs(state.lyricWheelAccumulator) / LYRIC_WHEEL_STEP_DELTA);
-    if (steps <= 0) {
-      return;
-    }
-    const direction = state.lyricWheelAccumulator > 0 ? 1 : -1;
-    for (let idx = 0; idx < steps; idx += 1) {
-      seekLyricReelToIndex(state.lyricReelIndex + direction);
-    }
-    state.lyricWheelAccumulator -= direction * steps * LYRIC_WHEEL_STEP_DELTA;
+    const currentTarget = state.lyricReelTargetPosition >= 0
+      ? state.lyricReelTargetPosition
+      : state.lyricReelVisualPosition;
+    const deltaLines = event.deltaY / LYRIC_WHEEL_STEP_DELTA;
+    setLyricReelTargetPosition(currentTarget + deltaLines, false);
     return;
   }
 
