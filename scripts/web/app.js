@@ -1273,6 +1273,50 @@ function stepLyricReel(step) {
   return true;
 }
 
+function isNodeInsideDictionaryPopup(node) {
+  let current = node;
+  while (current) {
+    if (current === elements.subtitleDictPopup) {
+      return true;
+    }
+    current = current.parentNode;
+  }
+  return false;
+}
+
+function hasDictionarySelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.toString()) {
+    return false;
+  }
+  return isNodeInsideDictionaryPopup(selection.anchorNode) || isNodeInsideDictionaryPopup(selection.focusNode);
+}
+
+function stepSubtitleCue(step) {
+  if (!state.cues.length || !elements.videoPlayer.src) {
+    return false;
+  }
+  const direction = step >= 0 ? 1 : -1;
+  let baseIndex = state.activeCueIndex;
+  if (baseIndex < 0 || baseIndex >= state.cues.length) {
+    const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+    const active = findActiveCueIndex(currentMs);
+    baseIndex = active >= 0 ? active : findNearestCueIndex(currentMs);
+  }
+  if (baseIndex < 0) {
+    baseIndex = 0;
+  }
+  const targetIndex = Math.max(0, Math.min(state.cues.length - 1, baseIndex + direction));
+  const cue = state.cues[targetIndex];
+  if (!cue) {
+    return false;
+  }
+  state.activeCueIndex = targetIndex;
+  elements.videoPlayer.currentTime = Math.max(0, cue.start_ms / 1000);
+  renderSubtitleOverlayText(cue.text || "...");
+  return true;
+}
+
 function updateSubtitleFromPlayback() {
   if (state.lyricReelActive) {
     return;
@@ -1835,6 +1879,13 @@ function handleKeydown(event) {
   if (event.metaKey || event.ctrlKey || event.altKey) {
     return;
   }
+  if (
+    event.shiftKey &&
+    (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+    hasDictionarySelection()
+  ) {
+    return;
+  }
   if (state.lyricReelActive) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1865,13 +1916,37 @@ function handleKeydown(event) {
     return;
   }
 
-  if (event.key === "ArrowDown" || key === "j") {
+  if (event.shiftKey && event.key === "ArrowDown") {
     event.preventDefault();
     nextVideo().catch((error) => setStatus(error.message, "error"));
     return;
   }
 
-  if (event.key === "ArrowUp" || key === "k") {
+  if (event.shiftKey && event.key === "ArrowUp") {
+    event.preventDefault();
+    prevVideo().catch((error) => setStatus(error.message, "error"));
+    return;
+  }
+
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    stepSubtitleCue(1);
+    return;
+  }
+
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    stepSubtitleCue(-1);
+    return;
+  }
+
+  if (key === "j") {
+    event.preventDefault();
+    nextVideo().catch((error) => setStatus(error.message, "error"));
+    return;
+  }
+
+  if (key === "k") {
     event.preventDefault();
     prevVideo().catch((error) => setStatus(error.message, "error"));
     return;
