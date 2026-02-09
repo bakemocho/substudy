@@ -817,11 +817,12 @@ function startDictionaryHoverLoop() {
     state.dictHoverLoopPauseOnStop = elements.videoPlayer.paused;
   }
   state.dictHoverLoopActive = true;
+  const shouldAutoPlay = !state.dictHoverLoopPauseOnStop;
   const nowMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
   if (nowMs < startMs || nowMs > endMs) {
     elements.videoPlayer.currentTime = startMs / 1000;
   }
-  if (elements.videoPlayer.paused) {
+  if (shouldAutoPlay && elements.videoPlayer.paused) {
     elements.videoPlayer.play().catch(() => {});
   }
 }
@@ -839,7 +840,7 @@ function enforceDictionaryHoverLoop() {
   const nowMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
   if (nowMs >= endMs || nowMs < startMs - 80) {
     elements.videoPlayer.currentTime = startMs / 1000;
-    if (elements.videoPlayer.paused) {
+    if (!state.dictHoverLoopPauseOnStop && elements.videoPlayer.paused) {
       elements.videoPlayer.play().catch(() => {});
     }
   }
