@@ -1742,9 +1742,53 @@ def upsert_video_and_subtitles(
         )
 
 
+def prune_source_videos_full_rebuild(
+    connection: sqlite3.Connection,
+    source_id: str,
+    keep_video_ids: list[str],
+) -> None:
+    """Delete only stale rows after full rebuild without wiping per-video analysis columns."""
+    connection.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS tmp_keep_video_ids (
+            video_id TEXT PRIMARY KEY
+        )
+        """
+    )
+    connection.execute("DELETE FROM tmp_keep_video_ids")
+    if keep_video_ids:
+        connection.executemany(
+            "INSERT OR IGNORE INTO tmp_keep_video_ids(video_id) VALUES (?)",
+            ((video_id,) for video_id in keep_video_ids),
+        )
+
+    # Keep side tables consistent when full rebuild drops videos that no longer exist.
+    for table_name in ("video_favorites", "subtitle_bookmarks", "video_notes"):
+        connection.execute(
+            f"""
+            DELETE FROM {table_name}
+            WHERE source_id = ?
+              AND video_id NOT IN (
+                SELECT video_id FROM tmp_keep_video_ids
+              )
+            """,
+            (source_id,),
+        )
+
+    connection.execute(
+        """
+        DELETE FROM videos
+        WHERE source_id = ?
+          AND video_id NOT IN (
+            SELECT video_id FROM tmp_keep_video_ids
+          )
+        """,
+        (source_id,),
+    )
+
+
 def rebuild_source_full(connection: sqlite3.Connection, source: SourceConfig, synced_at: str) -> None:
     connection.execute("DELETE FROM subtitles WHERE source_id = ?", (source.id,))
-    connection.execute("DELETE FROM videos WHERE source_id = ?", (source.id,))
 
     meta_records = load_meta_records(source.meta_dir)
     media_files = scan_media_files(source)
@@ -1770,6 +1814,8 @@ def rebuild_source_full(connection: sqlite3.Connection, source: SourceConfig, sy
             subtitle_records=subtitle_records,
             synced_at=synced_at,
         )
+
+    prune_source_videos_full_rebuild(connection, source.id, all_video_ids)
 
     print(
         f"[ledger] {source.id}: full videos={len(all_video_ids)} "

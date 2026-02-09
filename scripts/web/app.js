@@ -2290,14 +2290,13 @@ function renderSubtitlePanelReel() {
     jaLine.className = "subtitle-panel-line ja";
     if (row.ja_text) {
       jaLine.textContent = row.ja_text;
-    } else {
-      jaLine.classList.add("missing");
-      jaLine.textContent = "（和訳なし）";
     }
 
     rowEl.appendChild(head);
     rowEl.appendChild(enLine);
-    rowEl.appendChild(jaLine);
+    if (row.ja_text) {
+      rowEl.appendChild(jaLine);
+    }
     elements.subtitlePanelReel.appendChild(rowEl);
   }
   updateSubtitlePanelBookmarkStates();
