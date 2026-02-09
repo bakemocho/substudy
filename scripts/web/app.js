@@ -2705,10 +2705,17 @@ function bindEvents() {
   elements.subtitleDictPopup.addEventListener(
     "wheel",
     (event) => {
+      event.preventDefault();
       event.stopPropagation();
       clearDictionaryPopupHideTimer();
+      if (event.deltaY !== 0) {
+        elements.subtitleDictPopup.scrollTop += event.deltaY;
+      }
+      if (event.deltaX !== 0) {
+        elements.subtitleDictPopup.scrollLeft += event.deltaX;
+      }
     },
-    { passive: true }
+    { passive: false }
   );
 
   elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
