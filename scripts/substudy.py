@@ -1827,7 +1827,40 @@ def rebuild_source_incremental(connection: sqlite3.Connection, source: SourceCon
     media_backfill_ids = media_archive_ids & no_media_ids
     subtitle_backfill_ids = subs_archive_ids & no_subtitle_ids
 
-    candidate_ids = missing_from_db_ids | no_meta_ids | media_backfill_ids | subtitle_backfill_ids
+    # Keep incremental mode aware of subtitle file add/remove updates for existing videos.
+    # This allows translation subtitle drops (e.g., *.ja.vtt) to appear without full rebuild.
+    subtitle_files = scan_subtitles(source)
+    db_subtitle_paths_by_video: dict[str, set[str]] = {}
+    for row in connection.execute(
+        """
+        SELECT video_id, subtitle_path
+        FROM subtitles
+        WHERE source_id = ?
+        """,
+        (source.id,),
+    ).fetchall():
+        video_id = str(row[0])
+        subtitle_path = str(row[1])
+        db_subtitle_paths_by_video.setdefault(video_id, set()).add(subtitle_path)
+
+    subtitle_changed_ids: set[str] = set()
+    subtitle_video_ids = set(subtitle_files) | set(db_subtitle_paths_by_video)
+    for video_id in subtitle_video_ids:
+        scanned_paths = {
+            str(path)
+            for _, path, _ in subtitle_files.get(video_id, [])
+        }
+        db_paths = db_subtitle_paths_by_video.get(video_id, set())
+        if scanned_paths != db_paths:
+            subtitle_changed_ids.add(video_id)
+
+    candidate_ids = (
+        missing_from_db_ids
+        | no_meta_ids
+        | media_backfill_ids
+        | subtitle_backfill_ids
+        | subtitle_changed_ids
+    )
     if not candidate_ids:
         print(f"[ledger] {source.id}: incremental up to date")
         return
@@ -1863,6 +1896,7 @@ def rebuild_source_incremental(connection: sqlite3.Connection, source: SourceCon
         f"[ledger] {source.id}: incremental updated={updated} "
         f"new_from_archive={len(missing_from_db_ids)} no_meta={len(no_meta_ids)} "
         f"media_backfill={len(media_backfill_ids)} subtitle_backfill={len(subtitle_backfill_ids)} "
+        f"subtitle_changed={len(subtitle_changed_ids)} "
         f"meta={with_meta} media={with_media} subs={with_subtitles}"
     )
 
@@ -3630,9 +3664,27 @@ def build_web_handler(
             if source_filter and not self._is_source_allowed(source_filter):
                 self._send_error_json(403, "Source is not allowed.")
                 return
+            translation_filter = str(query.get("translation_filter", ["all"])[0] or "all").strip().lower()
+            if translation_filter not in {"all", "ja_only", "ja_missing"}:
+                translation_filter = "all"
 
             limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
             offset = clamp_int(query.get("offset", [None])[0], default=0, minimum=0, maximum=20000)
+
+            def ja_subtitle_exists_clause(video_alias: str) -> str:
+                return f"""
+                EXISTS (
+                    SELECT 1
+                    FROM subtitles sja
+                    WHERE sja.source_id = {video_alias}.source_id
+                      AND sja.video_id = {video_alias}.video_id
+                      AND (
+                        LOWER(COALESCE(sja.language, '')) = 'ja'
+                        OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-%'
+                        OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja.%'
+                      )
+                )
+                """
 
             where_clauses = [
                 "v.has_media = 1",
@@ -3646,6 +3698,10 @@ def build_web_handler(
             if source_filter:
                 where_clauses.append("v.source_id = ?")
                 params.append(source_filter)
+            if translation_filter == "ja_only":
+                where_clauses.append(ja_subtitle_exists_clause("v"))
+            elif translation_filter == "ja_missing":
+                where_clauses.append(f"NOT ({ja_subtitle_exists_clause('v')})")
 
             with self._open_connection() as connection:
                 rows = connection.execute(
@@ -3694,6 +3750,10 @@ def build_web_handler(
                     placeholders = ",".join("?" for _ in sorted(allowed_source_ids))
                     source_where_clauses.append(f"source_id IN ({placeholders})")
                     source_params.extend(sorted(allowed_source_ids))
+                if translation_filter == "ja_only":
+                    source_where_clauses.append(ja_subtitle_exists_clause("videos"))
+                elif translation_filter == "ja_missing":
+                    source_where_clauses.append(f"NOT ({ja_subtitle_exists_clause('videos')})")
                 source_rows = connection.execute(
                     f"""
                     SELECT DISTINCT source_id
@@ -3725,6 +3785,20 @@ def build_web_handler(
                         }
                         for track in tracks
                     ]
+                    has_ja_track = any(
+                        (
+                            str(track["kind"]).strip().lower() == "subtitle"
+                            and (
+                                str(track["label"]).strip().lower() == "ja"
+                                or str(track["label"]).strip().lower().startswith("ja-")
+                            )
+                        )
+                        for track in public_tracks
+                    )
+                    if translation_filter == "ja_only" and not has_ja_track:
+                        continue
+                    if translation_filter == "ja_missing" and has_ja_track:
+                        continue
                     videos.append(
                         {
                             "source_id": source_id,
@@ -3763,6 +3837,7 @@ def build_web_handler(
                     "videos": videos,
                     "count": len(videos),
                     "sources": source_ids,
+                    "translation_filter": translation_filter,
                 }
             )
 

@@ -18,6 +18,7 @@ const DICT_PREFETCH_HEAD_TERMS = 64;
 const DICT_PREFETCH_BATCH_SIZE = 12;
 const DICT_PREFETCH_BATCH_DELAY_MS = 32;
 const DICT_PREFETCH_START_DELAY_MS = 90;
+const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
@@ -104,10 +105,18 @@ const state = {
   dictPrefetchToken: 0,
   dictPrefetchedVideoKeys: new Set(),
   dictPrefetchPendingVideoKeys: new Set(),
+  translationFilter: (() => {
+    const stored = String(localStorage.getItem("substudy.translation_filter") || "").trim();
+    if (TRANSLATION_FILTER_VALUES.has(stored)) {
+      return stored;
+    }
+    return "all";
+  })(),
 };
 
 const elements = {
   sourceSelect: document.getElementById("sourceSelect"),
+  translationFilterSelect: document.getElementById("translationFilterSelect"),
   jumpOpenBtn: document.getElementById("jumpOpenBtn"),
   autoplayToggle: document.getElementById("autoplayToggle"),
   shuffleToggle: document.getElementById("shuffleToggle"),
@@ -440,24 +449,61 @@ function loadVolumeSettings() {
   applyVolumeSettings(initialVolume, storedMuted);
 }
 
+function normalizeTranslationFilter(value, fallback = "all") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (TRANSLATION_FILTER_VALUES.has(normalized)) {
+    return normalized;
+  }
+  return TRANSLATION_FILTER_VALUES.has(String(fallback || "").trim().toLowerCase())
+    ? String(fallback).trim().toLowerCase()
+    : "all";
+}
+
+function hasJaSubtitleTrack(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  return tracks.some((track) => {
+    if (String(track?.kind || "").trim().toLowerCase() !== "subtitle") {
+      return false;
+    }
+    const label = String(track?.label || "").trim().toLowerCase();
+    return label === "ja" || label.startsWith("ja-");
+  });
+}
+
+function updateTranslationFilterSelect() {
+  if (!elements.translationFilterSelect) {
+    return;
+  }
+  elements.translationFilterSelect.value = normalizeTranslationFilter(state.translationFilter, "all");
+}
+
 function parseInitialVideoSelectionFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
     const sourceId = String(params.get("source_id") || "").trim();
     const videoId = String(params.get("video_id") || "").trim();
+    const hasTranslationFilter = params.has("translation_filter");
+    const translationFilter = normalizeTranslationFilter(
+      params.get("translation_filter"),
+      state.translationFilter
+    );
     return {
       sourceId,
       videoId,
+      translationFilter,
+      hasTranslationFilter,
     };
   } catch (_error) {
     return {
       sourceId: "",
       videoId: "",
+      translationFilter: state.translationFilter,
+      hasTranslationFilter: false,
     };
   }
 }
 
-function updateUrlVideoSelection(sourceId = "", videoId = "") {
+function updateUrlVideoSelection(sourceId = "", videoId = "", translationFilter = state.translationFilter) {
   try {
     const url = new URL(window.location.href);
     if (sourceId) {
@@ -469,6 +515,12 @@ function updateUrlVideoSelection(sourceId = "", videoId = "") {
       url.searchParams.set("video_id", videoId);
     } else {
       url.searchParams.delete("video_id");
+    }
+    const normalizedTranslationFilter = normalizeTranslationFilter(translationFilter, "all");
+    if (normalizedTranslationFilter !== "all") {
+      url.searchParams.set("translation_filter", normalizedTranslationFilter);
+    } else {
+      url.searchParams.delete("translation_filter");
     }
     const search = url.searchParams.toString();
     const nextRelativeUrl = `${url.pathname}${search ? `?${search}` : ""}${url.hash || ""}`;
@@ -2347,9 +2399,17 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   setStatus(`動画を表示中: ${video.source_id} (${state.index + 1}/${state.videos.length})`);
 }
 
-async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "") {
+async function loadFeed(
+  sourceId = "",
+  startRandom = false,
+  preferredVideoId = "",
+  translationFilter = state.translationFilter
+) {
   closeJumpModal();
   closeLyricReel();
+  state.translationFilter = normalizeTranslationFilter(translationFilter, state.translationFilter);
+  localStorage.setItem("substudy.translation_filter", state.translationFilter);
+  updateTranslationFilterSelect();
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
@@ -2357,12 +2417,33 @@ async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "
   if (sourceId) {
     params.set("source_id", sourceId);
   }
+  params.set("translation_filter", state.translationFilter);
 
   setStatus("フィードを読み込み中...");
   const payload = await apiRequest(`/api/feed?${params.toString()}`);
 
-  state.videos = Array.isArray(payload.videos) ? payload.videos : [];
-  state.sources = Array.isArray(payload.sources) ? payload.sources : [];
+  let loadedVideos = Array.isArray(payload.videos) ? payload.videos : [];
+  let loadedSources = Array.isArray(payload.sources) ? payload.sources : [];
+  const serverFilter = String(payload.translation_filter || "").trim().toLowerCase();
+  const serverFilterMismatch = (
+    state.translationFilter !== "all"
+    && (!TRANSLATION_FILTER_VALUES.has(serverFilter) || serverFilter !== state.translationFilter)
+  );
+  if (serverFilterMismatch) {
+    loadedVideos = loadedVideos.filter((video) => (
+      state.translationFilter === "ja_only"
+        ? hasJaSubtitleTrack(video)
+        : !hasJaSubtitleTrack(video)
+    ));
+    const sourceSet = new Set(loadedVideos.map((video) => String(video?.source_id || "")).filter(Boolean));
+    loadedSources = loadedSources.filter((source) => sourceSet.has(String(source || "")));
+    if (sourceId && !sourceSet.has(sourceId)) {
+      loadedSources = [...new Set([...loadedSources, sourceId])];
+    }
+  }
+
+  state.videos = loadedVideos;
+  state.sources = loadedSources;
   state.index = 0;
   state.rangeStartMs = null;
   state.metaExpanded = false;
@@ -2397,7 +2478,14 @@ async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "
   }
   resetPlaybackTracking(initialIndex);
   await openVideo(initialIndex, true, "keep");
-  setStatus(`${state.videos.length}件の動画を読み込みました。`, "ok");
+  if (serverFilterMismatch) {
+    setStatus(
+      `${state.videos.length}件の動画を読み込みました。和訳フィルタはローカル適用です（Webサーバー再起動推奨）。`,
+      "ok"
+    );
+  } else {
+    setStatus(`${state.videos.length}件の動画を読み込みました。`, "ok");
+  }
 }
 
 async function nextVideo() {
@@ -2964,11 +3052,22 @@ function bindEvents() {
   });
 
   elements.sourceSelect.addEventListener("change", () => {
-    loadFeed(elements.sourceSelect.value).catch((error) => {
+    loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
       setStatus(error.message, "error");
     });
     resetControlsToggleFade();
   });
+  if (elements.translationFilterSelect) {
+    elements.translationFilterSelect.addEventListener("change", () => {
+      state.translationFilter = normalizeTranslationFilter(elements.translationFilterSelect.value, "all");
+      localStorage.setItem("substudy.translation_filter", state.translationFilter);
+      updateTranslationFilterSelect();
+      loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
+        setStatus(error.message, "error");
+      });
+      resetControlsToggleFade();
+    });
+  }
 
   elements.autoplayToggle.addEventListener("click", () => {
     state.autoplayContinuous = !state.autoplayContinuous;
@@ -3135,16 +3234,23 @@ async function initialize() {
   updateShuffleToggle();
   updateNormalizationToggle();
   updateDictHoverLoopToggle();
+  updateTranslationFilterSelect();
   loadVolumeSettings();
   updatePlayPauseButton();
   bindEvents();
 
   try {
     const initialSelection = parseInitialVideoSelectionFromUrl();
+    if (initialSelection.hasTranslationFilter) {
+      state.translationFilter = normalizeTranslationFilter(initialSelection.translationFilter, "all");
+      localStorage.setItem("substudy.translation_filter", state.translationFilter);
+      updateTranslationFilterSelect();
+    }
     await loadFeed(
       initialSelection.sourceId,
       false,
-      initialSelection.videoId
+      initialSelection.videoId,
+      state.translationFilter
     );
     setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
   } catch (error) {

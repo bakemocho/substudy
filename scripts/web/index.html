@@ -22,6 +22,14 @@
             <span>Source</span>
             <select id="sourceSelect"></select>
           </label>
+          <label class="source-filter">
+            <span>字幕状態</span>
+            <select id="translationFilterSelect">
+              <option value="all">全動画</option>
+              <option value="ja_only">和訳あり</option>
+              <option value="ja_missing">和訳なし</option>
+            </select>
+          </label>
           <button id="jumpOpenBtn" class="ghost-btn jump-open-btn" type="button">ジャンプ (G)</button>
           <button id="autoplayToggle" class="ghost-btn" type="button">連続再生: ON</button>
           <button id="shuffleToggle" class="ghost-btn" type="button">シャッフル: OFF</button>
