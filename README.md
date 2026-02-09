@@ -220,54 +220,160 @@ print(dst)
 PY
 ```
 
-## Roadmap: Dictionary + NLP + Translation (planned)
+## Roadmap (updated)
 
-Planned next steps for grammar-aware subtitle study UX.
+Current priority is subtitle-first study UX: fast cue navigation + EN/JA parallel reading.
 
-### 0) EIJIRO dictionary ingestion
+### 0) Done / baseline
 
-- Current status: initial implementation done (`dict-index` + hover lookup backend).
-- Target source: `/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
-- Encoding note (verified): strict decode with `cp932` (`windows-31j`) succeeds for the full file.
-- `shift_jis` fails on vendor extension bytes (example: `0xFB..`), so ingestion should not assume strict Shift_JIS.
-- To improve usability, keep a normalized UTF-8 artifact in this project (or SQLite-only import) and treat the original as source-of-truth input.
-- Build a one-time dictionary index pipeline (planned command: `substudy.py dict-index`):
-  - Parse line-oriented entries from EIJIRO.
-  - Normalize keys (lowercase, lemma-like form, punctuation cleanup).
-  - Save to SQLite (`dict_entries` + `dict_entries_fts` for fast lookup).
-  - Optionally export UTF-8 TSV/JSONL for editor-friendly inspection.
+- EIJIRO dictionary indexing (`dict-index`) + hover lookup + collocation ranking.
+- Hover dictionary UX improvements (copy, loop, scroll isolation, prefetch).
+- Translation runbook + translation log table (`translation_runs`) in SQLite.
+- EN/JA subtitle tracks can be added by file naming (`video_id.<lang>.<ext>`) and reflected by `ledger`.
 
-### 1) Subtitle NLP cache (token/POS/dependency)
+### 1) Next: translated-availability filter (prerequisite for parallel cards)
 
-- Reuse structure ideas from:
-  - `/Users/bakemocho/gitwork_bk/vseg/avseg/inorder_dependency.py`
-  - `/Users/bakemocho/gitwork_bk/vseg/avseg/chunkify_segments.py`
-- English parsing target: spaCy `en_core_web_sm` (token, lemma, POS, dependency head).
-- Persist per-cue analysis in SQLite cache (planned table: `subtitle_nlp_cache`):
-  - `source_id`, `video_id`, `track`, `start_ms`, `end_ms`, `text_hash`
-  - `tokens_json`, `deps_json`, `importance_json`, `analyzed_at`
+Goal: enable stable study-mode feed slicing before EN/JA card expansion.
 
-### 2) Study UI enhancements
+- Add feed filter mode:
+  - `all`
+  - `ja_only` (和訳済みのみ)
+  - `ja_missing` (未和訳のみ)
+- Source of truth:
+  - subtitle track existence (`video_id.ja.*`)
+  - optional `translation_runs` status as supplemental signal
+- Keep behavior deterministic in UI:
+  - persist selected filter in URL/query + local storage
+  - apply filter without breaking shuffle/history behavior
 
-- POS-based color coding for subtitle tokens.
-- Importance-based emphasis (frequency/learning priority).
-- Dependency arrows rendered above subtitle text (graphical syntax guidance).
-- Token click/hover opens dictionary panel with EIJIRO candidates.
+Acceptance:
 
-### 3) LLM translation track (EN -> JA)
+- Filtered feed count is consistent across reloads.
+- `ja_only` mode never shows videos without JA track.
+- Missing JA data degrades gracefully (no crash).
 
-- Add optional translated subtitle track in addition to original English.
-- Cache translation results in SQLite (planned table: `subtitle_translations`):
-  - key: cue identity + `text_hash` + model/version
-  - value: translated text, metadata, timestamps
-- UI toggle between original and translated subtitle track.
+### 2) Next: subtitle reel in player side panel
 
-### 4) Automation rollout
+Goal: repurpose the current "字幕ブックマーク" area as a subtitle reel panel.
 
-- Daily/weekly jobs already run `sync/backfill/ledger/loudness/asr`.
-- After manual validation, optionally add `nlp` and `translate` stages as opt-in automation.
-- Keep translation stage disable-by-default until quality and token cost are measured.
-- `bep-eng.txt` is a reading dictionary and is currently out of scope for this pipeline.
+- Replace panel default content with reel list centered on current cue.
+- Reel row should show:
+  - line 1: English cue
+  - line 2: Japanese cue (if available)
+- Keep cue click behavior: jump video to cue `start_ms`.
+- Keep bookmark feature, but move it behind each reel row (row action) instead of occupying panel as primary view.
+
+Acceptance:
+
+- During playback, active cue stays centered and updates smoothly.
+- Reel click seeks accurately.
+- Existing bookmark APIs remain usable (no data migration required).
+
+### 3) Next: EN/JA parallel subtitle mapping
+
+Goal: stable 1:1 view for bilingual cues.
+
+- Add client-side cue aligner:
+  - primary key: `start_ms/end_ms`
+  - fallback: nearest timestamp within threshold
+- Rendering rules:
+  - JA missing -> show EN only
+  - EN missing (rare) -> show JA with marker
+- Add panel toggle:
+  - `EN only`
+  - `EN + JA` (default for study mode)
+
+Acceptance:
+
+- For typical tracks, most cues align without visible mismatch.
+- No crash/blank panel when one language track is missing.
+
+### 4) Next: similar-scene suggestion via cue embeddings
+
+Goal: let users discover semantically similar scenes from current subtitle context.
+
+- Build embeddings for subtitle cue windows (current cue + surrounding cues).
+- Index vectors locally (FAISS or equivalent local ANN index).
+- Add `Similar Scenes` action from current cue / subtitle reel row.
+- Retrieval rules:
+  - exclude near-duplicate neighbors in same video/time neighborhood
+  - return diverse results across videos/sources when possible
+- Result card should show:
+  - EN cue text
+  - JA cue text (if available)
+  - source/video and timestamp
+  - click-to-jump behavior
+
+Acceptance:
+
+- Query from current cue returns relevant top-k candidates quickly.
+- Results are not dominated by same-video adjacent cues.
+- Jump from suggestion lands on correct timestamp and updates subtitle state.
+
+### 5) Next: hover dictionary expansion (bookmark + recursive hover)
+
+Goal: make hover dictionary a reusable learning surface.
+
+- Add dictionary bookmark action in hover popup.
+  - bookmark unit: term/definition + video context (source/video/track/time/cue text)
+  - persist in dedicated table (`dictionary_bookmarks`)
+- Add recursive hover inside dictionary popup.
+  - hovering English words in definitions opens next-level popup lookup
+  - keep depth guard + visited-term guard to prevent infinite loop
+- Keep MVP storage model simple:
+  - subtitle JSON migration is not required for this step
+  - can be implemented with existing subtitle files + SQLite metadata
+
+Acceptance:
+
+- Popup bookmark toggle is responsive and persists after reload.
+- Recursive hover works for nested terms without UI lock/conflict.
+- Existing subtitle hover behavior remains intact.
+
+### 6) Next: reel linguistics overlay (NLP + dependencies)
+
+Goal: treat subtitle reel as grammar visualization surface.
+
+- Add English token/POS layer for each reel row.
+- Add dependency edges (head -> dependent) as overlay arrows on reel lines.
+- Color-code tokens by POS category.
+- Add EN/JA alignment color hints:
+  - same color group for likely aligned EN token span and JA phrase span
+  - fallback to neutral color when alignment confidence is low
+- Keep interactions readable:
+  - overlay can be toggled on/off
+  - hover dictionary and dependency overlay do not conflict
+
+Acceptance:
+
+- Dependency arrows render without blocking line selection/click.
+- POS colors are consistent across videos and tracks.
+- EN/JA alignment coloring remains stable when seeking/scrolling.
+
+### 7) Quality/performance pass for reel + dictionary coexistence
+
+- Ensure wheel/keyboard focus rules are unambiguous between:
+  - reel scrolling
+  - hover dictionary popup
+  - video seek / next-prev
+- Keep dictionary lookup latency low with prefetch + cache hit monitoring.
+- Add lightweight regression checks for:
+  - cue sync drift
+  - popup interaction conflicts
+  - keybind conflicts
+
+### 8) Translation pipeline hardening
+
+- Add helper command for translation target extraction (video-present subtitle set).
+- Add DB write helper for `translation_runs` (active/superseded transaction pattern).
+- Keep translation automation opt-in until quality/cost metrics stabilize.
+
+### Backlog
+
+- Unified subtitle JSON model (optional, only when metadata pressure grows).
+- Word importance ranking by frequency/learning priority.
+- Extended grammar visualization beyond reel view.
+- `bep-eng.txt` integration remains out of scope for current roadmap.
 
 ## Add more creators
 
