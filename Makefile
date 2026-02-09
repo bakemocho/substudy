@@ -1,7 +1,7 @@
 PYTHON ?= python3
 CONFIG ?= config/sources.toml
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -32,3 +32,6 @@ downloads:
 
 loudness:
 	$(PYTHON) scripts/substudy.py loudness --config $(CONFIG)
+
+dict-index:
+	$(PYTHON) scripts/substudy.py dict-index --config $(CONFIG)

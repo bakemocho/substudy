@@ -39,6 +39,11 @@ DEFAULT_LOUDNESS_MAX_BOOST_DB = 6.0
 DEFAULT_LOUDNESS_MAX_CUT_DB = 12.0
 DEFAULT_LOUDNESS_LIMIT = 300
 DEFAULT_LOUDNESS_FFMPEG_BIN = "ffmpeg"
+DEFAULT_DICT_SOURCE_NAME = "eijiro-1449"
+DEFAULT_DICT_ENCODING = "utf-8"
+DEFAULT_DICT_PATH = Path("data/eijiro-1449.utf8.txt")
+DEFAULT_DICT_LOOKUP_LIMIT = 8
+DICT_INDEX_BATCH_SIZE = 2000
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8876
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
@@ -861,6 +866,114 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def normalize_dictionary_term(raw_value: str) -> str:
+    value = str(raw_value or "")
+    if not value:
+        return ""
+    value = (
+        value
+        .replace("’", "'")
+        .replace("‘", "'")
+        .replace("`", "'")
+        .replace('"', " ")
+        .replace("“", " ")
+        .replace("”", " ")
+        .replace("‐", "-")
+        .replace("‑", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+    value = re.sub(r"[,:;!?()\[\]{}<>]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip().lower()
+    value = value.strip("\"'()[]{}<>")
+    value = re.sub(r"^[^a-z0-9]+|[^a-z0-9]+$", "", value)
+    return value
+
+
+def strip_eijiro_head_annotations(raw_head: str) -> str:
+    head = str(raw_head or "").strip()
+    if not head:
+        return ""
+    while True:
+        updated = re.sub(r"\s+\{[^{}]+\}\s*$", "", head).strip()
+        if updated == head:
+            break
+        head = updated
+    return head
+
+
+def parse_eijiro_line(raw_line: str, line_no: int) -> dict[str, Any] | None:
+    line = raw_line.strip()
+    if not line:
+        return None
+    while line.startswith("■"):
+        line = line[1:].strip()
+    if not line:
+        return None
+    if " : " not in line:
+        return None
+    raw_head, raw_definition = line.split(" : ", 1)
+    head = strip_eijiro_head_annotations(raw_head) or raw_head.strip()
+    definition = raw_definition.strip()
+    if not head or not definition:
+        return None
+    term_norm = normalize_dictionary_term(head)
+    if not term_norm:
+        return None
+    return {
+        "term": head,
+        "term_norm": term_norm,
+        "definition": definition,
+        "line_no": line_no,
+    }
+
+
+def dictionary_lookup_variants(term_norm: str) -> list[str]:
+    base = normalize_dictionary_term(term_norm)
+    if not base:
+        return []
+
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def add_variant(value: str) -> None:
+        normalized = normalize_dictionary_term(value)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        variants.append(normalized)
+
+    add_variant(base)
+    if base.endswith("'s"):
+        add_variant(base[:-2])
+    if base.endswith("ies") and len(base) > 4:
+        add_variant(base[:-3] + "y")
+    if base.endswith("ing") and len(base) > 5:
+        stem = base[:-3]
+        add_variant(stem)
+        add_variant(stem + "e")
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            add_variant(stem[:-1])
+    if base.endswith("ed") and len(base) > 4:
+        stem = base[:-2]
+        add_variant(stem)
+        add_variant(stem + "e")
+        if len(stem) > 2 and stem[-1] == stem[-2]:
+            add_variant(stem[:-1])
+    if base.endswith("es") and len(base) > 4:
+        add_variant(base[:-2])
+    if base.endswith("s") and len(base) > 3:
+        add_variant(base[:-1])
+    if "-" in base:
+        add_variant(base.replace("-", " "))
+
+    return variants
+
+
+def escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def load_meta_records(meta_dir: Path) -> dict[str, tuple[Path, dict[str, Any]]]:
     records: dict[str, tuple[Path, dict[str, Any]]] = {}
     if not meta_dir.exists():
@@ -1147,6 +1260,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
         """
     )
     ensure_videos_loudness_columns(connection)
+    ensure_dictionary_schema(connection)
 
 
 def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
@@ -1164,6 +1278,195 @@ def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
         connection.execute(
             f"ALTER TABLE videos ADD COLUMN {column_name} {column_type}"
         )
+
+
+def ensure_dictionary_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS dict_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT NOT NULL,
+            term TEXT NOT NULL,
+            term_norm TEXT NOT NULL,
+            definition TEXT NOT NULL,
+            line_no INTEGER,
+            created_at TEXT NOT NULL,
+            UNIQUE (source_name, term_norm, definition)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dict_entries_term_norm
+            ON dict_entries(term_norm);
+        CREATE INDEX IF NOT EXISTS idx_dict_entries_source_term_norm
+            ON dict_entries(source_name, term_norm);
+        """
+    )
+    try:
+        connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS dict_entries_fts USING fts5(
+                term_norm,
+                term,
+                definition,
+                content='dict_entries',
+                content_rowid='id'
+            );
+            """
+        )
+    except sqlite3.OperationalError:
+        # Some SQLite builds do not have FTS5 enabled.
+        return
+
+
+def rebuild_dictionary_fts(connection: sqlite3.Connection) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'dict_entries_fts'
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        connection.execute(
+            "INSERT INTO dict_entries_fts(dict_entries_fts) VALUES ('rebuild')"
+        )
+    except sqlite3.OperationalError:
+        return False
+    return True
+
+
+def lookup_dictionary_entries(
+    connection: sqlite3.Connection,
+    term: str,
+    limit: int = DEFAULT_DICT_LOOKUP_LIMIT,
+) -> dict[str, Any]:
+    def read_field(
+        row: sqlite3.Row | tuple[Any, ...],
+        index: int,
+        name: str,
+    ) -> Any:
+        if isinstance(row, sqlite3.Row):
+            return row[name]
+        return row[index]
+
+    normalized = normalize_dictionary_term(term)
+    if not normalized:
+        return {
+            "term": term,
+            "normalized": "",
+            "results": [],
+        }
+
+    safe_limit = max(1, min(20, int(limit)))
+    variants = dictionary_lookup_variants(normalized)
+    if not variants:
+        return {
+            "term": term,
+            "normalized": normalized,
+            "results": [],
+        }
+
+    placeholders = ",".join("?" for _ in variants)
+    exact_rows = connection.execute(
+        f"""
+        SELECT id, source_name, term, term_norm, definition
+        FROM dict_entries
+        WHERE term_norm IN ({placeholders})
+        ORDER BY
+            CASE
+                WHEN term_norm = ? THEN 0
+                ELSE 1
+            END,
+            LENGTH(term_norm) ASC,
+            id ASC
+        LIMIT ?
+        """,
+        (*variants, normalized, safe_limit),
+    ).fetchall()
+
+    selected_rows: list[sqlite3.Row | tuple[Any, ...]] = list(exact_rows)
+    seen_ids = {int(read_field(row, 0, "id")) for row in exact_rows}
+
+    if len(selected_rows) < safe_limit:
+        remaining = safe_limit - len(selected_rows)
+        prefix_pattern = f"{escape_like_pattern(normalized)}%"
+        prefix_rows = connection.execute(
+            """
+            SELECT id, source_name, term, term_norm, definition
+            FROM dict_entries
+            WHERE term_norm LIKE ? ESCAPE '\\'
+            ORDER BY LENGTH(term_norm) ASC, id ASC
+            LIMIT ?
+            """,
+            (prefix_pattern, remaining * 3),
+        ).fetchall()
+        for row in prefix_rows:
+            row_id = int(read_field(row, 0, "id"))
+            if row_id in seen_ids:
+                continue
+            seen_ids.add(row_id)
+            selected_rows.append(row)
+            if len(selected_rows) >= safe_limit:
+                break
+
+    if len(selected_rows) < safe_limit:
+        fts_table_exists = connection.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'dict_entries_fts'
+            LIMIT 1
+            """
+        ).fetchone() is not None
+        if fts_table_exists:
+            remaining = safe_limit - len(selected_rows)
+            safe_fts_term = normalized.replace('"', ' ').strip()
+            if safe_fts_term:
+                try:
+                    fts_rows = connection.execute(
+                        """
+                        SELECT de.id, de.source_name, de.term, de.term_norm, de.definition
+                        FROM dict_entries_fts fts
+                        JOIN dict_entries de
+                          ON de.id = fts.rowid
+                        WHERE fts.dict_entries_fts MATCH ?
+                        ORDER BY LENGTH(de.term_norm) ASC, de.id ASC
+                        LIMIT ?
+                        """,
+                        (safe_fts_term, remaining * 4),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    fts_rows = []
+                for row in fts_rows:
+                    row_id = int(read_field(row, 0, "id"))
+                    if row_id in seen_ids:
+                        continue
+                    seen_ids.add(row_id)
+                    selected_rows.append(row)
+                    if len(selected_rows) >= safe_limit:
+                        break
+
+    results: list[dict[str, Any]] = []
+    for row in selected_rows:
+        results.append(
+            {
+                "id": int(read_field(row, 0, "id")),
+                "source_name": str(read_field(row, 1, "source_name")),
+                "term": str(read_field(row, 2, "term")),
+                "term_norm": str(read_field(row, 3, "term_norm")),
+                "definition": str(read_field(row, 4, "definition")),
+            }
+        )
+
+    return {
+        "term": term,
+        "normalized": normalized,
+        "results": results,
+    }
 
 
 def export_csv(connection: sqlite3.Connection, csv_path: Path) -> None:
@@ -2425,6 +2728,112 @@ def run_loudness(
     )
 
 
+def run_dict_index(
+    db_path: Path,
+    dictionary_path: Path,
+    source_name: str = DEFAULT_DICT_SOURCE_NAME,
+    encoding: str = DEFAULT_DICT_ENCODING,
+    clear_existing: bool = True,
+    max_lines: int | None = None,
+) -> None:
+    if not dictionary_path.exists():
+        raise FileNotFoundError(f"Dictionary file not found: {dictionary_path}")
+    if not dictionary_path.is_file():
+        raise ValueError(f"Dictionary path is not a file: {dictionary_path}")
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(db_path))
+    create_schema(connection)
+
+    max_lines_value = None
+    if max_lines is not None and max_lines > 0:
+        max_lines_value = int(max_lines)
+
+    total_lines = 0
+    parsed_entries = 0
+    inserted_entries = 0
+    skipped_lines = 0
+    duplicate_entries = 0
+    now_iso = now_utc_iso()
+    batch: list[tuple[Any, ...]] = []
+
+    def flush_batch() -> tuple[int, int]:
+        nonlocal batch
+        if not batch:
+            return 0, 0
+        before_changes = connection.total_changes
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO dict_entries (
+                source_name,
+                term,
+                term_norm,
+                definition,
+                line_no,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            batch,
+        )
+        after_changes = connection.total_changes
+        inserted = max(0, after_changes - before_changes)
+        duplicates = max(0, len(batch) - inserted)
+        batch = []
+        return inserted, duplicates
+
+    try:
+        if clear_existing:
+            connection.execute(
+                "DELETE FROM dict_entries WHERE source_name = ?",
+                (source_name,),
+            )
+            connection.commit()
+
+        with dictionary_path.open("r", encoding=encoding, errors="strict", newline=None) as file:
+            for line_no, raw_line in enumerate(file, start=1):
+                total_lines += 1
+                if max_lines_value is not None and total_lines > max_lines_value:
+                    break
+                parsed = parse_eijiro_line(raw_line, line_no)
+                if parsed is None:
+                    skipped_lines += 1
+                    continue
+                parsed_entries += 1
+                batch.append(
+                    (
+                        source_name,
+                        parsed["term"],
+                        parsed["term_norm"],
+                        parsed["definition"],
+                        int(parsed["line_no"]),
+                        now_iso,
+                    )
+                )
+                if len(batch) >= DICT_INDEX_BATCH_SIZE:
+                    inserted, duplicates = flush_batch()
+                    inserted_entries += inserted
+                    duplicate_entries += duplicates
+                    connection.commit()
+
+        inserted, duplicates = flush_batch()
+        inserted_entries += inserted
+        duplicate_entries += duplicates
+
+        fts_rebuilt = rebuild_dictionary_fts(connection)
+        connection.commit()
+    finally:
+        connection.close()
+
+    print(
+        f"[dict-index] source={source_name} path={dictionary_path} encoding={encoding} "
+        f"lines={total_lines} parsed={parsed_entries} inserted={inserted_entries} "
+        f"duplicates={duplicate_entries} skipped={skipped_lines}"
+    )
+    if max_lines_value is not None:
+        print(f"[dict-index] max_lines applied: {max_lines_value}")
+    print(f"[dict-index] fts_rebuilt={fts_rebuilt} db={db_path}")
+
+
 def run_backfill(
     sources: list[SourceConfig],
     db_path: Path,
@@ -3315,6 +3724,26 @@ def build_web_handler(
                     }
                 )
 
+        def _handle_api_dictionary_lookup(self, query: dict[str, list[str]]) -> None:
+            raw_term = query.get("term", [None])[0]
+            if raw_term in (None, ""):
+                self._send_error_json(400, "term is required.")
+                return
+            term = str(raw_term).strip()
+            if not term:
+                self._send_error_json(400, "term is required.")
+                return
+            limit = clamp_int(
+                query.get("limit", [None])[0],
+                default=DEFAULT_DICT_LOOKUP_LIMIT,
+                minimum=1,
+                maximum=20,
+            )
+
+            with self._open_connection() as connection:
+                payload = lookup_dictionary_entries(connection, term, limit=limit)
+            self._send_json(payload)
+
         def _handle_api_bookmarks_get(self, query: dict[str, list[str]]) -> None:
             source_id = self._normalize_source(query.get("source_id", [None])[0])
             video_id = self._normalize_source(query.get("video_id", [None])[0])
@@ -3667,6 +4096,9 @@ def build_web_handler(
                 if path == "/api/subtitles":
                     self._handle_api_subtitles(query)
                     return
+                if path == "/api/dictionary":
+                    self._handle_api_dictionary_lookup(query)
+                    return
                 if path == "/api/bookmarks":
                     self._handle_api_bookmarks_get(query)
                     return
@@ -3891,6 +4323,41 @@ def parse_args() -> argparse.Namespace:
         help="ffmpeg binary path/name (default: ffmpeg)",
     )
 
+    dict_index_parser = subparsers.add_parser(
+        "dict-index",
+        help="Index EIJIRO dictionary entries into SQLite for hover lookup",
+    )
+    dict_index_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    dict_index_parser.add_argument("--source", action="append", dest="sources")
+    dict_index_parser.add_argument("--ledger-db", type=Path)
+    dict_index_parser.add_argument(
+        "--dictionary-path",
+        type=Path,
+        default=DEFAULT_DICT_PATH,
+        help="Dictionary file path (default: data/eijiro-1449.utf8.txt)",
+    )
+    dict_index_parser.add_argument(
+        "--encoding",
+        default=DEFAULT_DICT_ENCODING,
+        help="Dictionary file encoding (default: utf-8)",
+    )
+    dict_index_parser.add_argument(
+        "--source-name",
+        default=DEFAULT_DICT_SOURCE_NAME,
+        help="Logical dictionary source label stored in DB (default: eijiro-1449)",
+    )
+    dict_index_parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Append/update without deleting existing entries for the same source.",
+    )
+    dict_index_parser.add_argument(
+        "--max-lines",
+        type=int,
+        default=0,
+        help="Optional line cap for quick trial runs (0 = no cap).",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -4002,6 +4469,21 @@ def main() -> int:
             limit=max(1, int(args.limit)),
             force=bool(args.force),
             ffmpeg_bin=str(args.ffmpeg_bin),
+        )
+        return 0
+
+    if args.command == "dict-index":
+        dictionary_path = resolve_output_path(
+            args.dictionary_path,
+            DEFAULT_DICT_PATH,
+        )
+        run_dict_index(
+            db_path=ledger_db_path,
+            dictionary_path=dictionary_path,
+            source_name=str(args.source_name),
+            encoding=str(args.encoding),
+            clear_existing=not bool(args.no_clear),
+            max_lines=None if int(args.max_lines) <= 0 else int(args.max_lines),
         )
         return 0
 

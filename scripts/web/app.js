@@ -5,6 +5,8 @@ const LYRIC_REEL_AUTO_CLOSE_MS = 620;
 const LYRIC_REEL_INERTIA_FACTOR = 0.04;
 const LYRIC_REEL_INERTIA_DECAY = 0.88;
 const LYRIC_REEL_INERTIA_MIN = 0.0007;
+const DICT_POPUP_HIDE_DELAY_MS = 160;
+const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 
 const state = {
   videos: [],
@@ -41,6 +43,10 @@ const state = {
   normalizationEnabled: localStorage.getItem("substudy.volume_normalization") !== "off",
   userVolume: 1,
   userMuted: false,
+  dictLookupCache: new Map(),
+  dictPopupHideTimer: null,
+  dictLookupRequestId: 0,
+  dictPopupWord: "",
 };
 
 const elements = {
@@ -52,6 +58,7 @@ const elements = {
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
+  subtitleDictPopup: document.getElementById("subtitleDictPopup"),
   lyricReelOverlay: document.getElementById("lyricReelOverlay"),
   lyricReelList: document.getElementById("lyricReelList"),
   countdownPanel: document.getElementById("countdownPanel"),
@@ -699,8 +706,237 @@ function renderTrackOptions(video) {
   elements.trackSelect.value = state.currentTrackId;
 }
 
+function normalizeDictionaryTerm(value) {
+  return String(value || "")
+    .replace(/[’‘]/g, "'")
+    .replace(/[`]/g, "'")
+    .toLowerCase()
+    .trim()
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+}
+
+function clearDictionaryPopupHideTimer() {
+  if (state.dictPopupHideTimer !== null) {
+    window.clearTimeout(state.dictPopupHideTimer);
+    state.dictPopupHideTimer = null;
+  }
+}
+
+function hideSubtitleDictionaryPopup() {
+  clearDictionaryPopupHideTimer();
+  state.dictPopupWord = "";
+  elements.subtitleDictPopup.classList.add("hidden");
+  elements.subtitleDictPopup.setAttribute("aria-hidden", "true");
+  const activeWord = elements.subtitleOverlay.querySelector(".subtitle-word.active");
+  if (activeWord) {
+    activeWord.classList.remove("active");
+  }
+}
+
+function scheduleHideSubtitleDictionaryPopup() {
+  clearDictionaryPopupHideTimer();
+  state.dictPopupHideTimer = window.setTimeout(() => {
+    hideSubtitleDictionaryPopup();
+  }, DICT_POPUP_HIDE_DELAY_MS);
+}
+
+function positionSubtitleDictionaryPopup(anchorEl) {
+  if (!anchorEl || !elements.subtitleDictPopup || elements.subtitleDictPopup.classList.contains("hidden")) {
+    return;
+  }
+  const shellRect = elements.phoneShell.getBoundingClientRect();
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const popupRect = elements.subtitleDictPopup.getBoundingClientRect();
+
+  const centerX = anchorRect.left - shellRect.left + (anchorRect.width / 2);
+  const minCenterX = (popupRect.width / 2) + 8;
+  const maxCenterX = shellRect.width - (popupRect.width / 2) - 8;
+  const clampedCenterX = Math.max(minCenterX, Math.min(maxCenterX, centerX));
+
+  const spaceAbove = anchorRect.top - shellRect.top;
+  const placeBelow = spaceAbove < (popupRect.height + 16);
+  const top = placeBelow
+    ? (anchorRect.bottom - shellRect.top + 10)
+    : (anchorRect.top - shellRect.top - 10);
+  const translateY = placeBelow ? "0%" : "-100%";
+
+  elements.subtitleDictPopup.style.left = `${clampedCenterX.toFixed(1)}px`;
+  elements.subtitleDictPopup.style.top = `${top.toFixed(1)}px`;
+  elements.subtitleDictPopup.style.transform = `translate(-50%, ${translateY})`;
+}
+
+function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
+  elements.subtitleDictPopup.textContent = "";
+  const title = document.createElement("p");
+  title.className = "subtitle-dict-title";
+  title.textContent = `Dictionary: ${term}`;
+  elements.subtitleDictPopup.appendChild(title);
+
+  if (!rows.length) {
+    const empty = document.createElement("p");
+    empty.className = "subtitle-dict-empty";
+    empty.textContent = "辞書エントリが見つかりません。";
+    elements.subtitleDictPopup.appendChild(empty);
+  } else {
+    const list = document.createElement("div");
+    list.className = "subtitle-dict-list";
+    for (const row of rows) {
+      const item = document.createElement("article");
+      item.className = "subtitle-dict-item";
+
+      const label = document.createElement("strong");
+      label.textContent = row.term || term;
+
+      const detail = document.createElement("span");
+      const rawDefinition = String(row.definition || "").trim();
+      detail.textContent = rawDefinition.length > 260
+        ? `${rawDefinition.slice(0, 260)}...`
+        : rawDefinition;
+
+      item.appendChild(label);
+      item.appendChild(detail);
+      list.appendChild(item);
+    }
+    elements.subtitleDictPopup.appendChild(list);
+  }
+
+  elements.subtitleDictPopup.classList.remove("hidden");
+  elements.subtitleDictPopup.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => positionSubtitleDictionaryPopup(anchorEl));
+}
+
+function renderSubtitleDictionaryPopupLoading(term, anchorEl) {
+  elements.subtitleDictPopup.textContent = "";
+  const title = document.createElement("p");
+  title.className = "subtitle-dict-title";
+  title.textContent = `Dictionary: ${term}`;
+  const loading = document.createElement("p");
+  loading.className = "subtitle-dict-empty";
+  loading.textContent = "辞書を検索中...";
+  elements.subtitleDictPopup.appendChild(title);
+  elements.subtitleDictPopup.appendChild(loading);
+  elements.subtitleDictPopup.classList.remove("hidden");
+  elements.subtitleDictPopup.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => positionSubtitleDictionaryPopup(anchorEl));
+}
+
+async function lookupDictionary(term) {
+  const normalized = normalizeDictionaryTerm(term);
+  if (!normalized) {
+    return {
+      term,
+      normalized: "",
+      results: [],
+    };
+  }
+  const cached = state.dictLookupCache.get(normalized);
+  if (cached) {
+    return cached;
+  }
+  const params = new URLSearchParams({
+    term,
+    limit: "6",
+  });
+  const payload = await apiRequest(`/api/dictionary?${params.toString()}`);
+  state.dictLookupCache.set(normalized, payload);
+  return payload;
+}
+
+async function showSubtitleDictionaryForWord(wordEl) {
+  if (!wordEl) {
+    return;
+  }
+  const term = String(wordEl.dataset.dictTerm || "").trim();
+  if (!term) {
+    return;
+  }
+  clearDictionaryPopupHideTimer();
+  state.dictPopupWord = term;
+  const previousActive = elements.subtitleOverlay.querySelector(".subtitle-word.active");
+  if (previousActive && previousActive !== wordEl) {
+    previousActive.classList.remove("active");
+  }
+  wordEl.classList.add("active");
+  renderSubtitleDictionaryPopupLoading(term, wordEl);
+
+  const requestId = state.dictLookupRequestId + 1;
+  state.dictLookupRequestId = requestId;
+  try {
+    const payload = await lookupDictionary(term);
+    if (requestId !== state.dictLookupRequestId || state.dictPopupWord !== term) {
+      return;
+    }
+    const rows = Array.isArray(payload.results) ? payload.results : [];
+    renderSubtitleDictionaryPopup(term, rows, wordEl);
+  } catch (error) {
+    if (requestId !== state.dictLookupRequestId || state.dictPopupWord !== term) {
+      return;
+    }
+    renderSubtitleDictionaryPopup(term, [], wordEl);
+    setStatus(error.message, "error");
+  }
+}
+
+function handleSubtitleOverlayPointerOver(event) {
+  const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+  showSubtitleDictionaryForWord(target).catch((error) => setStatus(error.message, "error"));
+}
+
+function handleSubtitleOverlayPointerOut(event) {
+  const fromWord = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+  if (!fromWord) {
+    return;
+  }
+  const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+  if (nextElement && (nextElement.closest(".subtitle-word") || nextElement.closest("#subtitleDictPopup"))) {
+    return;
+  }
+  scheduleHideSubtitleDictionaryPopup();
+}
+
+function renderSubtitleOverlayText(text) {
+  const value = String(text || "").trim();
+  hideSubtitleDictionaryPopup();
+  elements.subtitleOverlay.textContent = "";
+  if (!value) {
+    return;
+  }
+  SUBTITLE_WORD_PATTERN.lastIndex = 0;
+  const fragment = document.createDocumentFragment();
+  let cursor = 0;
+  let hasWord = false;
+  let match = SUBTITLE_WORD_PATTERN.exec(value);
+  while (match) {
+    const [word] = match;
+    const start = match.index;
+    const end = start + word.length;
+    if (start > cursor) {
+      fragment.appendChild(document.createTextNode(value.slice(cursor, start)));
+    }
+    const span = document.createElement("span");
+    span.className = "subtitle-word";
+    span.dataset.dictTerm = word;
+    span.textContent = word;
+    fragment.appendChild(span);
+    cursor = end;
+    hasWord = true;
+    match = SUBTITLE_WORD_PATTERN.exec(value);
+  }
+  if (cursor < value.length) {
+    fragment.appendChild(document.createTextNode(value.slice(cursor)));
+  }
+  if (!hasWord) {
+    elements.subtitleOverlay.textContent = value;
+    return;
+  }
+  elements.subtitleOverlay.appendChild(fragment);
+}
+
 function clearSubtitleOverlay(message = "字幕がありません") {
-  elements.subtitleOverlay.textContent = message;
+  renderSubtitleOverlayText(message);
 }
 
 function findActiveCueIndex(timeMs) {
@@ -818,7 +1054,7 @@ function applyLyricReelVisualPosition(position) {
 
   const cueStartMs = getCueStartMsAtLyricPosition(clamped);
   elements.videoPlayer.currentTime = cueStartMs / 1000;
-  elements.subtitleOverlay.textContent = state.cues[state.lyricReelIndex]?.text || "...";
+  renderSubtitleOverlayText(state.cues[state.lyricReelIndex]?.text || "...");
   renderLyricReelAtPosition(clamped);
 }
 
@@ -965,10 +1201,10 @@ function updateSubtitleFromPlayback() {
 
   state.activeCueIndex = index;
   if (index < 0) {
-    elements.subtitleOverlay.textContent = "...";
+    renderSubtitleOverlayText("...");
     return;
   }
-  elements.subtitleOverlay.textContent = state.cues[index].text;
+  renderSubtitleOverlayText(state.cues[index].text);
 }
 
 function clearCountdown() {
@@ -1644,7 +1880,10 @@ function bindEvents() {
 
   elements.phoneShell.addEventListener("click", (event) => {
     const clickedElement = event.target instanceof Element ? event.target : null;
-    if (clickedElement && clickedElement.closest("button, input, select, textarea, a, label")) {
+    if (
+      clickedElement &&
+      clickedElement.closest("button, input, select, textarea, a, label, .subtitle-word, .subtitle-dict-popup")
+    ) {
       return;
     }
     if (state.lyricReelActive) {
@@ -1653,6 +1892,17 @@ function bindEvents() {
     }
     togglePlayPause();
   });
+  elements.subtitleOverlay.addEventListener("pointerover", handleSubtitleOverlayPointerOver);
+  elements.subtitleOverlay.addEventListener("pointerout", handleSubtitleOverlayPointerOut);
+  elements.subtitleOverlay.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+    if (target) {
+      event.stopPropagation();
+    }
+  });
+  elements.subtitleDictPopup.addEventListener("pointerenter", () => clearDictionaryPopupHideTimer());
+  elements.subtitleDictPopup.addEventListener("pointerleave", () => scheduleHideSubtitleDictionaryPopup());
+  elements.subtitleDictPopup.addEventListener("click", (event) => event.stopPropagation());
 
   elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
   elements.jumpCloseBtn.addEventListener("click", () => closeJumpModal());
@@ -1858,7 +2108,7 @@ async function initialize() {
       false,
       initialSelection.videoId
     );
-    setStatus("準備完了。動画上スクロールで時間同期歌詞リール、Gでジャンプできます。", "ok");
+    setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
   } catch (error) {
     setStatus(error.message, "error");
   }

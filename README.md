@@ -11,6 +11,7 @@ Local-first workflow for English study from downloaded short videos.
   - maintaining a master ledger (`SQLite` + `CSV`)
   - incremental ASR subtitle generation
   - per-video loudness analysis for inter-video volume normalization
+  - EIJIRO dictionary indexing for subtitle word hover lookup
   - download run/error tracking for retry-safe operations
   - local TikTok-style study web UI (`web`) with favorites/bookmarks/notes
 - macOS automation with two launchd jobs:
@@ -19,7 +20,7 @@ Local-first workflow for English study from downloaded short videos.
 
 ## Layout
 
-- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `loudness`, `downloads`, `web`)
+- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `loudness`, `dict-index`, `downloads`, `web`)
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
@@ -70,19 +71,25 @@ python3 scripts/substudy.py asr
 python3 scripts/substudy.py loudness
 ```
 
-7. Inspect recent download logs and pending failures:
+7. Index dictionary entries (for subtitle word hover):
+
+```bash
+python3 scripts/substudy.py dict-index --dictionary-path data/eijiro-1449.utf8.txt
+```
+
+8. Inspect recent download logs and pending failures:
 
 ```bash
 python3 scripts/substudy.py downloads --since-hours 24
 ```
 
-8. Rebuild ledger fully when needed:
+9. Rebuild ledger fully when needed:
 
 ```bash
 python3 scripts/substudy.py sync --full-ledger
 ```
 
-9. Launch local study web UI:
+10. Launch local study web UI:
 
 ```bash
 python3 scripts/substudy.py web --host 127.0.0.1 --port 8876
@@ -97,6 +104,7 @@ Open `http://127.0.0.1:8876`.
 - Continuous playback toggle (`A`)
 - Inter-video volume normalization toggle (`N`)
 - Subtitle overlay + selectable track
+- Hover English words in subtitle overlay to open dictionary popup
 - Subtitle bookmarks:
   - save current subtitle (`B`)
   - save playback range (`R` start, `T` save)
@@ -207,6 +215,7 @@ Planned next steps for grammar-aware subtitle study UX.
 
 ### 0) EIJIRO dictionary ingestion
 
+- Current status: initial implementation done (`dict-index` + hover lookup backend).
 - Target source: `/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
 - Encoding note (verified): strict decode with `cp932` (`windows-31j`) succeeds for the full file.
 - `shift_jis` fails on vendor extension bytes (example: `0xFB..`), so ingestion should not assume strict Shift_JIS.
