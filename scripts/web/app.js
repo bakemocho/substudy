@@ -7,7 +7,29 @@ const LYRIC_REEL_INERTIA_DECAY = 0.88;
 const LYRIC_REEL_INERTIA_MIN = 0.0007;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
 const DICT_HOVER_LOOP_MIN_MS = 900;
+const DICT_CONTEXT_MAX_CANDIDATES = 6;
+const DICT_CONTEXT_PER_TERM_LIMIT = 4;
+const DICT_CONTEXT_TOTAL_LIMIT = 12;
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
+const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
+  "back",
+  "up",
+  "out",
+  "off",
+  "on",
+  "in",
+  "away",
+  "down",
+  "over",
+  "around",
+  "through",
+  "apart",
+  "along",
+  "across",
+  "by",
+  "about",
+  "into",
+]);
 
 const state = {
   videos: [],
@@ -871,6 +893,19 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
 
       const label = document.createElement("strong");
       label.textContent = row.term || term;
+      item.appendChild(label);
+
+      const lookupTerm = String(row.lookup_term || "").trim();
+      if (lookupTerm) {
+        const normalizedLookupTerm = normalizeDictionaryTerm(lookupTerm);
+        const normalizedLabel = normalizeDictionaryTerm(row.term || "");
+        if (normalizedLookupTerm && normalizedLookupTerm !== normalizedLabel) {
+          const match = document.createElement("small");
+          match.className = "subtitle-dict-match";
+          match.textContent = `from: ${lookupTerm}`;
+          item.appendChild(match);
+        }
+      }
 
       const detail = document.createElement("span");
       const rawDefinition = String(row.definition || "").trim();
@@ -878,7 +913,6 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
         ? `${rawDefinition.slice(0, 260)}...`
         : rawDefinition;
 
-      item.appendChild(label);
       item.appendChild(detail);
       list.appendChild(item);
     }
@@ -927,6 +961,154 @@ async function lookupDictionary(term) {
   return payload;
 }
 
+function buildDictionaryLookupTerms(wordEl, baseTerm) {
+  const terms = [];
+  const seen = new Set();
+  const wordNodes = Array.from(elements.subtitleOverlay.querySelectorAll(".subtitle-word"));
+  const index = wordNodes.indexOf(wordEl);
+  const words = wordNodes.map((node) => String(node.dataset.dictTerm || node.textContent || "").trim());
+
+  const addTerm = (rawTerm) => {
+    const value = String(rawTerm || "").trim();
+    if (!value) {
+      return;
+    }
+    const normalized = normalizeDictionaryTerm(value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    terms.push(value);
+  };
+
+  const addRange = (startIndex, endIndex) => {
+    if (startIndex < 0 || endIndex < startIndex || endIndex >= words.length) {
+      return;
+    }
+    const phrase = words
+      .slice(startIndex, endIndex + 1)
+      .map((word) => String(word || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    addTerm(phrase);
+  };
+
+  const wordAt = (wordIndex) => normalizeDictionaryTerm(words[wordIndex] || "");
+
+  const addCollapsedForwardPhrasalCandidate = () => {
+    if (index < 0 || index >= words.length) {
+      return;
+    }
+    const head = wordAt(index);
+    if (!head) {
+      return;
+    }
+    const maxTail = Math.min(words.length - 1, index + 4);
+    for (let tailIndex = index + 2; tailIndex <= maxTail; tailIndex += 1) {
+      const tail = wordAt(tailIndex);
+      if (!tail || !DICT_COLLAPSE_PARTICLE_WORDS.has(tail)) {
+        continue;
+      }
+      addTerm(`${head} ${tail}`);
+    }
+  };
+
+  const addCollapsedBackwardPhrasalCandidate = () => {
+    if (index < 0 || index >= words.length) {
+      return;
+    }
+    const tail = wordAt(index);
+    if (!tail || !DICT_COLLAPSE_PARTICLE_WORDS.has(tail)) {
+      return;
+    }
+    const minHead = Math.max(0, index - 4);
+    for (let headIndex = index - 1; headIndex >= minHead; headIndex -= 1) {
+      const head = wordAt(headIndex);
+      if (!head || DICT_COLLAPSE_PARTICLE_WORDS.has(head)) {
+        continue;
+      }
+      addTerm(`${head} ${tail}`);
+      break;
+    }
+  };
+
+  if (index >= 0 && words.length > 0) {
+    // Prefer forward collocation first (e.g. "give back"),
+    // then surrounding context and finally the single word.
+    addRange(index, index + 1);
+    addRange(index, index + 2);
+    addCollapsedForwardPhrasalCandidate();
+    addCollapsedBackwardPhrasalCandidate();
+    addRange(index - 1, index);
+    addRange(index - 1, index + 1);
+    addRange(index - 2, index);
+  }
+  addTerm(baseTerm);
+  if (terms.length <= DICT_CONTEXT_MAX_CANDIDATES) {
+    return terms;
+  }
+  const topTerms = terms.slice(0, DICT_CONTEXT_MAX_CANDIDATES);
+  const normalizedBaseTerm = normalizeDictionaryTerm(baseTerm);
+  if (normalizedBaseTerm) {
+    const hasBase = topTerms.some((term) => normalizeDictionaryTerm(term) === normalizedBaseTerm);
+    if (!hasBase) {
+      topTerms[topTerms.length - 1] = baseTerm;
+    }
+  }
+  return topTerms;
+}
+
+function dictionaryResultKey(row) {
+  const id = Number(row?.id);
+  if (Number.isFinite(id) && id > 0) {
+    return `id:${id}`;
+  }
+  return [
+    String(row?.source_name || ""),
+    String(row?.term_norm || ""),
+    String(row?.definition || ""),
+  ].join("\u0000");
+}
+
+async function lookupDictionaryWithContext(wordEl, baseTerm) {
+  const lookupTerms = buildDictionaryLookupTerms(wordEl, baseTerm);
+  const mergedRows = [];
+  const seenRows = new Set();
+
+  for (const lookupTerm of lookupTerms) {
+    const payload = await lookupDictionary(lookupTerm);
+    const rows = Array.isArray(payload.results) ? payload.results : [];
+    if (!rows.length) {
+      continue;
+    }
+
+    let insertedForTerm = 0;
+    for (const row of rows) {
+      const key = dictionaryResultKey(row);
+      if (seenRows.has(key)) {
+        continue;
+      }
+      seenRows.add(key);
+      mergedRows.push({
+        ...row,
+        lookup_term: lookupTerm,
+      });
+      insertedForTerm += 1;
+      if (insertedForTerm >= DICT_CONTEXT_PER_TERM_LIMIT || mergedRows.length >= DICT_CONTEXT_TOTAL_LIMIT) {
+        break;
+      }
+    }
+    if (mergedRows.length >= DICT_CONTEXT_TOTAL_LIMIT) {
+      break;
+    }
+  }
+
+  return {
+    term: baseTerm,
+    results: mergedRows,
+  };
+}
+
 async function showSubtitleDictionaryForWord(wordEl) {
   if (!wordEl) {
     return;
@@ -948,7 +1130,7 @@ async function showSubtitleDictionaryForWord(wordEl) {
   const requestId = state.dictLookupRequestId + 1;
   state.dictLookupRequestId = requestId;
   try {
-    const payload = await lookupDictionary(term);
+    const payload = await lookupDictionaryWithContext(wordEl, term);
     if (requestId !== state.dictLookupRequestId || state.dictPopupWord !== term) {
       return;
     }

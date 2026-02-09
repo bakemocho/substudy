@@ -229,6 +229,14 @@ body {
   font-size: 0.86rem;
 }
 
+.subtitle-dict-match {
+  display: block;
+  margin-bottom: 3px;
+  color: rgba(149, 221, 239, 0.88);
+  font-size: 0.72rem;
+  letter-spacing: 0.01em;
+}
+
 .subtitle-dict-item span {
   display: block;
   color: rgba(214, 224, 245, 0.9);
