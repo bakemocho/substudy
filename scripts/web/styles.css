@@ -193,25 +193,13 @@ body {
 }
 
 .phone-shell.lyric-reel-active .video-meta-drawer {
-  opacity: 0.12;
+  opacity: 0;
+  visibility: hidden;
   pointer-events: none;
 }
 
 .lyric-reel-overlay.hidden {
   display: none;
-}
-
-.lyric-reel-badge {
-  margin: 0;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(130, 166, 255, 0.34);
-  background: rgba(6, 12, 24, 0.58);
-  color: #d2defd;
-  font-size: 0.76rem;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-  font-family: "Space Grotesk", sans-serif;
 }
 
 .lyric-reel-list {
@@ -252,12 +240,6 @@ body {
   opacity: 1;
   transform: scale(1.02);
   text-shadow: 0 0 18px rgba(113, 143, 247, 0.28);
-}
-
-.lyric-reel-hint {
-  margin: 0;
-  color: rgba(206, 221, 255, 0.78);
-  font-size: 0.8rem;
 }
 
 .countdown-panel {

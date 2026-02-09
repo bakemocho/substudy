@@ -2,6 +2,9 @@ const SEEK_SECONDS = 5;
 const CONTROL_TOGGLE_IDLE_MS = 2600;
 const LYRIC_WHEEL_STEP_DELTA = 52;
 const LYRIC_REEL_AUTO_CLOSE_MS = 620;
+const LYRIC_REEL_INERTIA_FACTOR = 0.04;
+const LYRIC_REEL_INERTIA_DECAY = 0.88;
+const LYRIC_REEL_INERTIA_MIN = 0.0007;
 
 const state = {
   videos: [],
@@ -16,6 +19,8 @@ const state = {
   lyricReelTargetPosition: -1,
   lyricReelVisualPosition: -1,
   lyricReelAnimationFrame: null,
+  lyricReelAnimationPrevTs: 0,
+  lyricReelInertiaVelocity: 0,
   lyricReelAutoCloseTimer: null,
   lyricReelResumeOnClose: false,
   cues: [],
@@ -693,6 +698,7 @@ function clearLyricReelAnimationFrame() {
     window.cancelAnimationFrame(state.lyricReelAnimationFrame);
     state.lyricReelAnimationFrame = null;
   }
+  state.lyricReelAnimationPrevTs = 0;
 }
 
 function getCueStartMsAtLyricPosition(position) {
@@ -761,15 +767,41 @@ function applyLyricReelVisualPosition(position) {
   renderLyricReelAtPosition(clamped);
 }
 
-function animateLyricReel() {
+function animateLyricReel(frameTs = 0) {
+  if (!state.lyricReelActive) {
+    clearLyricReelAnimationFrame();
+    return;
+  }
+
+  let frameScale = 1;
+  if (state.lyricReelAnimationPrevTs > 0 && frameTs > state.lyricReelAnimationPrevTs) {
+    const deltaMs = Math.min(64, frameTs - state.lyricReelAnimationPrevTs);
+    frameScale = Math.max(0.5, deltaMs / 16.666);
+  }
+  state.lyricReelAnimationPrevTs = frameTs > 0 ? frameTs : performance.now();
+
+  if (Math.abs(state.lyricReelInertiaVelocity) > LYRIC_REEL_INERTIA_MIN) {
+    const rawTarget = state.lyricReelTargetPosition + (state.lyricReelInertiaVelocity * frameScale);
+    const clampedTarget = clampLyricReelPosition(rawTarget);
+    state.lyricReelTargetPosition = clampedTarget;
+    if (Math.abs(clampedTarget - rawTarget) > 0.0001) {
+      state.lyricReelInertiaVelocity = 0;
+    } else {
+      state.lyricReelInertiaVelocity *= Math.pow(LYRIC_REEL_INERTIA_DECAY, frameScale);
+    }
+  } else {
+    state.lyricReelInertiaVelocity = 0;
+  }
+
   const diff = state.lyricReelTargetPosition - state.lyricReelVisualPosition;
-  if (Math.abs(diff) < 0.002) {
+  if (Math.abs(diff) < 0.002 && state.lyricReelInertiaVelocity === 0) {
     applyLyricReelVisualPosition(state.lyricReelTargetPosition);
     clearLyricReelAnimationFrame();
     return;
   }
 
-  const nextPosition = state.lyricReelVisualPosition + (diff * 0.24);
+  const ease = Math.min(0.34, 0.22 + ((frameScale - 1) * 0.05));
+  const nextPosition = state.lyricReelVisualPosition + (diff * ease);
   applyLyricReelVisualPosition(nextPosition);
   state.lyricReelAnimationFrame = window.requestAnimationFrame(animateLyricReel);
 }
@@ -783,6 +815,9 @@ function setLyricReelTargetPosition(position, immediate = false) {
   if (immediate || state.lyricReelVisualPosition < 0) {
     clearLyricReelAnimationFrame();
     applyLyricReelVisualPosition(clamped);
+    return;
+  }
+  if (state.lyricReelInertiaVelocity === 0 && Math.abs(clamped - state.lyricReelVisualPosition) < 0.002) {
     return;
   }
   if (state.lyricReelAnimationFrame === null) {
@@ -814,6 +849,7 @@ function closeLyricReel(options = {}) {
   state.lyricReelActive = false;
   state.lyricReelTargetPosition = -1;
   state.lyricReelVisualPosition = -1;
+  state.lyricReelInertiaVelocity = 0;
   elements.phoneShell.classList.remove("lyric-reel-active");
   elements.lyricReelOverlay.classList.add("hidden");
   elements.lyricReelOverlay.setAttribute("aria-hidden", "true");
@@ -835,6 +871,7 @@ function openLyricReel() {
   state.lyricReelActive = true;
   state.lyricReelResumeOnClose = wasPlaying;
   clearLyricReelAnimationFrame();
+  state.lyricReelInertiaVelocity = 0;
   elements.videoPlayer.pause();
   elements.phoneShell.classList.add("lyric-reel-active");
   elements.lyricReelOverlay.classList.remove("hidden");
@@ -849,6 +886,8 @@ function stepLyricReel(step) {
       return false;
     }
   }
+  scheduleLyricReelAutoClose();
+  state.lyricReelInertiaVelocity = 0;
   const base = state.lyricReelTargetPosition >= 0
     ? state.lyricReelTargetPosition
     : state.lyricReelIndex;
@@ -1351,6 +1390,11 @@ function handleWheel(event) {
       ? state.lyricReelTargetPosition
       : state.lyricReelVisualPosition;
     const deltaLines = event.deltaY / LYRIC_WHEEL_STEP_DELTA;
+    const velocityDelta = deltaLines * LYRIC_REEL_INERTIA_FACTOR;
+    state.lyricReelInertiaVelocity = Math.max(
+      -1.05,
+      Math.min(1.05, state.lyricReelInertiaVelocity + velocityDelta)
+    );
     setLyricReelTargetPosition(currentTarget + deltaLines, false);
     return;
   }
@@ -1391,12 +1435,12 @@ function handleKeydown(event) {
       closeLyricReel({ resumePlayback: true });
       return;
     }
-    if (event.key === "ArrowDown" || key === "j") {
+    if (event.key === "ArrowDown" || key === "j" || event.key === "ArrowRight") {
       event.preventDefault();
       stepLyricReel(1);
       return;
     }
-    if (event.key === "ArrowUp" || key === "k") {
+    if (event.key === "ArrowUp" || key === "k" || event.key === "ArrowLeft") {
       event.preventDefault();
       stepLyricReel(-1);
       return;
@@ -1528,6 +1572,18 @@ function bindTouchNavigation() {
 function bindEvents() {
   const resetControlsToggleFade = () => scheduleControlsToggleIdleFade();
 
+  elements.phoneShell.addEventListener("click", (event) => {
+    const clickedElement = event.target instanceof Element ? event.target : null;
+    if (clickedElement && clickedElement.closest("button, input, select, textarea, a, label")) {
+      return;
+    }
+    if (state.lyricReelActive) {
+      closeLyricReel({ resumePlayback: true });
+      return;
+    }
+    togglePlayPause();
+  });
+
   elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
   elements.jumpCloseBtn.addEventListener("click", () => closeJumpModal());
   elements.jumpModal.addEventListener("click", (event) => {
@@ -1557,7 +1613,10 @@ function bindEvents() {
       closeJumpModal();
     }
   });
-  elements.lyricReelOverlay.addEventListener("click", () => closeLyricReel({ resumePlayback: true }));
+  elements.lyricReelOverlay.addEventListener("click", (event) => {
+    event.stopPropagation();
+    closeLyricReel({ resumePlayback: true });
+  });
 
   elements.sourceSelect.addEventListener("change", () => {
     loadFeed(elements.sourceSelect.value).catch((error) => {
@@ -1583,18 +1642,38 @@ function bindEvents() {
   elements.controlsToggleBtn.addEventListener("blur", () => resetControlsToggleFade());
 
   elements.prevBtn.addEventListener("click", () => {
+    if (state.lyricReelActive) {
+      stepLyricReel(-1);
+      resetControlsToggleFade();
+      return;
+    }
     prevVideo().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
   });
   elements.seekBackBtn.addEventListener("click", () => {
+    if (state.lyricReelActive) {
+      stepLyricReel(-1);
+      resetControlsToggleFade();
+      return;
+    }
     seekBySeconds(-SEEK_SECONDS);
     resetControlsToggleFade();
   });
   elements.nextBtn.addEventListener("click", () => {
+    if (state.lyricReelActive) {
+      stepLyricReel(1);
+      resetControlsToggleFade();
+      return;
+    }
     nextVideo().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
   });
   elements.seekForwardBtn.addEventListener("click", () => {
+    if (state.lyricReelActive) {
+      stepLyricReel(1);
+      resetControlsToggleFade();
+      return;
+    }
     seekBySeconds(SEEK_SECONDS);
     resetControlsToggleFade();
   });
