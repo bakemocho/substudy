@@ -196,6 +196,9 @@ body {
   box-shadow: 0 18px 42px rgba(2, 5, 15, 0.56);
   backdrop-filter: blur(10px);
   line-height: 1.35;
+  overscroll-behavior: contain;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .subtitle-dict-title {

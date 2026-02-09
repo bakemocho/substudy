@@ -6,6 +6,7 @@ const LYRIC_REEL_INERTIA_FACTOR = 0.04;
 const LYRIC_REEL_INERTIA_DECAY = 0.88;
 const LYRIC_REEL_INERTIA_MIN = 0.0007;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
+const DICT_HOVER_LOOP_MIN_MS = 900;
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 
 const state = {
@@ -47,6 +48,11 @@ const state = {
   dictPopupHideTimer: null,
   dictLookupRequestId: 0,
   dictPopupWord: "",
+  dictPopupCueStartMs: null,
+  dictPopupCueEndMs: null,
+  dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
+  dictHoverLoopActive: false,
+  dictHoverLoopPauseOnStop: false,
 };
 
 const elements = {
@@ -55,6 +61,7 @@ const elements = {
   autoplayToggle: document.getElementById("autoplayToggle"),
   shuffleToggle: document.getElementById("shuffleToggle"),
   normalizationToggle: document.getElementById("normalizationToggle"),
+  dictHoverLoopToggle: document.getElementById("dictHoverLoopToggle"),
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
@@ -172,6 +179,13 @@ function updateNormalizationToggle() {
     return;
   }
   elements.normalizationToggle.textContent = `音量正規化: ${state.normalizationEnabled ? "ON" : "OFF"}`;
+}
+
+function updateDictHoverLoopToggle() {
+  if (!elements.dictHoverLoopToggle) {
+    return;
+  }
+  elements.dictHoverLoopToggle.textContent = `辞書ループ: ${state.dictHoverLoopEnabled ? "ON" : "OFF"}`;
 }
 
 function shuffleIndices(indices) {
@@ -722,9 +736,80 @@ function clearDictionaryPopupHideTimer() {
   }
 }
 
+function updateDictionaryPopupCueRange() {
+  const cue = currentCueOrFallback();
+  const cueStartMs = Number(cue.start_ms);
+  const cueEndMs = Number(cue.end_ms);
+  if (!Number.isFinite(cueStartMs) || !Number.isFinite(cueEndMs)) {
+    state.dictPopupCueStartMs = null;
+    state.dictPopupCueEndMs = null;
+    return;
+  }
+  const startMs = Math.max(0, Math.round(cueStartMs));
+  const endMs = Math.max(startMs + DICT_HOVER_LOOP_MIN_MS, Math.round(cueEndMs));
+  state.dictPopupCueStartMs = startMs;
+  state.dictPopupCueEndMs = endMs;
+}
+
+function stopDictionaryHoverLoop() {
+  if (!state.dictHoverLoopActive) {
+    return;
+  }
+  const pauseOnStop = state.dictHoverLoopPauseOnStop;
+  state.dictHoverLoopActive = false;
+  state.dictHoverLoopPauseOnStop = false;
+  if (pauseOnStop && !elements.videoPlayer.paused) {
+    elements.videoPlayer.pause();
+  }
+}
+
+function startDictionaryHoverLoop() {
+  if (!state.dictHoverLoopEnabled || state.lyricReelActive || !elements.videoPlayer.src) {
+    return;
+  }
+  const startMs = Number(state.dictPopupCueStartMs);
+  const endMs = Number(state.dictPopupCueEndMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return;
+  }
+  if (!state.dictHoverLoopActive) {
+    state.dictHoverLoopPauseOnStop = elements.videoPlayer.paused;
+  }
+  state.dictHoverLoopActive = true;
+  const nowMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+  if (nowMs < startMs || nowMs > endMs) {
+    elements.videoPlayer.currentTime = startMs / 1000;
+  }
+  if (elements.videoPlayer.paused) {
+    elements.videoPlayer.play().catch(() => {});
+  }
+}
+
+function enforceDictionaryHoverLoop() {
+  if (!state.dictHoverLoopActive || state.lyricReelActive || !elements.videoPlayer.src) {
+    return;
+  }
+  const startMs = Number(state.dictPopupCueStartMs);
+  const endMs = Number(state.dictPopupCueEndMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    stopDictionaryHoverLoop();
+    return;
+  }
+  const nowMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+  if (nowMs >= endMs || nowMs < startMs - 80) {
+    elements.videoPlayer.currentTime = startMs / 1000;
+    if (elements.videoPlayer.paused) {
+      elements.videoPlayer.play().catch(() => {});
+    }
+  }
+}
+
 function hideSubtitleDictionaryPopup() {
   clearDictionaryPopupHideTimer();
+  stopDictionaryHoverLoop();
   state.dictPopupWord = "";
+  state.dictPopupCueStartMs = null;
+  state.dictPopupCueEndMs = null;
   elements.subtitleDictPopup.classList.add("hidden");
   elements.subtitleDictPopup.setAttribute("aria-hidden", "true");
   const activeWord = elements.subtitleOverlay.querySelector(".subtitle-word.active");
@@ -852,6 +937,7 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
+  updateDictionaryPopupCueRange();
   const previousActive = elements.subtitleOverlay.querySelector(".subtitle-word.active");
   if (previousActive && previousActive !== wordEl) {
     previousActive.classList.remove("active");
@@ -1154,6 +1240,7 @@ function openLyricReel() {
   if (!state.cues.length) {
     return false;
   }
+  hideSubtitleDictionaryPopup();
   const wasPlaying = !elements.videoPlayer.paused;
   const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
   const activeIndex = findActiveCueIndex(currentMs);
@@ -1674,7 +1761,23 @@ function toggleNormalizationMode() {
   setStatus(`音量正規化を${state.normalizationEnabled ? "ON" : "OFF"}にしました。`, "ok");
 }
 
+function toggleDictionaryHoverLoopMode() {
+  state.dictHoverLoopEnabled = !state.dictHoverLoopEnabled;
+  localStorage.setItem("substudy.dict_hover_loop", state.dictHoverLoopEnabled ? "on" : "off");
+  if (!state.dictHoverLoopEnabled) {
+    stopDictionaryHoverLoop();
+  }
+  updateDictHoverLoopToggle();
+  setStatus(`辞書ループを${state.dictHoverLoopEnabled ? "ON" : "OFF"}にしました。`, "ok");
+}
+
 function handleWheel(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (target && target.closest("#subtitleDictPopup")) {
+    clearDictionaryPopupHideTimer();
+    return;
+  }
+
   const canUseLyricReel = state.lyricReelActive || state.cues.length > 0;
   if (canUseLyricReel) {
     event.preventDefault();
@@ -1729,6 +1832,9 @@ function handleKeydown(event) {
   }
 
   const key = event.key.toLowerCase();
+  if (event.metaKey || event.ctrlKey || event.altKey) {
+    return;
+  }
   if (state.lyricReelActive) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -1900,9 +2006,23 @@ function bindEvents() {
       event.stopPropagation();
     }
   });
-  elements.subtitleDictPopup.addEventListener("pointerenter", () => clearDictionaryPopupHideTimer());
-  elements.subtitleDictPopup.addEventListener("pointerleave", () => scheduleHideSubtitleDictionaryPopup());
+  elements.subtitleDictPopup.addEventListener("pointerenter", () => {
+    clearDictionaryPopupHideTimer();
+    startDictionaryHoverLoop();
+  });
+  elements.subtitleDictPopup.addEventListener("pointerleave", () => {
+    stopDictionaryHoverLoop();
+    scheduleHideSubtitleDictionaryPopup();
+  });
   elements.subtitleDictPopup.addEventListener("click", (event) => event.stopPropagation());
+  elements.subtitleDictPopup.addEventListener(
+    "wheel",
+    (event) => {
+      event.stopPropagation();
+      clearDictionaryPopupHideTimer();
+    },
+    { passive: true }
+  );
 
   elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
   elements.jumpCloseBtn.addEventListener("click", () => closeJumpModal());
@@ -1959,6 +2079,12 @@ function bindEvents() {
   if (elements.normalizationToggle) {
     elements.normalizationToggle.addEventListener("click", () => {
       toggleNormalizationMode();
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.dictHoverLoopToggle) {
+    elements.dictHoverLoopToggle.addEventListener("click", () => {
+      toggleDictionaryHoverLoopMode();
       resetControlsToggleFade();
     });
   }
@@ -2060,12 +2186,18 @@ function bindEvents() {
     resetControlsToggleFade();
   });
 
-  elements.videoPlayer.addEventListener("timeupdate", () => updateSubtitleFromPlayback());
+  elements.videoPlayer.addEventListener("timeupdate", () => {
+    enforceDictionaryHoverLoop();
+    updateSubtitleFromPlayback();
+  });
   elements.videoPlayer.addEventListener("play", () => {
     closeLyricReel();
     updatePlayPauseButton();
   });
-  elements.videoPlayer.addEventListener("pause", () => updatePlayPauseButton());
+  elements.videoPlayer.addEventListener("pause", () => {
+    stopDictionaryHoverLoop();
+    updatePlayPauseButton();
+  });
   elements.videoPlayer.addEventListener("volumechange", () => {
     updateMuteButtonLabel();
   });
@@ -2097,6 +2229,7 @@ async function initialize() {
   updateAutoplayToggle();
   updateShuffleToggle();
   updateNormalizationToggle();
+  updateDictHoverLoopToggle();
   loadVolumeSettings();
   updatePlayPauseButton();
   bindEvents();
