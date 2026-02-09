@@ -38,6 +38,9 @@ const state = {
   controlsFadeTimer: null,
   jumpResults: [],
   jumpSelectedIndex: 0,
+  normalizationEnabled: localStorage.getItem("substudy.volume_normalization") !== "off",
+  userVolume: 1,
+  userMuted: false,
 };
 
 const elements = {
@@ -45,6 +48,7 @@ const elements = {
   jumpOpenBtn: document.getElementById("jumpOpenBtn"),
   autoplayToggle: document.getElementById("autoplayToggle"),
   shuffleToggle: document.getElementById("shuffleToggle"),
+  normalizationToggle: document.getElementById("normalizationToggle"),
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
@@ -154,6 +158,13 @@ function updateAutoplayToggle() {
 
 function updateShuffleToggle() {
   elements.shuffleToggle.textContent = `シャッフル: ${state.shuffleMode ? "ON" : "OFF"}`;
+}
+
+function updateNormalizationToggle() {
+  if (!elements.normalizationToggle) {
+    return;
+  }
+  elements.normalizationToggle.textContent = `音量正規化: ${state.normalizationEnabled ? "ON" : "OFF"}`;
 }
 
 function shuffleIndices(indices) {
@@ -294,16 +305,60 @@ function toggleMetaDrawer(forceValue = null) {
 }
 
 function updateMuteButtonLabel() {
-  const volumePercent = Math.round((elements.videoPlayer.volume || 0) * 100);
-  elements.muteBtn.textContent = elements.videoPlayer.muted ? "ミュート中" : `音量: ${volumePercent}%`;
+  if (state.userMuted) {
+    elements.muteBtn.textContent = "ミュート中";
+    return;
+  }
+  const volumePercent = Math.round(state.userVolume * 100);
+  if (!state.normalizationEnabled) {
+    elements.muteBtn.textContent = `音量: ${volumePercent}%`;
+    return;
+  }
+
+  const video = currentVideo();
+  const gainDbRaw = Number(video?.audio_gain_db);
+  const gainDb = Number.isFinite(gainDbRaw) ? gainDbRaw : 0;
+  if (Math.abs(gainDb) < 0.05) {
+    elements.muteBtn.textContent = `音量: ${volumePercent}%`;
+    return;
+  }
+  const gainPrefix = gainDb > 0 ? "+" : "";
+  elements.muteBtn.textContent = `音量: ${volumePercent}% (${gainPrefix}${gainDb.toFixed(1)}dB)`;
+}
+
+function currentVideoNormalizationGain() {
+  if (!state.normalizationEnabled) {
+    return 1;
+  }
+  const video = currentVideo();
+  if (!video) {
+    return 1;
+  }
+  const gainDbRaw = Number(video.audio_gain_db);
+  if (!Number.isFinite(gainDbRaw)) {
+    return 1;
+  }
+  const gain = Math.pow(10, gainDbRaw / 20);
+  if (!Number.isFinite(gain)) {
+    return 1;
+  }
+  return Math.min(4, Math.max(0, gain));
+}
+
+function applyOutputVolume() {
+  const gain = currentVideoNormalizationGain();
+  const effectiveVolume = Math.min(1, Math.max(0, state.userVolume * gain));
+  elements.videoPlayer.volume = effectiveVolume;
+  elements.videoPlayer.muted = state.userMuted;
+  elements.volumeSlider.value = String(state.userVolume);
+  updateMuteButtonLabel();
 }
 
 function applyVolumeSettings(volumeValue, muted) {
   const normalizedVolume = Number.isFinite(volumeValue) ? Math.min(1, Math.max(0, volumeValue)) : 1;
-  elements.videoPlayer.volume = normalizedVolume;
-  elements.videoPlayer.muted = Boolean(muted);
-  elements.volumeSlider.value = String(normalizedVolume);
-  updateMuteButtonLabel();
+  state.userVolume = normalizedVolume;
+  state.userMuted = Boolean(muted);
+  applyOutputVolume();
 }
 
 function loadVolumeSettings() {
@@ -1090,6 +1145,7 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
 
   await loadTrackCues();
   await loadBookmarks();
+  applyOutputVolume();
 
   if (autoplay) {
     try {
@@ -1358,9 +1414,9 @@ function seekBySeconds(deltaSeconds) {
 }
 
 function toggleMute() {
-  elements.videoPlayer.muted = !elements.videoPlayer.muted;
-  localStorage.setItem("substudy.muted", elements.videoPlayer.muted ? "true" : "false");
-  updateMuteButtonLabel();
+  state.userMuted = !state.userMuted;
+  localStorage.setItem("substudy.muted", state.userMuted ? "true" : "false");
+  applyOutputVolume();
 }
 
 function toggleShuffleMode() {
@@ -1372,6 +1428,14 @@ function toggleShuffleMode() {
   }
   updateShuffleToggle();
   setStatus(`シャッフルを${state.shuffleMode ? "ON" : "OFF"}にしました。`, "ok");
+}
+
+function toggleNormalizationMode() {
+  state.normalizationEnabled = !state.normalizationEnabled;
+  localStorage.setItem("substudy.volume_normalization", state.normalizationEnabled ? "on" : "off");
+  updateNormalizationToggle();
+  applyOutputVolume();
+  setStatus(`音量正規化を${state.normalizationEnabled ? "ON" : "OFF"}にしました。`, "ok");
 }
 
 function handleWheel(event) {
@@ -1528,6 +1592,12 @@ function handleKeydown(event) {
     return;
   }
 
+  if (key === "n") {
+    event.preventDefault();
+    toggleNormalizationMode();
+    return;
+  }
+
   if (key === "c") {
     event.preventDefault();
     clearCountdown();
@@ -1636,6 +1706,12 @@ function bindEvents() {
     toggleShuffleMode();
     resetControlsToggleFade();
   });
+  if (elements.normalizationToggle) {
+    elements.normalizationToggle.addEventListener("click", () => {
+      toggleNormalizationMode();
+      resetControlsToggleFade();
+    });
+  }
   elements.controlsToggleBtn.addEventListener("click", () => toggleControlsDrawer());
   elements.controlsToggleBtn.addEventListener("pointerenter", () => showControlsToggleButton());
   elements.controlsToggleBtn.addEventListener("focus", () => showControlsToggleButton());
@@ -1694,13 +1770,13 @@ function bindEvents() {
   elements.volumeSlider.addEventListener("input", () => {
     const volume = Number(elements.volumeSlider.value);
     const safeVolume = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1;
-    elements.videoPlayer.volume = safeVolume;
+    state.userVolume = safeVolume;
     if (safeVolume > 0) {
-      elements.videoPlayer.muted = false;
+      state.userMuted = false;
     }
-    localStorage.setItem("substudy.volume", String(safeVolume));
-    localStorage.setItem("substudy.muted", elements.videoPlayer.muted ? "true" : "false");
-    updateMuteButtonLabel();
+    localStorage.setItem("substudy.volume", String(state.userVolume));
+    localStorage.setItem("substudy.muted", state.userMuted ? "true" : "false");
+    applyOutputVolume();
     resetControlsToggleFade();
   });
 
@@ -1741,10 +1817,7 @@ function bindEvents() {
   });
   elements.videoPlayer.addEventListener("pause", () => updatePlayPauseButton());
   elements.videoPlayer.addEventListener("volumechange", () => {
-    localStorage.setItem("substudy.volume", String(elements.videoPlayer.volume || 0));
-    localStorage.setItem("substudy.muted", elements.videoPlayer.muted ? "true" : "false");
     updateMuteButtonLabel();
-    resetControlsToggleFade();
   });
   elements.videoPlayer.addEventListener("ended", () => {
     if (!state.autoplayContinuous) {
@@ -1773,6 +1846,7 @@ async function initialize() {
   scheduleControlsToggleIdleFade();
   updateAutoplayToggle();
   updateShuffleToggle();
+  updateNormalizationToggle();
   loadVolumeSettings();
   updatePlayPauseButton();
   bindEvents();

@@ -23,21 +23,26 @@ while (($# > 0)); do
   esac
 done
 
-python3 "${REPO_ROOT}/scripts/substudy.py" sync \
-  --skip-ledger \
-  --config "${REPO_ROOT}/config/sources.toml" \
-  "${SOURCE_ARGS[@]}"
+run_substudy() {
+  local command="$1"
+  shift
+  python3 "${REPO_ROOT}/scripts/substudy.py" "${command}" "$@" "${SOURCE_ARGS[@]+"${SOURCE_ARGS[@]}"}"
+}
 
-python3 "${REPO_ROOT}/scripts/substudy.py" backfill \
+run_substudy sync \
   --skip-ledger \
-  --config "${REPO_ROOT}/config/sources.toml" \
-  "${SOURCE_ARGS[@]}"
+  --config "${REPO_ROOT}/config/sources.toml"
 
-python3 "${REPO_ROOT}/scripts/substudy.py" ledger \
+run_substudy backfill \
+  --skip-ledger \
+  --config "${REPO_ROOT}/config/sources.toml"
+
+run_substudy ledger \
   --incremental \
-  --config "${REPO_ROOT}/config/sources.toml" \
-  "${SOURCE_ARGS[@]}"
+  --config "${REPO_ROOT}/config/sources.toml"
 
-python3 "${REPO_ROOT}/scripts/substudy.py" asr \
-  --config "${REPO_ROOT}/config/sources.toml" \
-  "${SOURCE_ARGS[@]}"
+run_substudy loudness \
+  --config "${REPO_ROOT}/config/sources.toml"
+
+run_substudy asr \
+  --config "${REPO_ROOT}/config/sources.toml"

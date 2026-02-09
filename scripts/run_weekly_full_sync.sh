@@ -29,6 +29,7 @@ if command -v yt-dlp >/dev/null 2>&1; then
 fi
 
 python3 "${REPO_ROOT}/scripts/substudy.py" sync --full-ledger --config "${REPO_ROOT}/config/sources.toml"
+python3 "${REPO_ROOT}/scripts/substudy.py" loudness --config "${REPO_ROOT}/config/sources.toml"
 python3 "${REPO_ROOT}/scripts/substudy.py" asr --config "${REPO_ROOT}/config/sources.toml"
 
 echo "[weekly] done: $(date '+%Y-%m-%d %H:%M:%S')"

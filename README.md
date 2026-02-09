@@ -10,6 +10,7 @@ Local-first workflow for English study from downloaded short videos.
   - reverse-incremental backfill for older posts
   - maintaining a master ledger (`SQLite` + `CSV`)
   - incremental ASR subtitle generation
+  - per-video loudness analysis for inter-video volume normalization
   - download run/error tracking for retry-safe operations
   - local TikTok-style study web UI (`web`) with favorites/bookmarks/notes
 - macOS automation with two launchd jobs:
@@ -18,12 +19,12 @@ Local-first workflow for English study from downloaded short videos.
 
 ## Layout
 
-- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `downloads`, `web`)
+- `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `loudness`, `downloads`, `web`)
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
-- `scripts/run_daily_sync.sh`: daily incremental wrapper
-- `scripts/run_weekly_full_sync.sh`: weekly full wrapper (includes `brew upgrade yt-dlp`)
+- `scripts/run_daily_sync.sh`: daily incremental wrapper (`sync`/`backfill`/`ledger`/`loudness`/`asr`)
+- `scripts/run_weekly_full_sync.sh`: weekly full wrapper (includes `brew upgrade yt-dlp` + `loudness`)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `config/sources.example.toml`: example config
 - `data/master_ledger.sqlite`: generated ledger DB
@@ -63,19 +64,25 @@ Set `backfill_enabled = true` globally or per source before using it.
 python3 scripts/substudy.py asr
 ```
 
-6. Inspect recent download logs and pending failures:
+6. Analyze loudness (inter-video normalization gain):
+
+```bash
+python3 scripts/substudy.py loudness
+```
+
+7. Inspect recent download logs and pending failures:
 
 ```bash
 python3 scripts/substudy.py downloads --since-hours 24
 ```
 
-7. Rebuild ledger fully when needed:
+8. Rebuild ledger fully when needed:
 
 ```bash
 python3 scripts/substudy.py sync --full-ledger
 ```
 
-8. Launch local study web UI:
+9. Launch local study web UI:
 
 ```bash
 python3 scripts/substudy.py web --host 127.0.0.1 --port 8876
@@ -88,6 +95,7 @@ Open `http://127.0.0.1:8876`.
 - 9:16 vertical video feed with up/down navigation (`↑/↓`, `J/K`, wheel, swipe)
 - Auto-advance on video end with 3-second countdown and cancel button
 - Continuous playback toggle (`A`)
+- Inter-video volume normalization toggle (`N`)
 - Subtitle overlay + selectable track
 - Subtitle bookmarks:
   - save current subtitle (`B`)

@@ -6,6 +6,7 @@ import base64
 import csv
 import datetime as dt
 import json
+import math
 import mimetypes
 import re
 import shlex
@@ -33,6 +34,11 @@ DEFAULT_LEDGER_CSV = Path("data/master_ledger.csv")
 DEFAULT_TIKTOK_VIDEO_URL = "https://www.tiktok.com/@{handle}/video/{id}"
 DEFAULT_PLAYLIST_END = 200
 DEFAULT_ASR_EXTS = ["srt", "vtt"]
+DEFAULT_LOUDNESS_TARGET_LUFS = -16.0
+DEFAULT_LOUDNESS_MAX_BOOST_DB = 6.0
+DEFAULT_LOUDNESS_MAX_CUT_DB = 12.0
+DEFAULT_LOUDNESS_LIMIT = 300
+DEFAULT_LOUDNESS_FFMPEG_BIN = "ffmpeg"
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8876
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
@@ -1012,6 +1018,10 @@ def create_schema(connection: sqlite3.Connection) -> None:
             has_subtitles INTEGER NOT NULL DEFAULT 0,
             subtitle_count INTEGER NOT NULL DEFAULT 0,
             subtitle_langs TEXT,
+            audio_lufs REAL,
+            audio_gain_db REAL,
+            audio_loudness_analyzed_at TEXT,
+            audio_loudness_error TEXT,
             synced_at TEXT NOT NULL,
             PRIMARY KEY (source_id, video_id),
             FOREIGN KEY (source_id) REFERENCES sources(source_id)
@@ -1136,6 +1146,24 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_notes(source_id, video_id, updated_at DESC);
         """
     )
+    ensure_videos_loudness_columns(connection)
+
+
+def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA table_info(videos)").fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+    required_columns = {
+        "audio_lufs": "REAL",
+        "audio_gain_db": "REAL",
+        "audio_loudness_analyzed_at": "TEXT",
+        "audio_loudness_error": "TEXT",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name in existing_columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE videos ADD COLUMN {column_name} {column_type}"
+        )
 
 
 def export_csv(connection: sqlite3.Connection, csv_path: Path) -> None:
@@ -1158,6 +1186,10 @@ def export_csv(connection: sqlite3.Connection, csv_path: Path) -> None:
         v.has_subtitles,
         v.subtitle_count,
         v.subtitle_langs,
+        v.audio_lufs,
+        v.audio_gain_db,
+        v.audio_loudness_analyzed_at,
+        v.audio_loudness_error,
         CASE
             WHEN a.status = 'success' AND a.output_path IS NOT NULL THEN 1
             ELSE 0
@@ -2163,6 +2195,236 @@ def run_asr(
     print(f"[asr] completed ({mode}) -> {db_path}")
 
 
+def extract_loudnorm_stats(output_text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    best_payload: dict[str, Any] | None = None
+    for match in re.finditer(r"\{", output_text):
+        chunk = output_text[match.start() :]
+        try:
+            payload, _ = decoder.raw_decode(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "input_i" in payload:
+            best_payload = payload
+    return best_payload
+
+
+def parse_finite_float(raw_value: Any) -> float | None:
+    parsed = safe_float(raw_value)
+    if parsed is None or not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def analyze_media_loudness(
+    media_path: Path,
+    ffmpeg_bin: str,
+    target_lufs: float,
+) -> tuple[float | None, str | None]:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        str(media_path),
+        "-vn",
+        "-sn",
+        "-dn",
+        "-af",
+        f"loudnorm=I={target_lufs:.1f}:TP=-1.5:LRA=11:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    merged_output = f"{completed.stderr}\n{completed.stdout}".strip()
+    stats = extract_loudnorm_stats(merged_output)
+    if stats is None:
+        if completed.returncode != 0:
+            message = merged_output.splitlines()[-1].strip() if merged_output else ""
+            return None, message or f"ffmpeg exited with code {completed.returncode}"
+        return None, "loudnorm JSON payload not found"
+
+    input_lufs = parse_finite_float(stats.get("input_i"))
+    if input_lufs is None:
+        return None, "invalid input_i in loudnorm output"
+    return input_lufs, None
+
+
+def run_loudness(
+    sources: list[SourceConfig],
+    db_path: Path,
+    target_lufs: float = DEFAULT_LOUDNESS_TARGET_LUFS,
+    max_boost_db: float = DEFAULT_LOUDNESS_MAX_BOOST_DB,
+    max_cut_db: float = DEFAULT_LOUDNESS_MAX_CUT_DB,
+    limit: int = DEFAULT_LOUDNESS_LIMIT,
+    force: bool = False,
+    ffmpeg_bin: str = DEFAULT_LOUDNESS_FFMPEG_BIN,
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_candidate = Path(ffmpeg_bin).expanduser()
+    has_explicit_path = ffmpeg_candidate.is_absolute() or "/" in ffmpeg_bin or "\\" in ffmpeg_bin
+    if has_explicit_path:
+        if not ffmpeg_candidate.exists():
+            raise RuntimeError(f"ffmpeg binary not found: {ffmpeg_candidate}")
+    elif shutil.which(ffmpeg_bin) is None:
+        raise RuntimeError(
+            f"ffmpeg binary '{ffmpeg_bin}' not found in PATH. "
+            "Install ffmpeg or pass --ffmpeg-bin."
+        )
+
+    connection = sqlite3.connect(str(db_path))
+    create_schema(connection)
+
+    safe_limit = max(1, int(limit))
+    safe_boost = max(0.0, float(max_boost_db))
+    safe_cut = max(0.0, float(max_cut_db))
+
+    total_candidates = 0
+    total_success = 0
+    total_failed = 0
+    total_missing = 0
+
+    try:
+        for source in sources:
+            where_clauses = [
+                "source_id = ?",
+                "has_media = 1",
+                "media_path IS NOT NULL",
+            ]
+            params: list[Any] = [source.id]
+            if not force:
+                where_clauses.append(
+                    "("
+                    "audio_loudness_analyzed_at IS NULL "
+                    "OR audio_loudness_analyzed_at = '' "
+                    "OR audio_gain_db IS NULL"
+                    ")"
+                )
+
+            rows = connection.execute(
+                f"""
+                SELECT video_id, media_path
+                FROM videos
+                WHERE {" AND ".join(where_clauses)}
+                ORDER BY COALESCE(upload_date, '') DESC, video_id DESC
+                LIMIT ?
+                """,
+                (*params, safe_limit),
+            ).fetchall()
+
+            if not rows:
+                print(f"[loudness] {source.id}: up to date")
+                continue
+
+            print(
+                f"[loudness] {source.id}: queued={len(rows)} "
+                f"target={target_lufs:.1f}LUFS max_boost={safe_boost:.1f}dB max_cut={safe_cut:.1f}dB"
+            )
+
+            source_success = 0
+            source_failed = 0
+            source_missing = 0
+
+            for index, (video_id_value, media_path_value) in enumerate(rows, start=1):
+                video_id = str(video_id_value)
+                media_path = Path(str(media_path_value))
+                analyzed_at = now_utc_iso()
+
+                if not media_path.exists() or not media_path.is_file():
+                    connection.execute(
+                        """
+                        UPDATE videos
+                        SET audio_lufs = NULL,
+                            audio_gain_db = NULL,
+                            audio_loudness_analyzed_at = ?,
+                            audio_loudness_error = ?
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        """,
+                        (analyzed_at, "media file missing", source.id, video_id),
+                    )
+                    source_missing += 1
+                    print(f"[loudness] {source.id}/{video_id}: media file missing")
+                    continue
+
+                input_lufs, error = analyze_media_loudness(
+                    media_path=media_path,
+                    ffmpeg_bin=ffmpeg_bin,
+                    target_lufs=target_lufs,
+                )
+                if input_lufs is None:
+                    connection.execute(
+                        """
+                        UPDATE videos
+                        SET audio_lufs = NULL,
+                            audio_gain_db = NULL,
+                            audio_loudness_analyzed_at = ?,
+                            audio_loudness_error = ?
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        """,
+                        (analyzed_at, error or "loudness analysis failed", source.id, video_id),
+                    )
+                    source_failed += 1
+                    print(
+                        f"[loudness] {source.id}/{video_id}: failed "
+                        f"({error or 'unknown error'})"
+                    )
+                    continue
+
+                raw_gain_db = target_lufs - input_lufs
+                clipped_gain_db = max(-safe_cut, min(safe_boost, raw_gain_db))
+                connection.execute(
+                    """
+                    UPDATE videos
+                    SET audio_lufs = ?,
+                        audio_gain_db = ?,
+                        audio_loudness_analyzed_at = ?,
+                        audio_loudness_error = ''
+                    WHERE source_id = ?
+                      AND video_id = ?
+                    """,
+                    (
+                        input_lufs,
+                        clipped_gain_db,
+                        analyzed_at,
+                        source.id,
+                        video_id,
+                    ),
+                )
+                source_success += 1
+                print(
+                    f"[loudness] {source.id}/{video_id}: "
+                    f"LUFS={input_lufs:.2f} gain={clipped_gain_db:+.2f}dB "
+                    f"({index}/{len(rows)})"
+                )
+
+            connection.commit()
+            total_candidates += len(rows)
+            total_success += source_success
+            total_failed += source_failed
+            total_missing += source_missing
+            print(
+                f"[loudness] {source.id}: ok={source_success} "
+                f"failed={source_failed} missing={source_missing}"
+            )
+    finally:
+        connection.close()
+
+    print(
+        f"[loudness] completed candidates={total_candidates} "
+        f"ok={total_success} failed={total_failed} missing={total_missing} "
+        f"db={db_path}"
+    )
+
+
 def run_backfill(
     sources: list[SourceConfig],
     db_path: Path,
@@ -2912,7 +3174,9 @@ def build_web_handler(
                             WHEN vf.video_id IS NULL THEN 0
                             ELSE 1
                         END AS is_favorite,
-                        COALESCE(vn.note, '') AS video_note
+                        COALESCE(vn.note, '') AS video_note,
+                        v.audio_lufs,
+                        v.audio_gain_db
                     FROM videos v
                     LEFT JOIN video_favorites vf
                       ON vf.source_id = v.source_id
@@ -2996,6 +3260,8 @@ def build_web_handler(
                                 else str(row["favorite_created_at"])
                             ),
                             "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
+                            "audio_lufs": safe_float(row["audio_lufs"]),
+                            "audio_gain_db": safe_float(row["audio_gain_db"]),
                             "tracks": public_tracks,
                             "default_track": public_tracks[0]["track_id"] if public_tracks else None,
                         }
@@ -3583,6 +3849,48 @@ def parse_args() -> argparse.Namespace:
     )
     downloads_parser.add_argument("--ledger-db", type=Path)
 
+    loudness_parser = subparsers.add_parser(
+        "loudness",
+        help="Analyze per-video loudness and store normalization gain",
+    )
+    loudness_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    loudness_parser.add_argument("--source", action="append", dest="sources")
+    loudness_parser.add_argument("--ledger-db", type=Path)
+    loudness_parser.add_argument(
+        "--target-lufs",
+        type=float,
+        default=DEFAULT_LOUDNESS_TARGET_LUFS,
+        help="Target integrated loudness in LUFS (default: -16.0)",
+    )
+    loudness_parser.add_argument(
+        "--max-boost-db",
+        type=float,
+        default=DEFAULT_LOUDNESS_MAX_BOOST_DB,
+        help="Maximum positive gain per video (default: 6.0)",
+    )
+    loudness_parser.add_argument(
+        "--max-cut-db",
+        type=float,
+        default=DEFAULT_LOUDNESS_MAX_CUT_DB,
+        help="Maximum attenuation per video (default: 12.0)",
+    )
+    loudness_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LOUDNESS_LIMIT,
+        help="Maximum videos to analyze per source in one run (default: 300)",
+    )
+    loudness_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-analyze videos even when gain has already been computed.",
+    )
+    loudness_parser.add_argument(
+        "--ffmpeg-bin",
+        default=DEFAULT_LOUDNESS_FFMPEG_BIN,
+        help="ffmpeg binary path/name (default: ffmpeg)",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -3681,6 +3989,19 @@ def main() -> int:
             db_path=ledger_db_path,
             since_hours=max(1, args.since_hours),
             limit=max(1, args.limit),
+        )
+        return 0
+
+    if args.command == "loudness":
+        run_loudness(
+            sources=sources,
+            db_path=ledger_db_path,
+            target_lufs=float(args.target_lufs),
+            max_boost_db=max(0.0, float(args.max_boost_db)),
+            max_cut_db=max(0.0, float(args.max_cut_db)),
+            limit=max(1, int(args.limit)),
+            force=bool(args.force),
+            ffmpeg_bin=str(args.ffmpeg_bin),
         )
         return 0
 
