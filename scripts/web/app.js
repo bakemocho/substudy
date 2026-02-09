@@ -5,6 +5,9 @@ const LYRIC_REEL_AUTO_CLOSE_MS = 620;
 const LYRIC_REEL_INERTIA_FACTOR = 0.04;
 const LYRIC_REEL_INERTIA_DECAY = 0.88;
 const LYRIC_REEL_INERTIA_MIN = 0.0007;
+const SUBTITLE_PANEL_JA_ALIGN_THRESHOLD_MS = 1400;
+const SUBTITLE_PANEL_CENTER_TOLERANCE_PX = 34;
+const SUBTITLE_PANEL_PROGRAMMATIC_SCROLL_RESET_MS = 720;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
 const DICT_HOVER_LOOP_MIN_MS = 900;
 const DICT_CONTEXT_MAX_CANDIDATES = 9;
@@ -77,6 +80,16 @@ const state = {
   cues: [],
   activeCueIndex: -1,
   currentTrackId: null,
+  subtitlePanelRows: [],
+  subtitlePanelPrimaryTrackId: null,
+  subtitlePanelJaTrackId: null,
+  subtitlePanelPrimaryCues: [],
+  subtitlePanelJaCues: [],
+  subtitlePanelActiveIndex: -1,
+  subtitlePanelLoadToken: 0,
+  subtitlePanelAutoCenter: true,
+  subtitlePanelProgrammaticScroll: false,
+  subtitlePanelProgrammaticScrollTimer: null,
   bookmarks: [],
   countdownTimer: null,
   countdownRemaining: 0,
@@ -147,6 +160,7 @@ const elements = {
   muteBtn: document.getElementById("muteBtn"),
   volumeSlider: document.getElementById("volumeSlider"),
   playerActions: document.querySelector(".player-actions"),
+  subtitlePanelReel: document.getElementById("subtitlePanelReel"),
   trackSelect: document.getElementById("trackSelect"),
   bookmarkCueBtn: document.getElementById("bookmarkCueBtn"),
   rangeStartBtn: document.getElementById("rangeStartBtn"),
@@ -821,6 +835,93 @@ function renderTrackOptions(video) {
   }
 
   elements.trackSelect.value = state.currentTrackId;
+}
+
+function normalizedTrackKind(track) {
+  return String(track?.kind || "").trim().toLowerCase();
+}
+
+function normalizedTrackLabel(track) {
+  return String(track?.label || "").trim().toLowerCase();
+}
+
+function isJapaneseTrack(track) {
+  const label = normalizedTrackLabel(track);
+  return (
+    normalizedTrackKind(track) === "subtitle"
+    && (
+      label === "ja"
+      || label.startsWith("ja-")
+      || label.includes("japanese")
+    )
+  );
+}
+
+function isEnglishTrack(track) {
+  const kind = normalizedTrackKind(track);
+  const label = normalizedTrackLabel(track);
+  if (kind === "asr") {
+    return true;
+  }
+  if (kind !== "subtitle") {
+    return false;
+  }
+  return (
+    label === "en"
+    || label.startsWith("en-")
+    || label.includes("english")
+  );
+}
+
+function resolveSubtitlePanelTrackIds(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  if (!tracks.length) {
+    return {
+      primaryTrackId: state.currentTrackId,
+      jaTrackId: null,
+    };
+  }
+
+  const currentTrack = tracks.find((track) => track.track_id === state.currentTrackId) || null;
+  const jaTrack = tracks.find((track) => isJapaneseTrack(track)) || null;
+
+  let primaryTrack = null;
+  if (currentTrack && !isJapaneseTrack(currentTrack)) {
+    primaryTrack = currentTrack;
+  }
+  if (!primaryTrack) {
+    primaryTrack = tracks.find((track) => normalizedTrackKind(track) === "asr") || null;
+  }
+  if (!primaryTrack) {
+    primaryTrack = tracks.find((track) => isEnglishTrack(track)) || null;
+  }
+  if (!primaryTrack) {
+    primaryTrack = tracks.find((track) => normalizedTrackKind(track) === "subtitle" && !isJapaneseTrack(track)) || null;
+  }
+  if (!primaryTrack) {
+    primaryTrack = currentTrack || tracks[0] || null;
+  }
+
+  let jaTrackId = jaTrack ? String(jaTrack.track_id || "") : "";
+  const primaryTrackId = primaryTrack ? String(primaryTrack.track_id || "") : "";
+  if (jaTrackId && jaTrackId === primaryTrackId) {
+    jaTrackId = "";
+  }
+  return {
+    primaryTrackId: primaryTrackId || null,
+    jaTrackId: jaTrackId || null,
+  };
+}
+
+function renderSubtitlePanelLoading(message) {
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  elements.subtitlePanelReel.textContent = "";
+  const loading = document.createElement("p");
+  loading.className = "subtitle-panel-empty";
+  loading.textContent = message;
+  elements.subtitlePanelReel.appendChild(loading);
 }
 
 function normalizeDictionaryTerm(value) {
@@ -1896,16 +1997,16 @@ function clearSubtitleOverlay(message = "字幕がありません") {
   renderSubtitleOverlayText(message);
 }
 
-function findActiveCueIndex(timeMs) {
-  if (!state.cues.length) {
+function findActiveCueIndexInList(cues, timeMs) {
+  if (!Array.isArray(cues) || !cues.length) {
     return -1;
   }
 
   let left = 0;
-  let right = state.cues.length - 1;
+  let right = cues.length - 1;
   while (left <= right) {
     const mid = Math.floor((left + right) / 2);
-    const cue = state.cues[mid];
+    const cue = cues[mid];
     if (timeMs < cue.start_ms) {
       right = mid - 1;
     } else if (timeMs > cue.end_ms) {
@@ -1917,14 +2018,14 @@ function findActiveCueIndex(timeMs) {
   return -1;
 }
 
-function findNearestCueIndex(timeMs) {
-  if (!state.cues.length) {
+function findNearestCueIndexInList(cues, timeMs) {
+  if (!Array.isArray(cues) || !cues.length) {
     return -1;
   }
   let nearest = 0;
   let nearestDistance = Number.POSITIVE_INFINITY;
-  for (let idx = 0; idx < state.cues.length; idx += 1) {
-    const cue = state.cues[idx];
+  for (let idx = 0; idx < cues.length; idx += 1) {
+    const cue = cues[idx];
     const distance = Math.abs(timeMs - cue.start_ms);
     if (distance < nearestDistance) {
       nearestDistance = distance;
@@ -1932,6 +2033,430 @@ function findNearestCueIndex(timeMs) {
     }
   }
   return nearest;
+}
+
+function findActiveCueIndex(timeMs) {
+  return findActiveCueIndexInList(state.cues, timeMs);
+}
+
+function findNearestCueIndex(timeMs) {
+  return findNearestCueIndexInList(state.cues, timeMs);
+}
+
+function findNearestCueIndexByStart(cues, startMs) {
+  if (!Array.isArray(cues) || !cues.length) {
+    return -1;
+  }
+  let left = 0;
+  let right = cues.length - 1;
+  while (left <= right) {
+    const mid = Math.floor((left + right) / 2);
+    const cue = cues[mid];
+    if (startMs < cue.start_ms) {
+      right = mid - 1;
+    } else if (startMs > cue.start_ms) {
+      left = mid + 1;
+    } else {
+      return mid;
+    }
+  }
+  const candidates = [];
+  if (left >= 0 && left < cues.length) {
+    candidates.push(left);
+  }
+  if (right >= 0 && right < cues.length) {
+    candidates.push(right);
+  }
+  if (!candidates.length) {
+    return -1;
+  }
+  candidates.sort((a, b) => (
+    Math.abs(cues[a].start_ms - startMs) - Math.abs(cues[b].start_ms - startMs)
+  ));
+  return candidates[0];
+}
+
+function findAlignedJaCue(primaryCue, jaCues) {
+  if (!primaryCue || !Array.isArray(jaCues) || !jaCues.length) {
+    return null;
+  }
+  const baseStart = Number(primaryCue.start_ms);
+  const baseEnd = Number(primaryCue.end_ms);
+  if (!Number.isFinite(baseStart) || !Number.isFinite(baseEnd)) {
+    return null;
+  }
+  const nearestIndex = findNearestCueIndexByStart(jaCues, baseStart);
+  if (nearestIndex < 0) {
+    return null;
+  }
+  let best = null;
+  for (let idx = Math.max(0, nearestIndex - 1); idx <= Math.min(jaCues.length - 1, nearestIndex + 1); idx += 1) {
+    const cue = jaCues[idx];
+    const cueStart = Number(cue?.start_ms);
+    const cueEnd = Number(cue?.end_ms);
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd)) {
+      continue;
+    }
+    const overlapMs = Math.max(0, Math.min(baseEnd, cueEnd) - Math.max(baseStart, cueStart));
+    const startDistanceMs = Math.abs(cueStart - baseStart);
+    const score = overlapMs > 0
+      ? (100000 + overlapMs)
+      : (-startDistanceMs);
+    if (!best || score > best.score) {
+      best = {
+        cue,
+        score,
+        overlapMs,
+        startDistanceMs,
+      };
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  if (best.overlapMs <= 0 && best.startDistanceMs > SUBTITLE_PANEL_JA_ALIGN_THRESHOLD_MS) {
+    return null;
+  }
+  return best.cue;
+}
+
+function buildSubtitlePanelRows(primaryCues, jaCues) {
+  const rows = [];
+  if (Array.isArray(primaryCues) && primaryCues.length) {
+    for (let idx = 0; idx < primaryCues.length; idx += 1) {
+      const cue = primaryCues[idx];
+      if (!cue) {
+        continue;
+      }
+      const jaCue = findAlignedJaCue(cue, jaCues);
+      rows.push({
+        index: idx,
+        start_ms: Number(cue.start_ms) || 0,
+        end_ms: Number(cue.end_ms) || Number(cue.start_ms) || 0,
+        en_text: String(cue.text || "").trim(),
+        ja_text: jaCue ? String(jaCue.text || "").trim() : "",
+      });
+    }
+    return rows;
+  }
+  if (!Array.isArray(jaCues) || !jaCues.length) {
+    return rows;
+  }
+  for (let idx = 0; idx < jaCues.length; idx += 1) {
+    const cue = jaCues[idx];
+    rows.push({
+      index: idx,
+      start_ms: Number(cue.start_ms) || 0,
+      end_ms: Number(cue.end_ms) || Number(cue.start_ms) || 0,
+      en_text: "",
+      ja_text: String(cue?.text || "").trim(),
+    });
+  }
+  return rows;
+}
+
+function isSubtitlePanelRowBookmarked(row) {
+  if (!row) {
+    return false;
+  }
+  const rowTrackId = String(state.subtitlePanelPrimaryTrackId || state.currentTrackId || "");
+  const rowStart = Math.round(Number(row.start_ms) || 0);
+  const rowEnd = Math.round(Number(row.end_ms) || rowStart);
+  return state.bookmarks.some((bookmark) => {
+    const bookmarkStart = Math.round(Number(bookmark.start_ms) || 0);
+    const bookmarkEnd = Math.round(Number(bookmark.end_ms) || bookmarkStart);
+    const bookmarkTrack = String(bookmark.track || "");
+    if (rowTrackId && bookmarkTrack && rowTrackId !== bookmarkTrack) {
+      return false;
+    }
+    const startClose = Math.abs(bookmarkStart - rowStart) <= 120;
+    const endClose = Math.abs(bookmarkEnd - rowEnd) <= 160;
+    return startClose && endClose;
+  });
+}
+
+function updateSubtitlePanelBookmarkStates() {
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  const buttons = elements.subtitlePanelReel.querySelectorAll(".subtitle-panel-bookmark-btn");
+  for (const button of buttons) {
+    const index = Number(button.dataset.index);
+    const row = state.subtitlePanelRows[index];
+    const saved = isSubtitlePanelRowBookmarked(row);
+    button.textContent = saved ? "★ 保存済み" : "☆ 保存";
+    button.classList.toggle("saved", saved);
+  }
+}
+
+function clearSubtitlePanelProgrammaticScrollTimer() {
+  if (state.subtitlePanelProgrammaticScrollTimer !== null) {
+    window.clearTimeout(state.subtitlePanelProgrammaticScrollTimer);
+    state.subtitlePanelProgrammaticScrollTimer = null;
+  }
+}
+
+function markSubtitlePanelProgrammaticScroll() {
+  state.subtitlePanelProgrammaticScroll = true;
+  clearSubtitlePanelProgrammaticScrollTimer();
+  state.subtitlePanelProgrammaticScrollTimer = window.setTimeout(() => {
+    state.subtitlePanelProgrammaticScroll = false;
+    state.subtitlePanelProgrammaticScrollTimer = null;
+  }, SUBTITLE_PANEL_PROGRAMMATIC_SCROLL_RESET_MS);
+}
+
+function attachSubtitlePanelAutoCenter() {
+  state.subtitlePanelAutoCenter = true;
+}
+
+function detachSubtitlePanelAutoCenter() {
+  state.subtitlePanelAutoCenter = false;
+}
+
+function scrollSubtitlePanelRowIntoCenter(index, smooth = true, force = false) {
+  if (!elements.subtitlePanelReel || index < 0) {
+    return;
+  }
+  const row = elements.subtitlePanelReel.querySelector(`.subtitle-panel-row[data-index="${index}"]`);
+  if (!row) {
+    return;
+  }
+  const reelRect = elements.subtitlePanelReel.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const cardEl = elements.subtitlePanelReel.closest(".subtitle-reel-card");
+  const cardRect = cardEl ? cardEl.getBoundingClientRect() : null;
+  const rowCenterY = rowRect.top + (rowRect.height / 2);
+  let desiredCenterY = reelRect.top + (reelRect.height / 2);
+  if (cardRect) {
+    const cardCenterY = cardRect.top + (cardRect.height / 2);
+    const minCenterY = reelRect.top + Math.max(18, rowRect.height / 2);
+    const maxCenterY = reelRect.bottom - Math.max(18, rowRect.height / 2);
+    desiredCenterY = Math.max(minCenterY, Math.min(maxCenterY, cardCenterY));
+  }
+  const deltaY = rowCenterY - desiredCenterY;
+  const maxScroll = Math.max(0, elements.subtitlePanelReel.scrollHeight - elements.subtitlePanelReel.clientHeight);
+  const targetTop = Math.max(0, Math.min(maxScroll, elements.subtitlePanelReel.scrollTop + deltaY));
+  if (!force && Math.abs(elements.subtitlePanelReel.scrollTop - targetTop) < SUBTITLE_PANEL_CENTER_TOLERANCE_PX) {
+    return;
+  }
+  markSubtitlePanelProgrammaticScroll();
+  elements.subtitlePanelReel.scrollTo({
+    top: targetTop,
+    behavior: smooth ? "smooth" : "auto",
+  });
+}
+
+function renderSubtitlePanelReel() {
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  elements.subtitlePanelReel.textContent = "";
+
+  if (!state.subtitlePanelRows.length) {
+    renderSubtitlePanelLoading("表示できる字幕がありません。");
+    return;
+  }
+
+  for (let idx = 0; idx < state.subtitlePanelRows.length; idx += 1) {
+    const row = state.subtitlePanelRows[idx];
+    const rowEl = document.createElement("article");
+    rowEl.className = "subtitle-panel-row";
+    rowEl.dataset.index = String(idx);
+    if (idx === state.subtitlePanelActiveIndex) {
+      rowEl.classList.add("active");
+    }
+
+    const head = document.createElement("div");
+    head.className = "subtitle-panel-row-head";
+
+    const time = document.createElement("p");
+    time.className = "subtitle-panel-row-time";
+    time.textContent = `${formatTimeMs(row.start_ms)} - ${formatTimeMs(row.end_ms)}`;
+
+    const bookmarkBtn = document.createElement("button");
+    bookmarkBtn.type = "button";
+    bookmarkBtn.className = "subtitle-panel-bookmark-btn";
+    bookmarkBtn.dataset.index = String(idx);
+    bookmarkBtn.textContent = "☆ 保存";
+
+    head.appendChild(time);
+    head.appendChild(bookmarkBtn);
+
+    const enLine = document.createElement("p");
+    enLine.className = "subtitle-panel-line en";
+    enLine.textContent = row.en_text || "(English cue unavailable)";
+
+    const jaLine = document.createElement("p");
+    jaLine.className = "subtitle-panel-line ja";
+    if (row.ja_text) {
+      jaLine.textContent = row.ja_text;
+    } else {
+      jaLine.classList.add("missing");
+      jaLine.textContent = "（和訳なし）";
+    }
+
+    rowEl.appendChild(head);
+    rowEl.appendChild(enLine);
+    rowEl.appendChild(jaLine);
+    elements.subtitlePanelReel.appendChild(rowEl);
+  }
+  updateSubtitlePanelBookmarkStates();
+}
+
+function updateSubtitlePanelActiveFromPlayback(options = {}) {
+  const {
+    smooth = true,
+    force = false,
+  } = options;
+  if (force) {
+    attachSubtitlePanelAutoCenter();
+  }
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  if (!state.subtitlePanelRows.length || !state.subtitlePanelPrimaryCues.length) {
+    state.subtitlePanelActiveIndex = -1;
+    return;
+  }
+  const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+  let nextIndex = findActiveCueIndexInList(state.subtitlePanelPrimaryCues, currentMs);
+  if (nextIndex < 0) {
+    nextIndex = findNearestCueIndexInList(state.subtitlePanelPrimaryCues, currentMs);
+  }
+  if (!force && nextIndex === state.subtitlePanelActiveIndex) {
+    return;
+  }
+
+  if (state.subtitlePanelActiveIndex >= 0) {
+    const previous = elements.subtitlePanelReel.querySelector(
+      `.subtitle-panel-row[data-index="${state.subtitlePanelActiveIndex}"]`,
+    );
+    if (previous) {
+      previous.classList.remove("active");
+    }
+  }
+  state.subtitlePanelActiveIndex = nextIndex;
+  if (nextIndex >= 0) {
+    const next = elements.subtitlePanelReel.querySelector(`.subtitle-panel-row[data-index="${nextIndex}"]`);
+    if (next) {
+      next.classList.add("active");
+    }
+    if (state.subtitlePanelAutoCenter || force) {
+      scrollSubtitlePanelRowIntoCenter(nextIndex, smooth, force);
+    }
+  }
+}
+
+function seekToSubtitlePanelRow(index) {
+  if (!Array.isArray(state.subtitlePanelRows) || index < 0 || index >= state.subtitlePanelRows.length) {
+    return;
+  }
+  attachSubtitlePanelAutoCenter();
+  const row = state.subtitlePanelRows[index];
+  elements.videoPlayer.currentTime = Math.max(0, (Number(row.start_ms) || 0) / 1000);
+  if (state.lyricReelActive) {
+    const nearestIndex = findNearestCueIndex(Math.round(elements.videoPlayer.currentTime * 1000));
+    if (nearestIndex >= 0) {
+      setLyricReelTargetPosition(nearestIndex, true);
+    }
+  }
+  updateSubtitleFromPlayback();
+  updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
+}
+
+async function bookmarkSubtitlePanelRow(index) {
+  if (!Array.isArray(state.subtitlePanelRows) || index < 0 || index >= state.subtitlePanelRows.length) {
+    return;
+  }
+  const row = state.subtitlePanelRows[index];
+  if (!row) {
+    return;
+  }
+  if (isSubtitlePanelRowBookmarked(row)) {
+    setStatus("この字幕はすでに保存済みです。", "info");
+    return;
+  }
+  const text = row.en_text || row.ja_text || "";
+  await createBookmark(row.start_ms, row.end_ms, text, {
+    trackId: state.subtitlePanelPrimaryTrackId || state.currentTrackId,
+  });
+}
+
+async function fetchTrackCues(video, trackId) {
+  if (!video || !trackId) {
+    return [];
+  }
+  const params = new URLSearchParams({
+    source_id: video.source_id,
+    video_id: video.video_id,
+    track: trackId,
+  });
+  const payload = await apiRequest(`/api/subtitles?${params.toString()}`);
+  return Array.isArray(payload?.cues) ? payload.cues : [];
+}
+
+async function loadSubtitlePanelReel(video) {
+  const loadToken = state.subtitlePanelLoadToken + 1;
+  state.subtitlePanelLoadToken = loadToken;
+  attachSubtitlePanelAutoCenter();
+  state.subtitlePanelRows = [];
+  state.subtitlePanelPrimaryCues = [];
+  state.subtitlePanelJaCues = [];
+  state.subtitlePanelActiveIndex = -1;
+
+  if (!video) {
+    state.subtitlePanelPrimaryTrackId = null;
+    state.subtitlePanelJaTrackId = null;
+    renderSubtitlePanelLoading("動画がありません。");
+    return;
+  }
+
+  renderSubtitlePanelLoading("字幕リールを読み込み中...");
+  const tracks = resolveSubtitlePanelTrackIds(video);
+  state.subtitlePanelPrimaryTrackId = tracks.primaryTrackId;
+  state.subtitlePanelJaTrackId = tracks.jaTrackId;
+
+  const promiseCache = new Map();
+  const loadTrackById = async (trackId) => {
+    if (!trackId) {
+      return [];
+    }
+    if (trackId === state.currentTrackId) {
+      return state.cues;
+    }
+    if (promiseCache.has(trackId)) {
+      return promiseCache.get(trackId);
+    }
+    const promise = fetchTrackCues(video, trackId);
+    promiseCache.set(trackId, promise);
+    return promise;
+  };
+
+  try {
+    const [primaryCues, jaCues] = await Promise.all([
+      loadTrackById(state.subtitlePanelPrimaryTrackId),
+      loadTrackById(state.subtitlePanelJaTrackId),
+    ]);
+    if (loadToken !== state.subtitlePanelLoadToken) {
+      return;
+    }
+    const safePrimary = Array.isArray(primaryCues) ? primaryCues : [];
+    const safeJa = Array.isArray(jaCues) ? jaCues : [];
+    state.subtitlePanelPrimaryCues = safePrimary.length ? safePrimary : safeJa;
+    state.subtitlePanelJaCues = safeJa;
+    state.subtitlePanelRows = buildSubtitlePanelRows(safePrimary, safeJa);
+    renderSubtitlePanelReel();
+    updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
+  } catch (error) {
+    if (loadToken !== state.subtitlePanelLoadToken) {
+      return;
+    }
+    state.subtitlePanelRows = [];
+    state.subtitlePanelPrimaryCues = [];
+    state.subtitlePanelJaCues = [];
+    renderSubtitlePanelLoading("字幕リールの読み込みに失敗しました。");
+    setStatus(error.message, "error");
+  }
 }
 
 function clampLyricReelPosition(position) {
@@ -2013,6 +2538,7 @@ function applyLyricReelVisualPosition(position) {
   elements.videoPlayer.currentTime = cueStartMs / 1000;
   renderSubtitleOverlayText(state.cues[state.lyricReelIndex]?.text || "...");
   renderLyricReelAtPosition(clamped);
+  updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
 }
 
 function animateLyricReel(frameTs = 0) {
@@ -2185,6 +2711,7 @@ function stepSubtitleCue(step) {
   state.activeCueIndex = targetIndex;
   elements.videoPlayer.currentTime = Math.max(0, cue.start_ms / 1000);
   renderSubtitleOverlayText(cue.text || "...");
+  updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
   return true;
 }
 
@@ -2193,20 +2720,24 @@ function updateSubtitleFromPlayback() {
     return;
   }
   if (!state.cues.length) {
+    updateSubtitlePanelActiveFromPlayback({ smooth: true });
     return;
   }
   const currentMs = Math.round(elements.videoPlayer.currentTime * 1000);
   const index = findActiveCueIndex(currentMs);
   if (index === state.activeCueIndex) {
+    updateSubtitlePanelActiveFromPlayback({ smooth: true });
     return;
   }
 
   state.activeCueIndex = index;
   if (index < 0) {
     renderSubtitleOverlayText("...");
+    updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
     return;
   }
   renderSubtitleOverlayText(state.cues[index].text);
+  updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
 }
 
 function clearCountdown() {
@@ -2239,11 +2770,20 @@ function startCountdown() {
 async function loadTrackCues() {
   closeLyricReel();
   const video = currentVideo();
-  if (!video || !state.currentTrackId) {
+  if (!video) {
+    state.cues = [];
+    state.activeCueIndex = -1;
+    state.lyricReelIndex = -1;
+    clearSubtitleOverlay("動画がありません");
+    await loadSubtitlePanelReel(null);
+    return;
+  }
+  if (!state.currentTrackId) {
     state.cues = [];
     state.activeCueIndex = -1;
     state.lyricReelIndex = -1;
     clearSubtitleOverlay("字幕トラックがありません");
+    await loadSubtitlePanelReel(video);
     return;
   }
 
@@ -2260,11 +2800,13 @@ async function loadTrackCues() {
 
   if (!state.cues.length) {
     clearSubtitleOverlay("字幕が見つかりません");
+    await loadSubtitlePanelReel(video);
     return;
   }
 
   clearSubtitleOverlay(state.cues[0].text || "字幕あり");
   updateSubtitleFromPlayback();
+  await loadSubtitlePanelReel(video);
 }
 
 async function loadBookmarks() {
@@ -2272,6 +2814,7 @@ async function loadBookmarks() {
   if (!video) {
     state.bookmarks = [];
     renderBookmarkList();
+    updateSubtitlePanelBookmarkStates();
     return;
   }
 
@@ -2283,6 +2826,7 @@ async function loadBookmarks() {
   const payload = await apiRequest(`/api/bookmarks?${params.toString()}`);
   state.bookmarks = Array.isArray(payload.bookmarks) ? payload.bookmarks : [];
   renderBookmarkList();
+  updateSubtitlePanelBookmarkStates();
 }
 
 function renderBookmarkList() {
@@ -2462,6 +3006,13 @@ async function loadFeed(
     clearSubtitleOverlay("動画がありません");
     setVideoMetaFallback("動画が見つかりません", "0 / 0");
     state.bookmarks = [];
+    state.subtitlePanelRows = [];
+    state.subtitlePanelPrimaryCues = [];
+    state.subtitlePanelJaCues = [];
+    state.subtitlePanelPrimaryTrackId = null;
+    state.subtitlePanelJaTrackId = null;
+    state.subtitlePanelActiveIndex = -1;
+    renderSubtitlePanelLoading("動画がありません。");
     renderBookmarkList();
     setStatus("条件に一致する動画がありません。", "error");
     return;
@@ -2606,22 +3157,28 @@ function gatherRangeText(startMs, endMs) {
   return parts.join(" ").trim();
 }
 
-async function createBookmark(startMs, endMs, text) {
+async function createBookmark(startMs, endMs, text, options = {}) {
   const video = currentVideo();
   if (!video) {
     return;
   }
+  const trackId = Object.prototype.hasOwnProperty.call(options, "trackId")
+    ? options.trackId
+    : state.currentTrackId;
+  const noteValue = Object.prototype.hasOwnProperty.call(options, "note")
+    ? options.note
+    : (elements.bookmarkNoteInput ? elements.bookmarkNoteInput.value : "");
 
   await apiRequest("/api/bookmarks", {
     method: "POST",
     body: JSON.stringify({
       source_id: video.source_id,
       video_id: video.video_id,
-      track: state.currentTrackId,
+      track: trackId,
       start_ms: Math.round(startMs),
       end_ms: Math.round(endMs),
       text,
-      note: elements.bookmarkNoteInput.value,
+      note: noteValue,
     }),
   });
 
@@ -3016,6 +3573,55 @@ function bindEvents() {
     },
     { passive: false }
   );
+  if (elements.subtitlePanelReel) {
+    elements.subtitlePanelReel.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        detachSubtitlePanelAutoCenter();
+        elements.subtitlePanelReel.scrollTop += event.deltaY;
+        if (event.deltaX !== 0) {
+          elements.subtitlePanelReel.scrollLeft += event.deltaX;
+        }
+        resetControlsToggleFade();
+      },
+      { passive: false }
+    );
+    elements.subtitlePanelReel.addEventListener("scroll", () => {
+      if (!state.subtitlePanelProgrammaticScroll) {
+        detachSubtitlePanelAutoCenter();
+      }
+    });
+    elements.subtitlePanelReel.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) {
+        return;
+      }
+      const bookmarkButton = target.closest(".subtitle-panel-bookmark-btn");
+      if (bookmarkButton) {
+        event.preventDefault();
+        event.stopPropagation();
+        const index = Number(bookmarkButton.dataset.index);
+        if (Number.isInteger(index) && index >= 0) {
+          bookmarkSubtitlePanelRow(index).catch((error) => setStatus(error.message, "error"));
+          resetControlsToggleFade();
+        }
+        return;
+      }
+
+      const row = target.closest(".subtitle-panel-row");
+      if (!row) {
+        return;
+      }
+      const index = Number(row.dataset.index);
+      if (!Number.isInteger(index) || index < 0) {
+        return;
+      }
+      seekToSubtitlePanelRow(index);
+      resetControlsToggleFade();
+    });
+  }
 
   elements.jumpOpenBtn.addEventListener("click", () => openJumpModal());
   elements.jumpCloseBtn.addEventListener("click", () => closeJumpModal());

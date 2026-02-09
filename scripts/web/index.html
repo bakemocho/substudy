@@ -82,22 +82,27 @@
         </section>
 
         <section class="study-column" aria-label="Learning Tools">
-          <article class="card">
-            <h3>字幕ブックマーク</h3>
+          <article class="card subtitle-reel-card">
+            <h3>字幕リール</h3>
             <label class="field">
-              <span>字幕トラック</span>
+              <span>再生字幕トラック</span>
               <select id="trackSelect"></select>
             </label>
-            <div class="inline-actions">
-              <button id="bookmarkCueBtn" type="button">現在字幕を保存 (B)</button>
-              <button id="rangeStartBtn" type="button">範囲開始 (R)</button>
-              <button id="bookmarkRangeBtn" type="button">範囲保存 (T)</button>
-            </div>
-            <label class="field">
-              <span>ブックマークメモ</span>
-              <input id="bookmarkNoteInput" type="text" placeholder="メモを追加 (任意)" />
-            </label>
-            <p id="rangeStatus" class="hint">範囲ブックマークは未開始です。</p>
+            <p class="hint">行クリックでシーク、右上ボタンでその字幕を保存。</p>
+            <div id="subtitlePanelReel" class="subtitle-panel-reel" aria-live="polite"></div>
+            <details class="bookmark-inline-tools">
+              <summary>手動ブックマーク操作</summary>
+              <div class="inline-actions">
+                <button id="bookmarkCueBtn" type="button">現在字幕を保存 (B)</button>
+                <button id="rangeStartBtn" type="button">範囲開始 (R)</button>
+                <button id="bookmarkRangeBtn" type="button">範囲保存 (T)</button>
+              </div>
+              <label class="field">
+                <span>ブックマークメモ</span>
+                <input id="bookmarkNoteInput" type="text" placeholder="メモを追加 (任意)" />
+              </label>
+              <p id="rangeStatus" class="hint">範囲ブックマークは未開始です。</p>
+            </details>
           </article>
 
           <article class="card">
