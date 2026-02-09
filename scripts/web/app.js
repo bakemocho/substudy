@@ -1,5 +1,7 @@
 const SEEK_SECONDS = 5;
 const CONTROL_TOGGLE_IDLE_MS = 2600;
+const LYRIC_WHEEL_STEP_DELTA = 52;
+const LYRIC_WHEEL_IDLE_RESET_MS = 260;
 
 const state = {
   videos: [],
@@ -9,6 +11,10 @@ const state = {
   shuffleQueue: [],
   playbackHistory: [],
   historyPointer: -1,
+  lyricReelActive: false,
+  lyricReelIndex: -1,
+  lyricWheelAccumulator: 0,
+  lyricWheelResetTimer: null,
   cues: [],
   activeCueIndex: -1,
   currentTrackId: null,
@@ -34,6 +40,8 @@ const elements = {
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
+  lyricReelOverlay: document.getElementById("lyricReelOverlay"),
+  lyricReelList: document.getElementById("lyricReelList"),
   countdownPanel: document.getElementById("countdownPanel"),
   countdownValue: document.getElementById("countdownValue"),
   cancelCountdownBtn: document.getElementById("cancelCountdownBtn"),
@@ -551,6 +559,7 @@ function openJumpModal() {
     setStatus("ジャンプ対象の動画がありません。", "error");
     return;
   }
+  closeLyricReel();
   elements.jumpModal.classList.remove("hidden");
   elements.jumpModal.setAttribute("aria-hidden", "false");
   refreshJumpResults();
@@ -652,6 +661,118 @@ function findActiveCueIndex(timeMs) {
   return -1;
 }
 
+function findNearestCueIndex(timeMs) {
+  if (!state.cues.length) {
+    return -1;
+  }
+  let nearest = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (let idx = 0; idx < state.cues.length; idx += 1) {
+    const cue = state.cues[idx];
+    const distance = Math.abs(timeMs - cue.start_ms);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = idx;
+    }
+  }
+  return nearest;
+}
+
+function renderLyricReel() {
+  elements.lyricReelList.textContent = "";
+  if (!state.cues.length || state.lyricReelIndex < 0) {
+    return;
+  }
+
+  const start = Math.max(0, state.lyricReelIndex - 4);
+  const end = Math.min(state.cues.length, state.lyricReelIndex + 5);
+  for (let idx = start; idx < end; idx += 1) {
+    const cue = state.cues[idx];
+    const line = document.createElement("p");
+    line.className = "lyric-reel-line";
+    if (idx === state.lyricReelIndex) {
+      line.classList.add("active");
+    } else if (Math.abs(idx - state.lyricReelIndex) >= 3) {
+      line.dataset.distance = "far";
+    }
+    line.textContent = cue.text || "...";
+    elements.lyricReelList.appendChild(line);
+  }
+}
+
+function clearLyricWheelResetTimer() {
+  if (state.lyricWheelResetTimer !== null) {
+    window.clearTimeout(state.lyricWheelResetTimer);
+    state.lyricWheelResetTimer = null;
+  }
+}
+
+function resetLyricWheelAccumulator() {
+  clearLyricWheelResetTimer();
+  state.lyricWheelAccumulator = 0;
+}
+
+function scheduleLyricWheelAccumulatorReset() {
+  clearLyricWheelResetTimer();
+  state.lyricWheelResetTimer = window.setTimeout(() => {
+    state.lyricWheelAccumulator = 0;
+    state.lyricWheelResetTimer = null;
+  }, LYRIC_WHEEL_IDLE_RESET_MS);
+}
+
+function closeLyricReel() {
+  if (!state.lyricReelActive) {
+    return;
+  }
+  resetLyricWheelAccumulator();
+  state.lyricReelActive = false;
+  elements.phoneShell.classList.remove("lyric-reel-active");
+  elements.lyricReelOverlay.classList.add("hidden");
+  elements.lyricReelOverlay.setAttribute("aria-hidden", "true");
+}
+
+function seekLyricReelToIndex(index) {
+  if (!state.cues.length) {
+    return;
+  }
+  const nextIndex = Math.max(0, Math.min(state.cues.length - 1, index));
+  const cue = state.cues[nextIndex];
+  state.lyricReelIndex = nextIndex;
+  state.activeCueIndex = nextIndex;
+  elements.videoPlayer.currentTime = cue.start_ms / 1000;
+  elements.subtitleOverlay.textContent = cue.text || "...";
+  renderLyricReel();
+}
+
+function openLyricReel() {
+  if (!state.cues.length) {
+    return false;
+  }
+  const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+  const activeIndex = findActiveCueIndex(currentMs);
+  const initialIndex = activeIndex >= 0 ? activeIndex : findNearestCueIndex(currentMs);
+
+  state.lyricReelActive = true;
+  resetLyricWheelAccumulator();
+  elements.videoPlayer.pause();
+  elements.phoneShell.classList.add("lyric-reel-active");
+  elements.lyricReelOverlay.classList.remove("hidden");
+  elements.lyricReelOverlay.setAttribute("aria-hidden", "false");
+  seekLyricReelToIndex(initialIndex >= 0 ? initialIndex : 0);
+  return true;
+}
+
+function stepLyricReel(step) {
+  if (!state.lyricReelActive) {
+    if (!openLyricReel()) {
+      return false;
+    }
+  }
+  const nextIndex = state.lyricReelIndex + step;
+  seekLyricReelToIndex(nextIndex);
+  return true;
+}
+
 function updateSubtitleFromPlayback() {
   if (!state.cues.length) {
     return;
@@ -697,10 +818,12 @@ function startCountdown() {
 }
 
 async function loadTrackCues() {
+  closeLyricReel();
   const video = currentVideo();
   if (!video || !state.currentTrackId) {
     state.cues = [];
     state.activeCueIndex = -1;
+    state.lyricReelIndex = -1;
     clearSubtitleOverlay("字幕トラックがありません");
     return;
   }
@@ -714,6 +837,7 @@ async function loadTrackCues() {
   const payload = await apiRequest(`/api/subtitles?${params.toString()}`);
   state.cues = Array.isArray(payload.cues) ? payload.cues : [];
   state.activeCueIndex = -1;
+  state.lyricReelIndex = -1;
 
   if (!state.cues.length) {
     clearSubtitleOverlay("字幕が見つかりません");
@@ -823,6 +947,7 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   }
 
   clearCountdown();
+  closeLyricReel();
   state.index = Math.max(0, Math.min(index, state.videos.length - 1));
   if (historyMode === "push") {
     pushHistory(state.index);
@@ -856,6 +981,7 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
 
 async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "") {
   closeJumpModal();
+  closeLyricReel();
   const params = new URLSearchParams({ limit: "900", offset: "0" });
   if (sourceId) {
     params.set("source_id", sourceId);
@@ -880,6 +1006,7 @@ async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "
     state.playbackHistory = [];
     state.historyPointer = -1;
     state.shuffleQueue = [];
+    state.lyricReelIndex = -1;
     clearSubtitleOverlay("動画がありません");
     setVideoMetaFallback("動画が見つかりません", "0 / 0");
     state.bookmarks = [];
@@ -1096,6 +1223,13 @@ function seekBySeconds(deltaSeconds) {
     next = Math.max(0, next);
   }
   elements.videoPlayer.currentTime = next;
+  if (state.lyricReelActive && state.cues.length) {
+    const nearestIndex = findNearestCueIndex(Math.round(next * 1000));
+    if (nearestIndex >= 0) {
+      state.lyricReelIndex = nearestIndex;
+      renderLyricReel();
+    }
+  }
   updateSubtitleFromPlayback();
 }
 
@@ -1117,21 +1251,49 @@ function toggleShuffleMode() {
 }
 
 function handleWheel(event) {
+  const canUseLyricReel = state.lyricReelActive || state.cues.length > 0;
+  if (canUseLyricReel) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!state.lyricReelActive) {
+      const opened = openLyricReel();
+      if (!opened) {
+        return;
+      }
+    }
+    state.lyricWheelAccumulator += event.deltaY;
+    scheduleLyricWheelAccumulatorReset();
+
+    const steps = Math.floor(Math.abs(state.lyricWheelAccumulator) / LYRIC_WHEEL_STEP_DELTA);
+    if (steps <= 0) {
+      return;
+    }
+    const direction = state.lyricWheelAccumulator > 0 ? 1 : -1;
+    for (let idx = 0; idx < steps; idx += 1) {
+      seekLyricReelToIndex(state.lyricReelIndex + direction);
+    }
+    state.lyricWheelAccumulator -= direction * steps * LYRIC_WHEEL_STEP_DELTA;
+    return;
+  }
+
   const now = Date.now();
   if (now < state.wheelLockUntil) {
+    event.preventDefault();
     return;
   }
 
-  if (Math.abs(event.deltaY) < 36) {
+  if (Math.abs(event.deltaY) < 18) {
     return;
   }
 
+  const direction = event.deltaY > 0 ? 1 : -1;
   state.wheelLockUntil = now + 420;
-  if (event.deltaY > 0) {
+  if (direction > 0) {
     nextVideo().catch((error) => setStatus(error.message, "error"));
   } else {
     prevVideo().catch((error) => setStatus(error.message, "error"));
   }
+  event.preventDefault();
 }
 
 function handleKeydown(event) {
@@ -1143,13 +1305,31 @@ function handleKeydown(event) {
     return;
   }
 
+  const key = event.key.toLowerCase();
+  if (state.lyricReelActive) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeLyricReel();
+      return;
+    }
+    if (event.key === "ArrowDown" || key === "j") {
+      event.preventDefault();
+      stepLyricReel(1);
+      return;
+    }
+    if (event.key === "ArrowUp" || key === "k") {
+      event.preventDefault();
+      stepLyricReel(-1);
+      return;
+    }
+  }
+
   const activeTag = document.activeElement ? document.activeElement.tagName : "";
   const isTyping = ["INPUT", "TEXTAREA", "SELECT"].includes(activeTag);
   if (isTyping) {
     return;
   }
 
-  const key = event.key.toLowerCase();
   if (event.key === " ") {
     event.preventDefault();
     togglePlayPause();
@@ -1298,6 +1478,7 @@ function bindEvents() {
       closeJumpModal();
     }
   });
+  elements.lyricReelOverlay.addEventListener("click", () => closeLyricReel());
 
   elements.sourceSelect.addEventListener("change", () => {
     loadFeed(elements.sourceSelect.value).catch((error) => {
@@ -1396,7 +1577,10 @@ function bindEvents() {
   });
 
   elements.videoPlayer.addEventListener("timeupdate", () => updateSubtitleFromPlayback());
-  elements.videoPlayer.addEventListener("play", () => updatePlayPauseButton());
+  elements.videoPlayer.addEventListener("play", () => {
+    closeLyricReel();
+    updatePlayPauseButton();
+  });
   elements.videoPlayer.addEventListener("pause", () => updatePlayPauseButton());
   elements.videoPlayer.addEventListener("volumechange", () => {
     localStorage.setItem("substudy.volume", String(elements.videoPlayer.volume || 0));
@@ -1415,7 +1599,7 @@ function bindEvents() {
     startCountdown();
   });
 
-  elements.phoneShell.addEventListener("wheel", handleWheel, { passive: true });
+  elements.phoneShell.addEventListener("wheel", handleWheel, { passive: false });
   elements.phoneShell.addEventListener("pointermove", resetControlsToggleFade, { passive: true });
   if (elements.playerActions) {
     elements.playerActions.addEventListener("pointermove", resetControlsToggleFade, { passive: true });
@@ -1442,7 +1626,7 @@ async function initialize() {
       false,
       initialSelection.videoId
     );
-    setStatus("準備完了。上下移動・左右5秒シーク・Gジャンプが使えます。", "ok");
+    setStatus("準備完了。動画上スクロールで時間同期歌詞リール、Gでジャンプできます。", "ok");
   } catch (error) {
     setStatus(error.message, "error");
   }
