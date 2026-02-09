@@ -2806,6 +2806,7 @@ def run_loudness(
                     )
                     source_missing += 1
                     print(f"[loudness] {source.id}/{video_id}: media file missing")
+                    connection.commit()
                     continue
 
                 input_lufs, error = analyze_media_loudness(
@@ -2831,6 +2832,7 @@ def run_loudness(
                         f"[loudness] {source.id}/{video_id}: failed "
                         f"({error or 'unknown error'})"
                     )
+                    connection.commit()
                     continue
 
                 raw_gain_db = target_lufs - input_lufs
@@ -2859,8 +2861,8 @@ def run_loudness(
                     f"LUFS={input_lufs:.2f} gain={clipped_gain_db:+.2f}dB "
                     f"({index}/{len(rows)})"
                 )
+                connection.commit()
 
-            connection.commit()
             total_candidates += len(rows)
             total_success += source_success
             total_failed += source_failed
@@ -4718,17 +4720,25 @@ def main() -> int:
         return 0
 
     if args.command == "loudness":
-        run_loudness(
-            sources=sources,
-            db_path=ledger_db_path,
-            target_lufs=float(args.target_lufs),
-            max_boost_db=max(0.0, float(args.max_boost_db)),
-            max_cut_db=max(0.0, float(args.max_cut_db)),
-            limit=max(1, int(args.limit)),
-            force=bool(args.force),
-            ffmpeg_bin=str(args.ffmpeg_bin),
-        )
-        return 0
+        try:
+            run_loudness(
+                sources=sources,
+                db_path=ledger_db_path,
+                target_lufs=float(args.target_lufs),
+                max_boost_db=max(0.0, float(args.max_boost_db)),
+                max_cut_db=max(0.0, float(args.max_cut_db)),
+                limit=max(1, int(args.limit)),
+                force=bool(args.force),
+                ffmpeg_bin=str(args.ffmpeg_bin),
+            )
+            return 0
+        except KeyboardInterrupt:
+            print(
+                "[loudness] interrupted by user. "
+                "Processed rows are already committed.",
+                file=sys.stderr,
+            )
+            return 130
 
     if args.command == "dict-index":
         dictionary_path = resolve_output_path(
