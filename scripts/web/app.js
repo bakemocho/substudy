@@ -1040,7 +1040,7 @@ async function lookupDictionary(term) {
   return payload;
 }
 
-async function lookupDictionaryBatch(terms, limit = DICT_CONTEXT_PER_TERM_LIMIT, exactOnly = false) {
+async function lookupDictionaryBatch(terms, limit = DICT_CONTEXT_PER_TERM_LIMIT, exactOnly = false, ftsMode = "all") {
   if (state.dictBatchApiAvailable === false) {
     throw new Error("Dictionary batch API is unavailable");
   }
@@ -1066,6 +1066,9 @@ async function lookupDictionaryBatch(terms, limit = DICT_CONTEXT_PER_TERM_LIMIT,
   params.set("limit", String(Math.max(1, Math.min(20, Number(limit) || DICT_CONTEXT_PER_TERM_LIMIT))));
   if (exactOnly) {
     params.set("exact_only", "1");
+  }
+  if (ftsMode && ftsMode !== "all") {
+    params.set("fts_mode", String(ftsMode));
   }
 
   let payload;
@@ -1218,6 +1221,28 @@ function buildDictionaryLookupTerms(wordEl, baseTerm) {
     }
   };
 
+  const addCoreHeadPhraseVariants = () => {
+    if (!coreTerms.length) {
+      return;
+    }
+    const primaryCore = coreTerms[0];
+    const alternateHeads = coreTerms.slice(1).filter(Boolean);
+    if (!primaryCore || !alternateHeads.length) {
+      return;
+    }
+    const snapshot = [...terms];
+    for (const term of snapshot) {
+      const tokens = splitNormalizedWords(term);
+      if (tokens.length < 2 || tokens[0] !== primaryCore) {
+        continue;
+      }
+      const tail = tokens.slice(1).join(" ");
+      for (const altHead of alternateHeads) {
+        addTerm(`${altHead} ${tail}`);
+      }
+    }
+  };
+
   if (index >= 0 && words.length > 0) {
     addRange(index, index + 1);
     addRange(index, index + 2);
@@ -1225,6 +1250,7 @@ function buildDictionaryLookupTerms(wordEl, baseTerm) {
     addCollapsedForwardPhrasalCandidate();
     addCollapsedBackwardPhrasalCandidate();
   }
+  addCoreHeadPhraseVariants();
 
   for (const coreTerm of coreTerms) {
     addTerm(coreTerm);
@@ -1372,7 +1398,7 @@ async function lookupDictionaryWithContext(wordEl, baseTerm) {
       }
       if (broadTerms.length) {
         tasks.push(
-          lookupDictionaryBatch(broadTerms, DICT_CONTEXT_PER_TERM_LIMIT, false).then((items) => {
+          lookupDictionaryBatch(broadTerms, DICT_CONTEXT_PER_TERM_LIMIT, false, "term").then((items) => {
             for (const item of items) {
               const key = normalizeDictionaryTerm(item?.term || item?.normalized || "");
               if (!key || mapped.has(key)) {
@@ -1426,6 +1452,14 @@ async function lookupDictionaryWithContext(wordEl, baseTerm) {
         context.contextWordSet,
         coreTermSet,
       );
+      const lookupTokens = splitNormalizedWords(scored.lookupNormalized);
+      if (!scored.isCoreLookup && lookupTokens.length >= 3) {
+        const rowTokens = splitNormalizedWords(scored.rowTermNormalized);
+        const hasDirectTokenOverlap = rowTokens.some((token) => lookupTokens.includes(token));
+        if (!hasDirectTokenOverlap) {
+          continue;
+        }
+      }
       if (
         scored.isCoreLookup
         && !scored.isCoreEntry

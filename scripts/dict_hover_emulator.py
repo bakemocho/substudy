@@ -141,6 +141,19 @@ def build_lookup_terms(words: list[str], hover_index: int, base_term: str) -> tu
                 add_term(f"{candidate_head} {tail}")
                 break
 
+    if core_terms:
+        primary_core = core_terms[0]
+        alternate_heads = [term for term in core_terms[1:] if term]
+        if primary_core and alternate_heads:
+            snapshot = list(terms)
+            for term in snapshot:
+                tokens = split_normalized_words(term)
+                if len(tokens) < 2 or tokens[0] != primary_core:
+                    continue
+                tail_words = " ".join(tokens[1:])
+                for alt_head in alternate_heads:
+                    add_term(f"{alt_head} {tail_words}")
+
     for core_term in core_terms:
         add_term(core_term)
 
@@ -247,12 +260,15 @@ def emulate(connection: sqlite3.Connection, sentence: str, hover_word: str, hove
 
     payload_by_term: dict[str, dict[str, Any]] = {}
     for term in lookup_terms:
-        exact_only = len(split_normalized_words(term)) < 3 and term != base_normalized
+        term_tokens = split_normalized_words(term)
+        exact_only = len(term_tokens) < 3 and term != base_normalized
+        fts_mode = "term" if (len(term_tokens) >= 3 and term != base_normalized) else "all"
         payload_by_term[term] = lookup_dictionary_entries(
             connection,
             term,
             limit=DICT_CONTEXT_PER_TERM_LIMIT,
             exact_only=exact_only,
+            fts_mode=fts_mode,
         )
 
     candidates: list[Candidate] = []
@@ -267,6 +283,12 @@ def emulate(connection: sqlite3.Connection, sentence: str, hover_word: str, hove
                 continue
             seen_keys.add(key)
             scored = score_candidate(row, lookup_term, context_word_set, core_term_set)
+            lookup_tokens = split_normalized_words(scored["lookup_normalized"])
+            if (not scored["is_core_lookup"]) and len(lookup_tokens) >= 3:
+                row_tokens = split_normalized_words(scored["row_term_normalized"])
+                has_direct_overlap = any(token in lookup_tokens for token in row_tokens)
+                if not has_direct_overlap:
+                    continue
             if (
                 scored["is_core_lookup"]
                 and (not scored["is_core_entry"])

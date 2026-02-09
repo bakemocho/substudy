@@ -1343,6 +1343,7 @@ def lookup_dictionary_entries(
     term: str,
     limit: int = DEFAULT_DICT_LOOKUP_LIMIT,
     exact_only: bool = False,
+    fts_mode: str = "all",
 ) -> dict[str, Any]:
     def read_field(
         row: sqlite3.Row | tuple[Any, ...],
@@ -1362,6 +1363,9 @@ def lookup_dictionary_entries(
         }
 
     safe_limit = max(1, min(20, int(limit)))
+    safe_fts_mode = str(fts_mode or "all").strip().lower()
+    if safe_fts_mode not in {"all", "term", "off"}:
+        safe_fts_mode = "all"
     variants = dictionary_lookup_variants(normalized)
     if not variants:
         return {
@@ -1431,7 +1435,7 @@ def lookup_dictionary_entries(
             if len(selected_rows) >= safe_limit:
                 break
 
-    if len(selected_rows) < safe_limit:
+    if len(selected_rows) < safe_limit and safe_fts_mode != "off":
         fts_table_exists = connection.execute(
             """
             SELECT 1
@@ -1445,21 +1449,39 @@ def lookup_dictionary_entries(
             remaining = safe_limit - len(selected_rows)
             safe_fts_term = normalized.replace('"', ' ').strip()
             if safe_fts_term:
-                try:
-                    fts_rows = connection.execute(
-                        """
-                        SELECT de.id, de.source_name, de.term, de.term_norm, de.definition
-                        FROM dict_entries_fts fts
-                        JOIN dict_entries de
-                          ON de.id = fts.rowid
-                        WHERE fts.dict_entries_fts MATCH ?
-                        ORDER BY LENGTH(de.term_norm) ASC, de.id ASC
-                        LIMIT ?
-                        """,
-                        (safe_fts_term, remaining * 4),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    fts_rows = []
+                fts_match_expr = safe_fts_term
+                if safe_fts_mode == "term":
+                    term_tokens = [token for token in safe_fts_term.split() if token]
+                    column_terms: list[str] = []
+                    for token in term_tokens:
+                        cleaned_token = re.sub(r"[^a-z0-9-]+", "", token)
+                        if not cleaned_token:
+                            continue
+                        column_terms.append(
+                            f"(term_norm:{cleaned_token} OR term:{cleaned_token})"
+                        )
+                    if not column_terms:
+                        fts_match_expr = ""
+                    else:
+                        fts_match_expr = " ".join(column_terms)
+                if not fts_match_expr:
+                    fts_rows: list[sqlite3.Row | tuple[Any, ...]] = []
+                else:
+                    try:
+                        fts_rows = connection.execute(
+                            """
+                            SELECT de.id, de.source_name, de.term, de.term_norm, de.definition
+                            FROM dict_entries_fts fts
+                            JOIN dict_entries de
+                              ON de.id = fts.rowid
+                            WHERE fts.dict_entries_fts MATCH ?
+                            ORDER BY LENGTH(de.term_norm) ASC, de.id ASC
+                            LIMIT ?
+                            """,
+                            (fts_match_expr, remaining * 4),
+                        ).fetchall()
+                    except sqlite3.OperationalError:
+                        fts_rows = []
                 for row in fts_rows:
                     row_id = int(read_field(row, 0, "id"))
                     if row_id in seen_ids:
@@ -3770,6 +3792,7 @@ def build_web_handler(
                 maximum=20,
             )
             exact_only = parse_bool_flag(query.get("exact_only", [None])[0], default=False)
+            fts_mode = str(query.get("fts_mode", ["all"])[0] or "all")
 
             with self._open_connection() as connection:
                 payload = lookup_dictionary_entries(
@@ -3777,6 +3800,7 @@ def build_web_handler(
                     term,
                     limit=limit,
                     exact_only=exact_only,
+                    fts_mode=fts_mode,
                 )
             self._send_json(payload)
 
@@ -3808,6 +3832,7 @@ def build_web_handler(
                 maximum=20,
             )
             exact_only = parse_bool_flag(query.get("exact_only", [None])[0], default=False)
+            fts_mode = str(query.get("fts_mode", ["all"])[0] or "all")
 
             items: list[dict[str, Any]] = []
             with self._open_connection() as connection:
@@ -3818,6 +3843,7 @@ def build_web_handler(
                             term,
                             limit=limit,
                             exact_only=exact_only,
+                            fts_mode=fts_mode,
                         )
                     )
             self._send_json({"items": items})
