@@ -178,6 +178,53 @@ Check jobs:
 launchctl list | rg substudy
 ```
 
+## Roadmap: Dictionary + NLP + Translation (planned)
+
+Planned next steps for grammar-aware subtitle study UX.
+
+### 0) EIJIRO dictionary ingestion
+
+- Target source: `/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
+- Encoding note (verified): strict decode with `cp932` (`windows-31j`) succeeds for the full file.
+- `shift_jis` fails on vendor extension bytes (example: `0xFB..`), so ingestion should not assume strict Shift_JIS.
+- To improve usability, keep a normalized UTF-8 artifact in this project (or SQLite-only import) and treat the original as source-of-truth input.
+- Build a one-time dictionary index pipeline (planned command: `substudy.py dict-index`):
+  - Parse line-oriented entries from EIJIRO.
+  - Normalize keys (lowercase, lemma-like form, punctuation cleanup).
+  - Save to SQLite (`dict_entries` + `dict_entries_fts` for fast lookup).
+  - Optionally export UTF-8 TSV/JSONL for editor-friendly inspection.
+
+### 1) Subtitle NLP cache (token/POS/dependency)
+
+- Reuse structure ideas from:
+  - `/Users/bakemocho/gitwork_bk/vseg/avseg/inorder_dependency.py`
+  - `/Users/bakemocho/gitwork_bk/vseg/avseg/chunkify_segments.py`
+- English parsing target: spaCy `en_core_web_sm` (token, lemma, POS, dependency head).
+- Persist per-cue analysis in SQLite cache (planned table: `subtitle_nlp_cache`):
+  - `source_id`, `video_id`, `track`, `start_ms`, `end_ms`, `text_hash`
+  - `tokens_json`, `deps_json`, `importance_json`, `analyzed_at`
+
+### 2) Study UI enhancements
+
+- POS-based color coding for subtitle tokens.
+- Importance-based emphasis (frequency/learning priority).
+- Dependency arrows rendered above subtitle text (graphical syntax guidance).
+- Token click/hover opens dictionary panel with EIJIRO candidates.
+
+### 3) LLM translation track (EN -> JA)
+
+- Add optional translated subtitle track in addition to original English.
+- Cache translation results in SQLite (planned table: `subtitle_translations`):
+  - key: cue identity + `text_hash` + model/version
+  - value: translated text, metadata, timestamps
+- UI toggle between original and translated subtitle track.
+
+### 4) Automation rollout
+
+- Daily/weekly jobs already run `sync/backfill/ledger/loudness/asr`.
+- After manual validation, optionally add `nlp` and `translate` stages as opt-in automation.
+- Keep translation stage disable-by-default until quality and token cost are measured.
+
 ## Add more creators
 
 Add another `[[sources]]` block in `config/sources.toml`.
