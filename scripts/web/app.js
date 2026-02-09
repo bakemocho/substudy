@@ -11,6 +11,13 @@ const DICT_CONTEXT_MAX_CANDIDATES = 9;
 const DICT_CONTEXT_PER_TERM_LIMIT = 4;
 const DICT_CONTEXT_TOTAL_LIMIT = 12;
 const DICT_CONTEXT_CORE_MIN_RESULTS = 2;
+const DICT_PREFETCH_LOOKUP_LIMIT = 6;
+const DICT_PREFETCH_CUE_SCAN_LIMIT = 180;
+const DICT_PREFETCH_MAX_TERMS = 220;
+const DICT_PREFETCH_HEAD_TERMS = 64;
+const DICT_PREFETCH_BATCH_SIZE = 12;
+const DICT_PREFETCH_BATCH_DELAY_MS = 32;
+const DICT_PREFETCH_START_DELAY_MS = 90;
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
@@ -94,6 +101,9 @@ const state = {
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
   dictBatchApiAvailable: null,
+  dictPrefetchToken: 0,
+  dictPrefetchedVideoKeys: new Set(),
+  dictPrefetchPendingVideoKeys: new Set(),
 };
 
 const elements = {
@@ -1096,6 +1106,202 @@ async function lookupDictionaryBatch(terms, limit = DICT_CONTEXT_PER_TERM_LIMIT,
   return items;
 }
 
+function delayAsync(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
+function collectPrefetchTermsFromCues(cues) {
+  if (!Array.isArray(cues) || !cues.length) {
+    return [];
+  }
+  const stats = new Map();
+  const cueLimit = Math.min(cues.length, DICT_PREFETCH_CUE_SCAN_LIMIT);
+  for (let cueIndex = 0; cueIndex < cueLimit; cueIndex += 1) {
+    const cue = cues[cueIndex];
+    const text = String(cue?.text || "");
+    if (!text) {
+      continue;
+    }
+    SUBTITLE_WORD_PATTERN.lastIndex = 0;
+    let match = SUBTITLE_WORD_PATTERN.exec(text);
+    while (match) {
+      const normalized = normalizeDictionaryTerm(match[0]);
+      if (normalized && normalized.length >= 2) {
+        const current = stats.get(normalized);
+        if (current) {
+          current.count += 1;
+          if (cueIndex < current.firstCueIndex) {
+            current.firstCueIndex = cueIndex;
+          }
+        } else {
+          stats.set(normalized, { count: 1, firstCueIndex: cueIndex });
+        }
+      }
+      match = SUBTITLE_WORD_PATTERN.exec(text);
+    }
+  }
+
+  const ranked = Array.from(stats.entries());
+  ranked.sort((left, right) => {
+    const leftStat = left[1];
+    const rightStat = right[1];
+    if (rightStat.count !== leftStat.count) {
+      return rightStat.count - leftStat.count;
+    }
+    if (leftStat.firstCueIndex !== rightStat.firstCueIndex) {
+      return leftStat.firstCueIndex - rightStat.firstCueIndex;
+    }
+    return left[0].localeCompare(right[0]);
+  });
+
+  return ranked.slice(0, DICT_PREFETCH_MAX_TERMS).map(([term]) => term);
+}
+
+function resolveTrackIdForDictionaryPrefetch(video) {
+  if (!video || !Array.isArray(video.tracks) || !video.tracks.length) {
+    return "";
+  }
+  if (
+    state.currentTrackId
+    && video.tracks.some((track) => String(track?.track_id || "") === state.currentTrackId)
+  ) {
+    return state.currentTrackId;
+  }
+  const defaultTrack = String(video.default_track || "");
+  if (defaultTrack) {
+    return defaultTrack;
+  }
+  return String(video.tracks[0]?.track_id || "");
+}
+
+async function prefetchDictionaryTerms(terms, tokenSnapshot) {
+  if (!Array.isArray(terms) || !terms.length) {
+    return;
+  }
+  const queue = [];
+  const seen = new Set();
+  for (const rawTerm of terms) {
+    const normalized = normalizeDictionaryTerm(rawTerm);
+    if (!normalized || seen.has(normalized) || state.dictLookupCache.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    queue.push(normalized);
+    if (queue.length >= DICT_PREFETCH_MAX_TERMS) {
+      break;
+    }
+  }
+  if (!queue.length) {
+    return;
+  }
+
+  const prioritized = [
+    ...queue.slice(0, DICT_PREFETCH_HEAD_TERMS),
+    ...queue.slice(DICT_PREFETCH_HEAD_TERMS),
+  ];
+
+  for (let index = 0; index < prioritized.length; index += DICT_PREFETCH_BATCH_SIZE) {
+    if (tokenSnapshot !== state.dictPrefetchToken) {
+      return;
+    }
+    const batch = prioritized.slice(index, index + DICT_PREFETCH_BATCH_SIZE);
+    if (!batch.length) {
+      continue;
+    }
+    try {
+      await lookupDictionaryBatch(batch, DICT_PREFETCH_LOOKUP_LIMIT, false);
+    } catch (_batchError) {
+      for (const term of batch) {
+        if (tokenSnapshot !== state.dictPrefetchToken) {
+          return;
+        }
+        try {
+          await lookupDictionary(term);
+        } catch (_singleError) {
+          // Ignore prefetch errors; hover lookup retries on demand.
+        }
+      }
+    }
+    if (index + DICT_PREFETCH_BATCH_SIZE < prioritized.length) {
+      await delayAsync(DICT_PREFETCH_BATCH_DELAY_MS);
+    }
+  }
+}
+
+async function prefetchDictionaryForVideo(video, tokenSnapshot, delayMs = 0) {
+  if (!video) {
+    return;
+  }
+  const trackId = resolveTrackIdForDictionaryPrefetch(video);
+  if (!trackId) {
+    return;
+  }
+  const videoKey = `${video.source_id}/${video.video_id}/${trackId}`;
+  if (state.dictPrefetchedVideoKeys.has(videoKey) || state.dictPrefetchPendingVideoKeys.has(videoKey)) {
+    return;
+  }
+  state.dictPrefetchPendingVideoKeys.add(videoKey);
+  try {
+    if (delayMs > 0) {
+      await delayAsync(delayMs);
+      if (tokenSnapshot !== state.dictPrefetchToken) {
+        return;
+      }
+    }
+
+    const params = new URLSearchParams({
+      source_id: video.source_id,
+      video_id: video.video_id,
+      track: trackId,
+    });
+    const payload = await apiRequest(`/api/subtitles?${params.toString()}`);
+    if (tokenSnapshot !== state.dictPrefetchToken) {
+      return;
+    }
+    const cues = Array.isArray(payload?.cues) ? payload.cues : [];
+    const terms = collectPrefetchTermsFromCues(cues);
+    await prefetchDictionaryTerms(terms, tokenSnapshot);
+    if (tokenSnapshot === state.dictPrefetchToken) {
+      state.dictPrefetchedVideoKeys.add(videoKey);
+    }
+  } catch (_error) {
+    // Ignore prefetch failures; interactive lookup remains source of truth.
+  } finally {
+    state.dictPrefetchPendingVideoKeys.delete(videoKey);
+  }
+}
+
+function peekUpcomingVideoForPrefetch() {
+  if (!state.videos.length) {
+    return null;
+  }
+  if (state.shuffleMode) {
+    if (state.historyPointer < state.playbackHistory.length - 1) {
+      const historyIndex = state.playbackHistory[state.historyPointer + 1];
+      return state.videos[historyIndex] || null;
+    }
+    if (state.shuffleQueue.length) {
+      return state.videos[state.shuffleQueue[0]] || null;
+    }
+    return null;
+  }
+  if (state.index >= state.videos.length - 1) {
+    return null;
+  }
+  return state.videos[state.index + 1] || null;
+}
+
+function startCountdownPrefetch() {
+  const upcomingVideo = peekUpcomingVideoForPrefetch();
+  if (!upcomingVideo) {
+    return;
+  }
+  const tokenSnapshot = state.dictPrefetchToken;
+  prefetchDictionaryForVideo(upcomingVideo, tokenSnapshot, DICT_PREFETCH_START_DELAY_MS).catch(() => {});
+}
+
 function splitNormalizedWords(value) {
   const normalized = normalizeDictionaryTerm(value);
   if (!normalized) {
@@ -1962,6 +2168,7 @@ function clearCountdown() {
 
 function startCountdown() {
   clearCountdown();
+  startCountdownPrefetch();
   state.countdownRemaining = 3;
   elements.countdownValue.textContent = String(state.countdownRemaining);
   elements.countdownPanel.classList.remove("hidden");
@@ -2143,6 +2350,9 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
 async function loadFeed(sourceId = "", startRandom = false, preferredVideoId = "") {
   closeJumpModal();
   closeLyricReel();
+  state.dictPrefetchToken += 1;
+  state.dictPrefetchedVideoKeys.clear();
+  state.dictPrefetchPendingVideoKeys.clear();
   const params = new URLSearchParams({ limit: "900", offset: "0" });
   if (sourceId) {
     params.set("source_id", sourceId);
