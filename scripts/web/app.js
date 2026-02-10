@@ -8,6 +8,7 @@ const LYRIC_REEL_INERTIA_MIN = 0.0007;
 const SUBTITLE_PANEL_JA_ALIGN_THRESHOLD_MS = 1400;
 const SUBTITLE_PANEL_CENTER_TOLERANCE_PX = 34;
 const SUBTITLE_PANEL_PROGRAMMATIC_SCROLL_RESET_MS = 720;
+const SUBTITLE_PANEL_AUTO_CENTER_RESTORE_IDLE_MS = 2600;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
 const DICT_HOVER_LOOP_MIN_MS = 900;
 const DICT_CONTEXT_MAX_CANDIDATES = 9;
@@ -96,6 +97,7 @@ const state = {
   subtitlePanelAutoCenter: true,
   subtitlePanelProgrammaticScroll: false,
   subtitlePanelProgrammaticScrollTimer: null,
+  subtitlePanelAutoCenterRestoreTimer: null,
   subtitlePanelMode: (() => {
     const stored = String(localStorage.getItem("substudy.subtitle_panel_mode") || "").trim().toLowerCase();
     if (SUBTITLE_PANEL_MODES.has(stored)) {
@@ -186,6 +188,7 @@ const elements = {
   playerActions: document.querySelector(".player-actions"),
   subtitlePanelModeEnOnlyBtn: document.getElementById("subtitlePanelModeEnOnlyBtn"),
   subtitlePanelModeEnJaBtn: document.getElementById("subtitlePanelModeEnJaBtn"),
+  subtitleReelCard: document.querySelector(".subtitle-reel-card"),
   subtitlePanelReel: document.getElementById("subtitlePanelReel"),
   trackSelect: document.getElementById("trackSelect"),
   bookmarkCueBtn: document.getElementById("bookmarkCueBtn"),
@@ -2638,6 +2641,32 @@ function clearSubtitlePanelProgrammaticScrollTimer() {
   }
 }
 
+function clearSubtitlePanelAutoCenterRestoreTimer() {
+  if (state.subtitlePanelAutoCenterRestoreTimer !== null) {
+    window.clearTimeout(state.subtitlePanelAutoCenterRestoreTimer);
+    state.subtitlePanelAutoCenterRestoreTimer = null;
+  }
+}
+
+function scheduleSubtitlePanelAutoCenterRestore() {
+  clearSubtitlePanelAutoCenterRestoreTimer();
+  state.subtitlePanelAutoCenterRestoreTimer = window.setTimeout(() => {
+    state.subtitlePanelAutoCenterRestoreTimer = null;
+    if (!state.subtitlePanelAutoCenter) {
+      attachSubtitlePanelAutoCenter();
+      updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
+    }
+  }, SUBTITLE_PANEL_AUTO_CENTER_RESTORE_IDLE_MS);
+}
+
+function restoreSubtitlePanelAutoCenterImmediately() {
+  clearSubtitlePanelAutoCenterRestoreTimer();
+  if (!state.subtitlePanelAutoCenter) {
+    attachSubtitlePanelAutoCenter();
+    updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
+  }
+}
+
 function markSubtitlePanelProgrammaticScroll() {
   state.subtitlePanelProgrammaticScroll = true;
   clearSubtitlePanelProgrammaticScrollTimer();
@@ -2648,6 +2677,7 @@ function markSubtitlePanelProgrammaticScroll() {
 }
 
 function attachSubtitlePanelAutoCenter() {
+  clearSubtitlePanelAutoCenterRestoreTimer();
   state.subtitlePanelAutoCenter = true;
 }
 
@@ -2802,11 +2832,19 @@ function updateSubtitlePanelActiveFromPlayback(options = {}) {
   }
 }
 
-function seekToSubtitlePanelRow(index) {
+function seekToSubtitlePanelRow(index, options = {}) {
+  const {
+    preserveViewport = false,
+  } = options;
   if (!Array.isArray(state.subtitlePanelRows) || index < 0 || index >= state.subtitlePanelRows.length) {
     return;
   }
-  attachSubtitlePanelAutoCenter();
+  if (preserveViewport) {
+    detachSubtitlePanelAutoCenter();
+    scheduleSubtitlePanelAutoCenterRestore();
+  } else {
+    attachSubtitlePanelAutoCenter();
+  }
   const row = state.subtitlePanelRows[index];
   elements.videoPlayer.currentTime = Math.max(0, (Number(row.start_ms) || 0) / 1000);
   if (state.lyricReelActive) {
@@ -2816,7 +2854,9 @@ function seekToSubtitlePanelRow(index) {
     }
   }
   updateSubtitleFromPlayback();
-  updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
+  if (!preserveViewport) {
+    updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
+  }
 }
 
 async function bookmarkSubtitlePanelRow(index) {
@@ -4131,6 +4171,7 @@ function bindEvents() {
         event.preventDefault();
         event.stopPropagation();
         detachSubtitlePanelAutoCenter();
+        scheduleSubtitlePanelAutoCenterRestore();
         elements.subtitlePanelReel.scrollTop += event.deltaY;
         if (event.deltaX !== 0) {
           elements.subtitlePanelReel.scrollLeft += event.deltaX;
@@ -4142,6 +4183,7 @@ function bindEvents() {
     elements.subtitlePanelReel.addEventListener("scroll", () => {
       if (!state.subtitlePanelProgrammaticScroll) {
         detachSubtitlePanelAutoCenter();
+        scheduleSubtitlePanelAutoCenterRestore();
       }
       repositionActiveDictionaryPopup();
     });
@@ -4198,8 +4240,13 @@ function bindEvents() {
       if (!Number.isInteger(index) || index < 0) {
         return;
       }
-      seekToSubtitlePanelRow(index);
+      seekToSubtitlePanelRow(index, { preserveViewport: true });
       resetControlsToggleFade();
+    });
+  }
+  if (elements.subtitleReelCard) {
+    elements.subtitleReelCard.addEventListener("pointerleave", () => {
+      restoreSubtitlePanelAutoCenterImmediately();
     });
   }
   if (elements.subtitlePanelModeEnOnlyBtn) {
