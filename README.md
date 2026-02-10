@@ -242,17 +242,35 @@ Goal: reduce visual/interaction friction during continuous study.
   - enable same hover dictionary in English words inside subtitle reel rows
   - enable same hover dictionary in English words inside saved bookmark text
   - keep existing subtitle-overlay hover behavior unchanged
+- Keep reel focus stable while using hover dictionary:
+  - when pointer is on subtitle-reel word/popup/bridge, pause reel auto-follow scroll
+  - resume auto-follow only after hover session ends
+- Place dictionary popup near hover source card:
+  - overlay words -> popup in video card (current behavior)
+  - reel words -> popup near reel card word
+  - bookmark words -> popup near bookmark card word
+  - avoid routing every popup to video card when source is outside overlay
 - Add hover bridge between word and popup:
   - fill the gap with transparent hover-hit region so pointer can travel without losing context
   - prevent accidental re-target to words behind the gap while moving to popup
   - keep popup hide timing stable (no flicker while crossing)
+- Define recursive dictionary tree interaction rules (graph-mode draft):
+  - treat first popup as `lv.1` node (source word), then nested popup lookups as `lv.2+` child nodes
+  - model is tree-only (parent -> child lookup path), no collocation/semantic edge expansion here
+  - click on a lookup term pins the node (popup stays visible even when pointer leaves)
+  - outside click or `Esc` clears the full tree and dictionary loop state
+  - when hovering a node, freeze that node position; other nodes re-layout toward stable positions
 
 Acceptance:
 
 - Timer draw direction/fill matches actual video progress for play/pause/seek.
 - Card snap feels deterministic: easy to snap, slightly resistant to unsnap.
 - Hover dictionary opens from overlay/reel/bookmark consistently.
+- While using hover dictionary in subtitle reel, active cue auto-scroll does not yank the view.
+- Popup appears adjacent to the hover source region (overlay/reel/bookmark), not always in video card.
 - Moving pointer from word to popup does not collapse/switch lookup unexpectedly.
+- Click-pin / outside-click / `Esc` rules coexist with existing hover-hide behavior.
+- In graph-mode, hovered node stays fixed while non-hovered nodes can settle around it.
 
 Status (2026-02-10):
 
@@ -262,6 +280,9 @@ Status (2026-02-10):
   - transparent hover bridge between word and popup
   - hover dictionary hooks in subtitle reel and saved bookmarks
 - Needs polish:
+  - reel hover session should temporarily freeze auto-follow scrolling
+  - popup placement should anchor to source card (reel/bookmark) instead of video-card fixed placement
+  - recursive tree graph-mode (pin + freeze + re-layout) is still design/implementation pending
   - hover dictionary behavior in non-overlay cards (subtitle reel/bookmark) still has UX tuning room
   - keep tuning hover stability/intent detection before marking this block fully done
 
@@ -351,7 +372,7 @@ Acceptance:
 - Results are not dominated by same-video adjacent cues.
 - Jump from suggestion lands on correct timestamp and updates subtitle state.
 
-### 5) Next: hover dictionary expansion (bookmark + recursive hover)
+### 5) Next: hover dictionary expansion (bookmark + recursive tree graph)
 
 Goal: make hover dictionary a reusable learning surface.
 
@@ -360,7 +381,18 @@ Goal: make hover dictionary a reusable learning surface.
   - persist in dedicated table (`dictionary_bookmarks`)
 - Add recursive hover inside dictionary popup.
   - hovering English words in definitions opens next-level popup lookup
+  - build parent->child tree nodes by actual lookup path (`lv.1`, `lv.2`, ...)
   - keep depth guard + visited-term guard to prevent infinite loop
+- Graph-mode rendering policy:
+  - tree visualization only (no collocation edges)
+  - hovered node is temporarily fixed in place
+  - non-hovered nodes can continue force-layout relaxation
+  - click-pinned node remains fixed/visible until explicit clear
+- Prerequisite alignment with Immediate block:
+  - finalize popup placement/focus policy across overlay/reel/bookmark contexts
+  - finalize reel auto-follow freeze/resume policy during dictionary hover sessions
+  - finalize click-pin / outside-click / `Esc` coexistence rules
+  - treat these as mandatory before enabling recursive graph-mode by default
 - Keep MVP storage model simple:
   - subtitle JSON migration is not required for this step
   - can be implemented with existing subtitle files + SQLite metadata
@@ -368,7 +400,10 @@ Goal: make hover dictionary a reusable learning surface.
 Acceptance:
 
 - Popup bookmark toggle is responsive and persists after reload.
-- Recursive hover works for nested terms without UI lock/conflict.
+- Popup context policy is deterministic before recursive hover is enabled globally.
+- Recursive tree graph can grow to `lv.2+` via lookup-in-lookup without UI lock/conflict.
+- Hovered node freeze + surrounding-node re-layout behavior is visually stable.
+- click-pin / outside-click / `Esc` clear behavior is deterministic.
 - Existing subtitle hover behavior remains intact.
 
 ### 6) Next: reel linguistics overlay (NLP + dependencies)
