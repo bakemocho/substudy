@@ -2101,9 +2101,13 @@ function findActiveCueIndexInList(cues, timeMs) {
   while (left <= right) {
     const mid = Math.floor((left + right) / 2);
     const cue = cues[mid];
-    if (timeMs < cue.start_ms) {
+    const cueStart = Number(cue?.start_ms) || 0;
+    const cueEndRaw = Number(cue?.end_ms);
+    const cueEnd = Number.isFinite(cueEndRaw) ? cueEndRaw : cueStart;
+    const isZeroLength = cueEnd <= cueStart;
+    if (timeMs < cueStart) {
       right = mid - 1;
-    } else if (timeMs > cue.end_ms) {
+    } else if (isZeroLength ? timeMs > cueEnd : timeMs >= cueEnd) {
       left = mid + 1;
     } else {
       return mid;
@@ -2824,8 +2828,16 @@ function stepSubtitleCue(step) {
   if (!cue) {
     return false;
   }
+  const cueStartMs = Math.max(0, Math.round(Number(cue.start_ms) || 0));
+  const cueEndMs = Math.max(cueStartMs, Math.round(Number(cue.end_ms) || cueStartMs));
+  let seekMs = cueStartMs;
+  if (cueEndMs > cueStartMs) {
+    // Avoid exact boundary seeks; they can snap back to adjacent cues on some tracks.
+    const inCueOffset = Math.min(40, Math.max(1, cueEndMs - cueStartMs - 1));
+    seekMs = cueStartMs + inCueOffset;
+  }
   state.activeCueIndex = targetIndex;
-  elements.videoPlayer.currentTime = Math.max(0, cue.start_ms / 1000);
+  elements.videoPlayer.currentTime = seekMs / 1000;
   renderSubtitleOverlayText(cue.text || "...");
   updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
   return true;
@@ -3488,8 +3500,27 @@ function handleKeydown(event) {
     }
   }
 
-  const activeTag = document.activeElement ? document.activeElement.tagName : "";
-  const isTyping = ["INPUT", "TEXTAREA", "SELECT"].includes(activeTag);
+  const activeElement = document.activeElement;
+  const activeTag = activeElement ? activeElement.tagName : "";
+  if (activeTag === "SELECT") {
+    const isTrackSelectFocused = activeElement === elements.trackSelect;
+    if (!isTrackSelectFocused) {
+      return;
+    }
+    const isTrackSelectHotkey = (
+      event.key === "ArrowDown"
+      || event.key === "ArrowUp"
+      || event.key === "ArrowLeft"
+      || event.key === "ArrowRight"
+      || key === "j"
+      || key === "k"
+    );
+    if (!isTrackSelectHotkey) {
+      return;
+    }
+    elements.trackSelect.blur();
+  }
+  const isTyping = ["INPUT", "TEXTAREA"].includes(activeTag);
   if (isTyping) {
     return;
   }
@@ -3935,6 +3966,7 @@ function bindEvents() {
 
   elements.trackSelect.addEventListener("change", () => {
     state.currentTrackId = elements.trackSelect.value || null;
+    elements.trackSelect.blur();
     loadTrackCues().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
   });
