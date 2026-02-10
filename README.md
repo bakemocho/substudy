@@ -279,9 +279,11 @@ Status (2026-02-10):
   - viewport snap + release resistance
   - transparent hover bridge between word and popup
   - hover dictionary hooks in subtitle reel and saved bookmarks
+  - reel hover session now pauses auto-follow scrolling; auto-follow restores on pointer leave or short idle
+  - popup placement now anchors to hover source context (overlay/reel/bookmark), not just video-card fixed position
+  - click on subtitle words now pins dictionary popup; outside click or `Esc` clears the popup/loop state
 - Needs polish:
-  - reel hover session should temporarily freeze auto-follow scrolling
-  - popup placement should anchor to source card (reel/bookmark) instead of video-card fixed placement
+  - pin rule is currently single-popup scope; recursive tree-level pin/clear behavior is still pending
   - recursive tree graph-mode (pin + freeze + re-layout) is still design/implementation pending
   - hover dictionary behavior in non-overlay cards (subtitle reel/bookmark) still has UX tuning room
   - keep tuning hover stability/intent detection before marking this block fully done
@@ -293,7 +295,7 @@ Status (2026-02-10):
 - Translation runbook + translation log table (`translation_runs`) in SQLite.
 - EN/JA subtitle tracks can be added by file naming (`video_id.<lang>.<ext>`) and reflected by `ledger`.
 
-### 1) Next: translated-availability filter (prerequisite for parallel cards)
+### 1) Done: translated-availability filter (prerequisite for parallel cards)
 
 Goal: enable stable study-mode feed slicing before EN/JA card expansion.
 
@@ -314,7 +316,7 @@ Acceptance:
 - `ja_only` mode never shows videos without JA track.
 - Missing JA data degrades gracefully (no crash).
 
-### 2) Next: subtitle reel in player side panel
+### 2) Done: subtitle reel in player side panel
 
 Goal: repurpose the current "字幕ブックマーク" area as a subtitle reel panel.
 
@@ -331,7 +333,7 @@ Acceptance:
 - Reel click seeks accurately.
 - Existing bookmark APIs remain usable (no data migration required).
 
-### 3) Next: EN/JA parallel subtitle mapping
+### 3) Done: EN/JA parallel subtitle mapping
 
 Goal: stable 1:1 view for bilingual cues.
 
@@ -389,9 +391,9 @@ Goal: make hover dictionary a reusable learning surface.
   - non-hovered nodes can continue force-layout relaxation
   - click-pinned node remains fixed/visible until explicit clear
 - Prerequisite alignment with Immediate block:
-  - finalize popup placement/focus policy across overlay/reel/bookmark contexts
-  - finalize reel auto-follow freeze/resume policy during dictionary hover sessions
-  - finalize click-pin / outside-click / `Esc` coexistence rules
+  - popup placement/focus policy across overlay/reel/bookmark contexts (done)
+  - reel auto-follow freeze/resume policy during dictionary hover sessions (done)
+  - click-pin / outside-click / `Esc` coexistence rules (baseline single-popup behavior done)
   - treat these as mandatory before enabling recursive graph-mode by default
 - Keep MVP storage model simple:
   - subtitle JSON migration is not required for this step

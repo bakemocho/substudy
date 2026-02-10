@@ -129,6 +129,7 @@ const state = {
   dictPopupContextRootEl: null,
   dictPopupCueStartMs: null,
   dictPopupCueEndMs: null,
+  dictPopupPinned: false,
   dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
@@ -1191,6 +1192,15 @@ function clearDictionaryPopupHideTimer() {
   }
 }
 
+function setDictionaryPopupPinned(pinned) {
+  const nextPinned = Boolean(pinned);
+  state.dictPopupPinned = nextPinned;
+  if (nextPinned) {
+    clearDictionaryPopupHideTimer();
+  }
+  elements.subtitleDictPopup.classList.toggle("pinned", nextPinned);
+}
+
 function clearActiveDictionaryWord(exceptEl = null) {
   const activeWords = document.querySelectorAll(".subtitle-word.active");
   for (const activeWord of activeWords) {
@@ -1322,6 +1332,7 @@ function enforceDictionaryHoverLoop() {
 }
 
 function hideSubtitleDictionaryPopup() {
+  setDictionaryPopupPinned(false);
   clearDictionaryPopupHideTimer();
   stopDictionaryHoverLoop();
   state.dictPopupWord = "";
@@ -1340,6 +1351,9 @@ function hideSubtitleDictionaryPopup() {
 }
 
 function scheduleHideSubtitleDictionaryPopup() {
+  if (state.dictPopupPinned) {
+    return;
+  }
   clearDictionaryPopupHideTimer();
   state.dictPopupHideTimer = window.setTimeout(() => {
     hideSubtitleDictionaryPopup();
@@ -2392,6 +2406,14 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
 }
 
+function pinSubtitleDictionaryWord(wordEl) {
+  if (!(wordEl instanceof HTMLElement)) {
+    return;
+  }
+  setDictionaryPopupPinned(true);
+  showSubtitleDictionaryForWord(wordEl).catch((error) => setStatus(error.message, "error"));
+}
+
 function isDictionaryHoverSafeTarget(nextElement) {
   if (!(nextElement instanceof Element)) {
     return false;
@@ -2404,6 +2426,13 @@ function handleDictionaryWordPointerOver(event) {
   if (!(target instanceof HTMLElement)) {
     return;
   }
+  if (
+    state.dictPopupPinned
+    && state.dictPopupAnchorEl instanceof Element
+    && state.dictPopupAnchorEl !== target
+  ) {
+    return;
+  }
   showSubtitleDictionaryForWord(target).catch((error) => setStatus(error.message, "error"));
 }
 
@@ -2413,6 +2442,12 @@ function handleDictionaryWordPointerOut(event) {
     return;
   }
   const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+  if (state.dictPopupPinned) {
+    if (!isDictionaryHoverSafeTarget(nextElement)) {
+      stopDictionaryHoverLoop();
+    }
+    return;
+  }
   if (isDictionaryHoverSafeTarget(nextElement)) {
     return;
   }
@@ -3900,6 +3935,11 @@ function handleKeydown(event) {
       return;
     }
   }
+  if (event.key === "Escape" && isDictionaryPopupVisible()) {
+    event.preventDefault();
+    hideSubtitleDictionaryPopup();
+    return;
+  }
 
   const activeElement = document.activeElement;
   const activeTag = activeElement ? activeElement.tagName : "";
@@ -4093,8 +4133,10 @@ function bindEvents() {
   elements.subtitleOverlay.addEventListener("pointerout", handleDictionaryWordPointerOut);
   elements.subtitleOverlay.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
-    if (target) {
+    if (target instanceof HTMLElement) {
+      event.preventDefault();
       event.stopPropagation();
+      pinSubtitleDictionaryWord(target);
     }
   });
   if (elements.subtitlePanelReel) {
@@ -4104,6 +4146,15 @@ function bindEvents() {
   if (elements.bookmarkList) {
     elements.bookmarkList.addEventListener("pointerover", handleDictionaryWordPointerOver);
     elements.bookmarkList.addEventListener("pointerout", handleDictionaryWordPointerOut);
+    elements.bookmarkList.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      pinSubtitleDictionaryWord(target);
+    });
   }
   elements.subtitleDictPopup.addEventListener("pointerenter", () => {
     clearDictionaryPopupHideTimer();
@@ -4115,6 +4166,9 @@ function bindEvents() {
       return;
     }
     stopDictionaryHoverLoop();
+    if (state.dictPopupPinned) {
+      return;
+    }
     scheduleHideSubtitleDictionaryPopup();
   });
   if (elements.subtitleDictBridge) {
@@ -4128,6 +4182,9 @@ function bindEvents() {
         return;
       }
       stopDictionaryHoverLoop();
+      if (state.dictPopupPinned) {
+        return;
+      }
       scheduleHideSubtitleDictionaryPopup();
     });
   }
@@ -4194,6 +4251,10 @@ function bindEvents() {
       }
       const dictionaryWord = target.closest(".subtitle-word");
       if (dictionaryWord) {
+        if (dictionaryWord instanceof HTMLElement) {
+          event.preventDefault();
+          pinSubtitleDictionaryWord(dictionaryWord);
+        }
         event.stopPropagation();
         return;
       }
@@ -4481,6 +4542,16 @@ function bindEvents() {
     elements.playerActions.addEventListener("pointermove", resetControlsToggleFade, { passive: true });
   }
   bindTouchNavigation();
+  document.addEventListener("pointerdown", (event) => {
+    if (!isDictionaryPopupVisible()) {
+      return;
+    }
+    const target = event.target instanceof Element ? event.target : null;
+    if (target && target.closest(".subtitle-word, #subtitleDictPopup, #subtitleDictBridge")) {
+      return;
+    }
+    hideSubtitleDictionaryPopup();
+  }, true);
   document.addEventListener("keydown", handleKeydown);
   document.addEventListener("keydown", resetControlsToggleFade);
   window.addEventListener("scroll", () => {
