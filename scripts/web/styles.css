@@ -244,6 +244,11 @@ body {
   -webkit-user-select: text;
 }
 
+.subtitle-dict-popup.pinned {
+  border-color: rgba(116, 248, 224, 0.72);
+  box-shadow: 0 20px 46px rgba(2, 5, 15, 0.62), 0 0 0 1px rgba(83, 241, 216, 0.22) inset;
+}
+
 .subtitle-dict-bridge {
   position: fixed;
   z-index: 29;
@@ -257,6 +262,13 @@ body {
   font-size: 0.82rem;
   color: rgba(180, 214, 255, 0.96);
   letter-spacing: 0.02em;
+}
+
+.subtitle-dict-path {
+  margin: -4px 0 8px;
+  font-size: 0.7rem;
+  color: rgba(144, 226, 241, 0.86);
+  letter-spacing: 0.012em;
 }
 
 .subtitle-dict-list {
@@ -303,10 +315,14 @@ body {
   color: rgba(158, 185, 243, 0.8);
 }
 
-.subtitle-dict-item span {
+.subtitle-dict-def-text {
   display: block;
   color: rgba(214, 224, 245, 0.9);
   font-size: 0.8rem;
+}
+
+.subtitle-dict-inline-word {
+  display: inline;
 }
 
 .subtitle-dict-from {

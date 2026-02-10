@@ -15,6 +15,7 @@ const DICT_CONTEXT_MAX_CANDIDATES = 9;
 const DICT_CONTEXT_PER_TERM_LIMIT = 4;
 const DICT_CONTEXT_TOTAL_LIMIT = 12;
 const DICT_CONTEXT_CORE_MIN_RESULTS = 2;
+const DICT_TREE_MAX_DEPTH = 8;
 const DICT_PREFETCH_LOOKUP_LIMIT = 6;
 const DICT_PREFETCH_CUE_SCAN_LIMIT = 180;
 const DICT_PREFETCH_MAX_TERMS = 220;
@@ -129,7 +130,12 @@ const state = {
   dictPopupContextRootEl: null,
   dictPopupCueStartMs: null,
   dictPopupCueEndMs: null,
+  dictPopupNodeId: null,
   dictPopupPinned: false,
+  dictTreeNodes: new Map(),
+  dictTreeRootNodeId: null,
+  dictTreeCurrentNodeId: null,
+  dictTreeNextNodeId: 1,
   dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
@@ -1201,6 +1207,124 @@ function setDictionaryPopupPinned(pinned) {
   elements.subtitleDictPopup.classList.toggle("pinned", nextPinned);
 }
 
+function resetDictionaryTreeState() {
+  state.dictTreeNodes = new Map();
+  state.dictTreeRootNodeId = null;
+  state.dictTreeCurrentNodeId = null;
+  state.dictTreeNextNodeId = 1;
+  state.dictPopupNodeId = null;
+}
+
+function getDictionaryTreeNode(nodeId) {
+  if (!Number.isInteger(nodeId) || nodeId <= 0) {
+    return null;
+  }
+  return state.dictTreeNodes.get(nodeId) || null;
+}
+
+function collectDictionaryTreePath(nodeId) {
+  const path = [];
+  let current = getDictionaryTreeNode(nodeId);
+  const guard = new Set();
+  while (current && !guard.has(current.id)) {
+    guard.add(current.id);
+    path.unshift(current);
+    current = getDictionaryTreeNode(current.parentId);
+  }
+  return path;
+}
+
+function createDictionaryTreeNode({ term, normalizedTerm, parentId = null, source = "" }) {
+  const parentNode = getDictionaryTreeNode(parentId);
+  const id = state.dictTreeNextNodeId;
+  state.dictTreeNextNodeId += 1;
+  const node = {
+    id,
+    term: String(term || "").trim(),
+    normalizedTerm: String(normalizedTerm || "").trim(),
+    parentId: parentNode ? parentNode.id : null,
+    depth: parentNode ? parentNode.depth + 1 : 0,
+    source: String(source || "").trim(),
+    createdAt: Date.now(),
+  };
+  state.dictTreeNodes.set(id, node);
+  if (!parentNode) {
+    state.dictTreeRootNodeId = id;
+  }
+  state.dictTreeCurrentNodeId = id;
+  return node;
+}
+
+function findDictionaryTreeChild(parentId, normalizedTerm) {
+  if (!Number.isInteger(parentId) || parentId <= 0 || !normalizedTerm) {
+    return null;
+  }
+  for (const node of state.dictTreeNodes.values()) {
+    if (node.parentId === parentId && node.normalizedTerm === normalizedTerm) {
+      return node;
+    }
+  }
+  return null;
+}
+
+function ensureDictionaryTreeNodeForWord(wordEl, term) {
+  const normalizedTerm = normalizeDictionaryTerm(term);
+  if (!normalizedTerm) {
+    return { ok: false, reason: "empty", node: null };
+  }
+
+  const source = resolveDictionarySource(wordEl);
+  if (source !== "dict_popup") {
+    resetDictionaryTreeState();
+    const root = createDictionaryTreeNode({
+      term,
+      normalizedTerm,
+      parentId: null,
+      source,
+    });
+    return { ok: true, node: root };
+  }
+
+  const parentNodeId = Number(wordEl?.dataset?.dictNodeId);
+  let parentNode = getDictionaryTreeNode(parentNodeId);
+  if (!parentNode) {
+    parentNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
+  }
+  if (!parentNode) {
+    resetDictionaryTreeState();
+    const rootFromPopup = createDictionaryTreeNode({
+      term,
+      normalizedTerm,
+      parentId: null,
+      source,
+    });
+    return { ok: true, node: rootFromPopup };
+  }
+
+  if (parentNode.depth + 1 > DICT_TREE_MAX_DEPTH) {
+    return { ok: false, reason: "depth", node: parentNode };
+  }
+
+  const ancestorPath = collectDictionaryTreePath(parentNode.id);
+  if (ancestorPath.some((node) => node.normalizedTerm === normalizedTerm)) {
+    return { ok: false, reason: "cycle", node: parentNode };
+  }
+
+  const existingChild = findDictionaryTreeChild(parentNode.id, normalizedTerm);
+  if (existingChild) {
+    state.dictTreeCurrentNodeId = existingChild.id;
+    return { ok: true, node: existingChild };
+  }
+
+  const child = createDictionaryTreeNode({
+    term,
+    normalizedTerm,
+    parentId: parentNode.id,
+    source,
+  });
+  return { ok: true, node: child };
+}
+
 function clearActiveDictionaryWord(exceptEl = null) {
   const activeWords = document.querySelectorAll(".subtitle-word.active");
   for (const activeWord of activeWords) {
@@ -1224,7 +1348,7 @@ function resolveDictionarySource(wordEl) {
   }
   const sourceHolder = wordEl.closest("[data-dict-source]");
   const source = String(sourceHolder?.dataset?.dictSource || "").trim();
-  if (source === "overlay" || source === "reel" || source === "bookmark") {
+  if (source === "overlay" || source === "reel" || source === "bookmark" || source === "dict_popup") {
     return source;
   }
   return "";
@@ -1235,7 +1359,17 @@ function isDictionaryPopupVisible() {
 }
 
 function shouldSuspendSubtitlePanelAutoCenterForDictionary() {
-  return isDictionaryPopupVisible() && state.dictPopupSource === "reel";
+  if (!isDictionaryPopupVisible()) {
+    return false;
+  }
+  if (state.dictPopupSource === "reel") {
+    return true;
+  }
+  if (state.dictPopupSource === "dict_popup") {
+    const rootNode = getDictionaryTreeNode(state.dictTreeRootNodeId);
+    return rootNode?.source === "reel";
+  }
+  return false;
 }
 
 function extractDictionaryCueRangeFromElement(wordEl) {
@@ -1335,6 +1469,7 @@ function hideSubtitleDictionaryPopup() {
   setDictionaryPopupPinned(false);
   clearDictionaryPopupHideTimer();
   stopDictionaryHoverLoop();
+  resetDictionaryTreeState();
   state.dictPopupWord = "";
   state.dictPopupSource = "";
   state.dictPopupAnchorEl = null;
@@ -1483,12 +1618,99 @@ function groupDictionaryRows(rows) {
   return groups;
 }
 
-function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
+function buildDictionaryTreePathLabel(nodeId) {
+  const path = collectDictionaryTreePath(nodeId);
+  if (!path.length) {
+    return "";
+  }
+  return path.map((node) => node.term || node.normalizedTerm || "?").join(" > ");
+}
+
+function renderDictionaryDefinitionWordsIntoElement(element, text, nodeId = null) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+  const value = String(text || "").trim();
+  element.textContent = "";
+  if (!value) {
+    element.removeAttribute("data-dict-word-group");
+    element.removeAttribute("data-dict-source");
+    element.removeAttribute("data-dict-node-id");
+    return false;
+  }
+
+  state.dictWordGroupCounter += 1;
+  const groupId = `dict-popup-word-group-${state.dictWordGroupCounter}`;
+  element.dataset.dictWordGroup = groupId;
+  element.dataset.dictSource = "dict_popup";
+  if (Number.isInteger(nodeId) && nodeId > 0) {
+    element.dataset.dictNodeId = String(nodeId);
+  } else {
+    element.removeAttribute("data-dict-node-id");
+  }
+
+  const cueStartMs = Number(state.dictPopupCueStartMs);
+  const cueEndMs = Number(state.dictPopupCueEndMs);
+  const hasCueRange = Number.isFinite(cueStartMs) && Number.isFinite(cueEndMs) && cueEndMs > cueStartMs;
+  const fragment = document.createDocumentFragment();
+  SUBTITLE_WORD_PATTERN.lastIndex = 0;
+  let cursor = 0;
+  let hasWord = false;
+  let match = SUBTITLE_WORD_PATTERN.exec(value);
+  while (match) {
+    const [word] = match;
+    const start = match.index;
+    const end = start + word.length;
+    if (start > cursor) {
+      fragment.appendChild(document.createTextNode(value.slice(cursor, start)));
+    }
+    const wordSpan = document.createElement("span");
+    wordSpan.className = "subtitle-word subtitle-dict-inline-word";
+    wordSpan.dataset.dictTerm = word;
+    wordSpan.dataset.dictWordGroup = groupId;
+    wordSpan.dataset.dictSource = "dict_popup";
+    if (Number.isInteger(nodeId) && nodeId > 0) {
+      wordSpan.dataset.dictNodeId = String(nodeId);
+    }
+    if (hasCueRange) {
+      wordSpan.dataset.dictCueStartMs = String(Math.max(0, Math.round(cueStartMs)));
+      wordSpan.dataset.dictCueEndMs = String(Math.round(cueEndMs));
+    }
+    wordSpan.textContent = word;
+    fragment.appendChild(wordSpan);
+    cursor = end;
+    hasWord = true;
+    match = SUBTITLE_WORD_PATTERN.exec(value);
+  }
+
+  if (cursor < value.length) {
+    fragment.appendChild(document.createTextNode(value.slice(cursor)));
+  }
+  if (!hasWord) {
+    element.textContent = value;
+    element.removeAttribute("data-dict-word-group");
+    element.removeAttribute("data-dict-source");
+    element.removeAttribute("data-dict-node-id");
+    return false;
+  }
+  element.appendChild(fragment);
+  return true;
+}
+
+function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
+  const nodeId = Number(options.nodeId);
+  const node = getDictionaryTreeNode(nodeId);
   elements.subtitleDictPopup.textContent = "";
   const title = document.createElement("p");
   title.className = "subtitle-dict-title";
   title.textContent = `Dictionary: ${term}`;
   elements.subtitleDictPopup.appendChild(title);
+  if (node) {
+    const pathLine = document.createElement("p");
+    pathLine.className = "subtitle-dict-path";
+    pathLine.textContent = `lv.${node.depth + 1} • ${buildDictionaryTreePathLabel(node.id)}`;
+    elements.subtitleDictPopup.appendChild(pathLine);
+  }
 
   const groups = groupDictionaryRows(rows);
   if (!groups.length) {
@@ -1530,10 +1752,12 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
         defItem.className = "subtitle-dict-def-item";
 
         const detail = document.createElement("span");
+        detail.className = "subtitle-dict-def-text";
         const rawDefinition = String(entry.definition || "").trim();
-        detail.textContent = rawDefinition.length > 260
+        const clippedDefinition = rawDefinition.length > 260
           ? `${rawDefinition.slice(0, 260)}...`
           : rawDefinition;
+        renderDictionaryDefinitionWordsIntoElement(detail, clippedDefinition, node ? node.id : null);
         defItem.appendChild(detail);
 
         if (fromTerms.size > 1) {
@@ -1559,15 +1783,23 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl) {
   requestAnimationFrame(() => positionSubtitleDictionaryPopup(anchorEl));
 }
 
-function renderSubtitleDictionaryPopupLoading(term, anchorEl) {
+function renderSubtitleDictionaryPopupLoading(term, anchorEl, options = {}) {
+  const nodeId = Number(options.nodeId);
+  const node = getDictionaryTreeNode(nodeId);
   elements.subtitleDictPopup.textContent = "";
   const title = document.createElement("p");
   title.className = "subtitle-dict-title";
   title.textContent = `Dictionary: ${term}`;
+  elements.subtitleDictPopup.appendChild(title);
+  if (node) {
+    const pathLine = document.createElement("p");
+    pathLine.className = "subtitle-dict-path";
+    pathLine.textContent = `lv.${node.depth + 1} • ${buildDictionaryTreePathLabel(node.id)}`;
+    elements.subtitleDictPopup.appendChild(pathLine);
+  }
   const loading = document.createElement("p");
   loading.className = "subtitle-dict-empty";
   loading.textContent = "辞書を検索中...";
-  elements.subtitleDictPopup.appendChild(title);
   elements.subtitleDictPopup.appendChild(loading);
   elements.subtitleDictPopup.classList.remove("hidden");
   elements.subtitleDictPopup.setAttribute("aria-hidden", "false");
@@ -2378,30 +2610,49 @@ async function showSubtitleDictionaryForWord(wordEl) {
   if (!term) {
     return;
   }
+  const treeResult = ensureDictionaryTreeNodeForWord(wordEl, term);
+  if (!treeResult.ok || !treeResult.node) {
+    return;
+  }
+  const activeNodeId = treeResult.node.id;
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
+  state.dictPopupNodeId = activeNodeId;
   state.dictPopupSource = resolveDictionarySource(wordEl);
   state.dictPopupAnchorEl = wordEl;
   state.dictPopupContextRootEl = resolveDictionaryContextRoot(wordEl);
   updateDictionaryPopupCueRange(wordEl);
   clearActiveDictionaryWord(wordEl);
   wordEl.classList.add("active");
-  renderSubtitleDictionaryPopupLoading(term, wordEl);
+  renderSubtitleDictionaryPopupLoading(term, wordEl, { nodeId: activeNodeId });
 
   const requestId = state.dictLookupRequestId + 1;
   state.dictLookupRequestId = requestId;
   try {
     const payload = await lookupDictionaryWithContext(wordEl, term);
-    if (requestId !== state.dictLookupRequestId || state.dictPopupWord !== term) {
+    if (
+      requestId !== state.dictLookupRequestId
+      || state.dictPopupWord !== term
+      || state.dictPopupNodeId !== activeNodeId
+    ) {
       return;
     }
     const rows = Array.isArray(payload.results) ? payload.results : [];
-    renderSubtitleDictionaryPopup(term, rows, wordEl);
+    const node = getDictionaryTreeNode(activeNodeId);
+    if (node) {
+      node.resultCount = rows.length;
+      node.updatedAt = Date.now();
+    }
+    renderSubtitleDictionaryPopup(term, rows, wordEl, { nodeId: activeNodeId });
   } catch (error) {
-    if (requestId !== state.dictLookupRequestId || state.dictPopupWord !== term) {
+    if (
+      requestId !== state.dictLookupRequestId
+      || state.dictPopupWord !== term
+      || state.dictPopupNodeId !== activeNodeId
+    ) {
       return;
     }
-    renderSubtitleDictionaryPopup(term, [], wordEl);
+    renderSubtitleDictionaryPopup(term, [], wordEl, { nodeId: activeNodeId });
     setStatus(error.message, "error");
   }
 }
@@ -2426,10 +2677,12 @@ function handleDictionaryWordPointerOver(event) {
   if (!(target instanceof HTMLElement)) {
     return;
   }
+  const source = resolveDictionarySource(target);
   if (
     state.dictPopupPinned
     && state.dictPopupAnchorEl instanceof Element
     && state.dictPopupAnchorEl !== target
+    && source !== "dict_popup"
   ) {
     return;
   }
@@ -4156,6 +4409,8 @@ function bindEvents() {
       pinSubtitleDictionaryWord(target);
     });
   }
+  elements.subtitleDictPopup.addEventListener("pointerover", handleDictionaryWordPointerOver);
+  elements.subtitleDictPopup.addEventListener("pointerout", handleDictionaryWordPointerOut);
   elements.subtitleDictPopup.addEventListener("pointerenter", () => {
     clearDictionaryPopupHideTimer();
     startDictionaryHoverLoop();
@@ -4188,7 +4443,14 @@ function bindEvents() {
       scheduleHideSubtitleDictionaryPopup();
     });
   }
-  elements.subtitleDictPopup.addEventListener("click", (event) => event.stopPropagation());
+  elements.subtitleDictPopup.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+    if (target instanceof HTMLElement) {
+      event.preventDefault();
+      pinSubtitleDictionaryWord(target);
+    }
+    event.stopPropagation();
+  });
   elements.subtitleDictPopup.addEventListener(
     "wheel",
     (event) => {
