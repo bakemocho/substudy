@@ -249,6 +249,12 @@ body {
   box-shadow: 0 20px 46px rgba(2, 5, 15, 0.62), 0 0 0 1px rgba(83, 241, 216, 0.22) inset;
 }
 
+.subtitle-dict-popup-child {
+  transform: none;
+  left: -9999px;
+  top: -9999px;
+}
+
 .subtitle-dict-bridge {
   position: fixed;
   z-index: 29;

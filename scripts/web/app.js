@@ -132,6 +132,9 @@ const state = {
   dictPopupCueEndMs: null,
   dictPopupNodeId: null,
   dictPopupPinned: false,
+  dictPopupNodeElements: new Map(),
+  dictPopupNodeRequests: new Map(),
+  dictPopupRequestSeq: 0,
   dictTreeNodes: new Map(),
   dictTreeRootNodeId: null,
   dictTreeCurrentNodeId: null,
@@ -461,7 +464,7 @@ function shouldIgnorePlayerSnapWheelTarget(target) {
   }
   return Boolean(
     target.closest(
-      "#phoneShell, #subtitleDictPopup, #subtitleDictBridge, #subtitlePanelReel, #bookmarkList, #lyricReelOverlay, #jumpModal, .jump-results, input, textarea, select"
+      "#phoneShell, .subtitle-dict-popup, #subtitleDictBridge, #subtitlePanelReel, #bookmarkList, #lyricReelOverlay, #jumpModal, .jump-results, input, textarea, select"
     )
   );
 }
@@ -1205,9 +1208,155 @@ function setDictionaryPopupPinned(pinned) {
     clearDictionaryPopupHideTimer();
   }
   elements.subtitleDictPopup.classList.toggle("pinned", nextPinned);
+  for (const popupEl of state.dictPopupNodeElements.values()) {
+    popupEl.classList.toggle("pinned", nextPinned);
+  }
+}
+
+function getDictionaryPopupElements() {
+  return [elements.subtitleDictPopup, ...state.dictPopupNodeElements.values()];
+}
+
+function hideDictionaryPopupElement(popupEl) {
+  if (!(popupEl instanceof HTMLElement)) {
+    return;
+  }
+  popupEl.classList.add("hidden");
+  popupEl.setAttribute("aria-hidden", "true");
+}
+
+function showDictionaryPopupElement(popupEl) {
+  if (!(popupEl instanceof HTMLElement)) {
+    return;
+  }
+  popupEl.classList.remove("hidden");
+  popupEl.setAttribute("aria-hidden", "false");
+  popupEl.classList.toggle("pinned", state.dictPopupPinned);
+}
+
+function removeDictionaryPopupNodeElements() {
+  for (const popupEl of state.dictPopupNodeElements.values()) {
+    popupEl.remove();
+  }
+  state.dictPopupNodeElements = new Map();
+}
+
+function bindDictionaryPopupElementEvents(popupEl) {
+  if (!(popupEl instanceof HTMLElement) || popupEl.dataset.dictPopupEventsBound === "1") {
+    return;
+  }
+  popupEl.dataset.dictPopupEventsBound = "1";
+  popupEl.addEventListener("pointerover", handleDictionaryWordPointerOver);
+  popupEl.addEventListener("pointerout", handleDictionaryWordPointerOut);
+  popupEl.addEventListener("pointerenter", () => {
+    clearDictionaryPopupHideTimer();
+    startDictionaryHoverLoop();
+  });
+  popupEl.addEventListener("pointerleave", (event) => {
+    const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+    if (isDictionaryHoverSafeTarget(nextElement)) {
+      return;
+    }
+    stopDictionaryHoverLoop();
+    if (state.dictPopupPinned) {
+      return;
+    }
+    scheduleHideSubtitleDictionaryPopup();
+  });
+  popupEl.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
+    if (target instanceof HTMLElement) {
+      event.preventDefault();
+      pinSubtitleDictionaryWord(target);
+    }
+    event.stopPropagation();
+  });
+  popupEl.addEventListener(
+    "wheel",
+    (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      clearDictionaryPopupHideTimer();
+      if (event.deltaY !== 0) {
+        popupEl.scrollTop += event.deltaY;
+      }
+      if (event.deltaX !== 0) {
+        popupEl.scrollLeft += event.deltaX;
+      }
+    },
+    { passive: false }
+  );
+}
+
+function getDictionaryPopupElementForNode(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return elements.subtitleDictPopup;
+  }
+  if (safeNodeId === state.dictTreeRootNodeId) {
+    return elements.subtitleDictPopup;
+  }
+  return state.dictPopupNodeElements.get(safeNodeId) || null;
+}
+
+function ensureDictionaryPopupElementForNode(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0 || safeNodeId === state.dictTreeRootNodeId) {
+    return elements.subtitleDictPopup;
+  }
+  const existing = state.dictPopupNodeElements.get(safeNodeId);
+  if (existing) {
+    return existing;
+  }
+  const popupEl = document.createElement("div");
+  popupEl.className = "subtitle-dict-popup subtitle-dict-popup-child hidden";
+  popupEl.setAttribute("aria-hidden", "true");
+  popupEl.dataset.dictPopupNodeId = String(safeNodeId);
+  document.body.appendChild(popupEl);
+  bindDictionaryPopupElementEvents(popupEl);
+  state.dictPopupNodeElements.set(safeNodeId, popupEl);
+  return popupEl;
+}
+
+function setDictionaryNodeRequest(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return -1;
+  }
+  state.dictPopupRequestSeq += 1;
+  state.dictPopupNodeRequests.set(safeNodeId, state.dictPopupRequestSeq);
+  return state.dictPopupRequestSeq;
+}
+
+function isDictionaryNodeRequestCurrent(nodeId, requestId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0 || !Number.isInteger(requestId) || requestId <= 0) {
+    return false;
+  }
+  return state.dictPopupNodeRequests.get(safeNodeId) === requestId;
+}
+
+function retainDictionaryPopupPath(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    for (const popupEl of state.dictPopupNodeElements.values()) {
+      hideDictionaryPopupElement(popupEl);
+    }
+    return;
+  }
+  const path = collectDictionaryTreePath(safeNodeId);
+  const keepIds = new Set(path.map((node) => node.id));
+  for (const [popupNodeId, popupEl] of state.dictPopupNodeElements.entries()) {
+    if (keepIds.has(popupNodeId)) {
+      continue;
+    }
+    hideDictionaryPopupElement(popupEl);
+  }
 }
 
 function resetDictionaryTreeState() {
+  state.dictPopupNodeRequests = new Map();
+  removeDictionaryPopupNodeElements();
   state.dictTreeNodes = new Map();
   state.dictTreeRootNodeId = null;
   state.dictTreeCurrentNodeId = null;
@@ -1355,7 +1504,9 @@ function resolveDictionarySource(wordEl) {
 }
 
 function isDictionaryPopupVisible() {
-  return !elements.subtitleDictPopup.classList.contains("hidden");
+  return getDictionaryPopupElements().some((popupEl) => (
+    popupEl instanceof HTMLElement && !popupEl.classList.contains("hidden")
+  ));
 }
 
 function shouldSuspendSubtitlePanelAutoCenterForDictionary() {
@@ -1571,15 +1722,78 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   elements.subtitleDictBridge.setAttribute("aria-hidden", "false");
 }
 
+function positionDictionaryChildPopup(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0 || safeNodeId === state.dictTreeRootNodeId) {
+    return;
+  }
+  const node = getDictionaryTreeNode(safeNodeId);
+  if (!node) {
+    return;
+  }
+  const popupEl = getDictionaryPopupElementForNode(safeNodeId);
+  if (!(popupEl instanceof HTMLElement) || popupEl.classList.contains("hidden")) {
+    return;
+  }
+  const parentPopupEl = getDictionaryPopupElementForNode(node.parentId);
+  if (!(parentPopupEl instanceof HTMLElement)) {
+    return;
+  }
+  const parentRect = parentPopupEl.getBoundingClientRect();
+  const popupRect = popupEl.getBoundingClientRect();
+  const anchorRect = (node.anchorEl instanceof Element)
+    ? node.anchorEl.getBoundingClientRect()
+    : parentRect;
+  const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    return;
+  }
+
+  const gap = 10;
+  let left = parentRect.right + gap;
+  if (left + popupRect.width > viewportWidth - 8) {
+    left = parentRect.left - popupRect.width - gap;
+  }
+  left = Math.max(8, Math.min(viewportWidth - popupRect.width - 8, left));
+
+  const targetTop = anchorRect.top - Math.min(22, Math.max(8, anchorRect.height * 0.35));
+  const top = Math.max(8, Math.min(viewportHeight - popupRect.height - 8, targetTop));
+
+  popupEl.style.left = `${left.toFixed(1)}px`;
+  popupEl.style.top = `${top.toFixed(1)}px`;
+  popupEl.style.transform = "none";
+}
+
+function positionDictionaryPopupForNode(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return;
+  }
+  if (safeNodeId === state.dictTreeRootNodeId) {
+    positionSubtitleDictionaryPopup(state.dictPopupAnchorEl);
+    return;
+  }
+  positionDictionaryChildPopup(safeNodeId);
+}
+
 function repositionActiveDictionaryPopup() {
   if (!isDictionaryPopupVisible()) {
     return;
   }
-  if (!(state.dictPopupAnchorEl instanceof Element) || !document.body.contains(state.dictPopupAnchorEl)) {
+  if (
+    state.dictTreeRootNodeId
+    && state.dictPopupAnchorEl instanceof Element
+    && !document.body.contains(state.dictPopupAnchorEl)
+  ) {
     hideSubtitleDictionaryPopup();
     return;
   }
-  positionSubtitleDictionaryPopup(state.dictPopupAnchorEl);
+  const activeNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
+  const path = collectDictionaryTreePath(activeNode?.id || state.dictTreeRootNodeId);
+  for (const node of path) {
+    positionDictionaryPopupForNode(node.id);
+  }
 }
 
 function groupDictionaryRows(rows) {
@@ -1699,17 +1913,23 @@ function renderDictionaryDefinitionWordsIntoElement(element, text, nodeId = null
 
 function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
   const nodeId = Number(options.nodeId);
+  const popupEl = options.popupEl instanceof HTMLElement
+    ? options.popupEl
+    : getDictionaryPopupElementForNode(nodeId);
   const node = getDictionaryTreeNode(nodeId);
-  elements.subtitleDictPopup.textContent = "";
+  if (!(popupEl instanceof HTMLElement)) {
+    return;
+  }
+  popupEl.textContent = "";
   const title = document.createElement("p");
   title.className = "subtitle-dict-title";
   title.textContent = `Dictionary: ${term}`;
-  elements.subtitleDictPopup.appendChild(title);
+  popupEl.appendChild(title);
   if (node) {
     const pathLine = document.createElement("p");
     pathLine.className = "subtitle-dict-path";
     pathLine.textContent = `lv.${node.depth + 1} • ${buildDictionaryTreePathLabel(node.id)}`;
-    elements.subtitleDictPopup.appendChild(pathLine);
+    popupEl.appendChild(pathLine);
   }
 
   const groups = groupDictionaryRows(rows);
@@ -1717,7 +1937,7 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
     const empty = document.createElement("p");
     empty.className = "subtitle-dict-empty";
     empty.textContent = "辞書エントリが見つかりません。";
-    elements.subtitleDictPopup.appendChild(empty);
+    popupEl.appendChild(empty);
   } else {
     const list = document.createElement("div");
     list.className = "subtitle-dict-list";
@@ -1775,35 +1995,51 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
       item.appendChild(defs);
       list.appendChild(item);
     }
-    elements.subtitleDictPopup.appendChild(list);
+    popupEl.appendChild(list);
   }
 
-  elements.subtitleDictPopup.classList.remove("hidden");
-  elements.subtitleDictPopup.setAttribute("aria-hidden", "false");
-  requestAnimationFrame(() => positionSubtitleDictionaryPopup(anchorEl));
+  showDictionaryPopupElement(popupEl);
+  requestAnimationFrame(() => {
+    if (nodeId === state.dictTreeRootNodeId) {
+      positionSubtitleDictionaryPopup(anchorEl);
+    } else {
+      positionDictionaryPopupForNode(nodeId);
+    }
+  });
 }
 
 function renderSubtitleDictionaryPopupLoading(term, anchorEl, options = {}) {
   const nodeId = Number(options.nodeId);
+  const popupEl = options.popupEl instanceof HTMLElement
+    ? options.popupEl
+    : getDictionaryPopupElementForNode(nodeId);
   const node = getDictionaryTreeNode(nodeId);
-  elements.subtitleDictPopup.textContent = "";
+  if (!(popupEl instanceof HTMLElement)) {
+    return;
+  }
+  popupEl.textContent = "";
   const title = document.createElement("p");
   title.className = "subtitle-dict-title";
   title.textContent = `Dictionary: ${term}`;
-  elements.subtitleDictPopup.appendChild(title);
+  popupEl.appendChild(title);
   if (node) {
     const pathLine = document.createElement("p");
     pathLine.className = "subtitle-dict-path";
     pathLine.textContent = `lv.${node.depth + 1} • ${buildDictionaryTreePathLabel(node.id)}`;
-    elements.subtitleDictPopup.appendChild(pathLine);
+    popupEl.appendChild(pathLine);
   }
   const loading = document.createElement("p");
   loading.className = "subtitle-dict-empty";
   loading.textContent = "辞書を検索中...";
-  elements.subtitleDictPopup.appendChild(loading);
-  elements.subtitleDictPopup.classList.remove("hidden");
-  elements.subtitleDictPopup.setAttribute("aria-hidden", "false");
-  requestAnimationFrame(() => positionSubtitleDictionaryPopup(anchorEl));
+  popupEl.appendChild(loading);
+  showDictionaryPopupElement(popupEl);
+  requestAnimationFrame(() => {
+    if (nodeId === state.dictTreeRootNodeId) {
+      positionSubtitleDictionaryPopup(anchorEl);
+    } else {
+      positionDictionaryPopupForNode(nodeId);
+    }
+  });
 }
 
 async function lookupDictionary(term) {
@@ -2612,29 +2848,33 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
   const treeResult = ensureDictionaryTreeNodeForWord(wordEl, term);
   if (!treeResult.ok || !treeResult.node) {
+    if (treeResult.reason === "depth") {
+      setStatus(`辞書の深さ上限 (lv.${DICT_TREE_MAX_DEPTH + 1}) に到達しました。`, "info");
+    }
     return;
   }
-  const activeNodeId = treeResult.node.id;
+  const activeNode = treeResult.node;
+  const activeNodeId = activeNode.id;
+  activeNode.anchorEl = wordEl;
+  const popupEl = ensureDictionaryPopupElementForNode(activeNodeId);
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
   state.dictPopupNodeId = activeNodeId;
   state.dictPopupSource = resolveDictionarySource(wordEl);
-  state.dictPopupAnchorEl = wordEl;
+  if (activeNodeId === state.dictTreeRootNodeId) {
+    state.dictPopupAnchorEl = wordEl;
+  }
   state.dictPopupContextRootEl = resolveDictionaryContextRoot(wordEl);
   updateDictionaryPopupCueRange(wordEl);
+  retainDictionaryPopupPath(activeNodeId);
   clearActiveDictionaryWord(wordEl);
   wordEl.classList.add("active");
-  renderSubtitleDictionaryPopupLoading(term, wordEl, { nodeId: activeNodeId });
+  renderSubtitleDictionaryPopupLoading(term, wordEl, { nodeId: activeNodeId, popupEl });
 
-  const requestId = state.dictLookupRequestId + 1;
-  state.dictLookupRequestId = requestId;
+  const requestId = setDictionaryNodeRequest(activeNodeId);
   try {
     const payload = await lookupDictionaryWithContext(wordEl, term);
-    if (
-      requestId !== state.dictLookupRequestId
-      || state.dictPopupWord !== term
-      || state.dictPopupNodeId !== activeNodeId
-    ) {
+    if (!isDictionaryNodeRequestCurrent(activeNodeId, requestId)) {
       return;
     }
     const rows = Array.isArray(payload.results) ? payload.results : [];
@@ -2643,16 +2883,12 @@ async function showSubtitleDictionaryForWord(wordEl) {
       node.resultCount = rows.length;
       node.updatedAt = Date.now();
     }
-    renderSubtitleDictionaryPopup(term, rows, wordEl, { nodeId: activeNodeId });
+    renderSubtitleDictionaryPopup(term, rows, wordEl, { nodeId: activeNodeId, popupEl });
   } catch (error) {
-    if (
-      requestId !== state.dictLookupRequestId
-      || state.dictPopupWord !== term
-      || state.dictPopupNodeId !== activeNodeId
-    ) {
+    if (!isDictionaryNodeRequestCurrent(activeNodeId, requestId)) {
       return;
     }
-    renderSubtitleDictionaryPopup(term, [], wordEl, { nodeId: activeNodeId });
+    renderSubtitleDictionaryPopup(term, [], wordEl, { nodeId: activeNodeId, popupEl });
     setStatus(error.message, "error");
   }
 }
@@ -2669,7 +2905,7 @@ function isDictionaryHoverSafeTarget(nextElement) {
   if (!(nextElement instanceof Element)) {
     return false;
   }
-  return Boolean(nextElement.closest(".subtitle-word, #subtitleDictPopup, #subtitleDictBridge"));
+  return Boolean(nextElement.closest(".subtitle-word, .subtitle-dict-popup, #subtitleDictBridge"));
 }
 
 function handleDictionaryWordPointerOver(event) {
@@ -3467,9 +3703,12 @@ function stepLyricReel(step) {
 }
 
 function isNodeInsideDictionaryPopup(node) {
+  if (!(node instanceof Node)) {
+    return false;
+  }
   let current = node;
   while (current) {
-    if (current === elements.subtitleDictPopup) {
+    if (current instanceof Element && current.classList?.contains("subtitle-dict-popup")) {
       return true;
     }
     current = current.parentNode;
@@ -4102,7 +4341,7 @@ function toggleDictionaryHoverLoopMode() {
 
 function handleWheel(event) {
   const target = event.target instanceof Element ? event.target : null;
-  if (target && target.closest("#subtitleDictPopup, #subtitleDictBridge")) {
+  if (target && target.closest(".subtitle-dict-popup, #subtitleDictBridge")) {
     clearDictionaryPopupHideTimer();
     return;
   }
@@ -4409,23 +4648,7 @@ function bindEvents() {
       pinSubtitleDictionaryWord(target);
     });
   }
-  elements.subtitleDictPopup.addEventListener("pointerover", handleDictionaryWordPointerOver);
-  elements.subtitleDictPopup.addEventListener("pointerout", handleDictionaryWordPointerOut);
-  elements.subtitleDictPopup.addEventListener("pointerenter", () => {
-    clearDictionaryPopupHideTimer();
-    startDictionaryHoverLoop();
-  });
-  elements.subtitleDictPopup.addEventListener("pointerleave", (event) => {
-    const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
-    if (isDictionaryHoverSafeTarget(nextElement)) {
-      return;
-    }
-    stopDictionaryHoverLoop();
-    if (state.dictPopupPinned) {
-      return;
-    }
-    scheduleHideSubtitleDictionaryPopup();
-  });
+  bindDictionaryPopupElementEvents(elements.subtitleDictPopup);
   if (elements.subtitleDictBridge) {
     elements.subtitleDictBridge.addEventListener("pointerenter", () => {
       clearDictionaryPopupHideTimer();
@@ -4443,29 +4666,6 @@ function bindEvents() {
       scheduleHideSubtitleDictionaryPopup();
     });
   }
-  elements.subtitleDictPopup.addEventListener("click", (event) => {
-    const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
-    if (target instanceof HTMLElement) {
-      event.preventDefault();
-      pinSubtitleDictionaryWord(target);
-    }
-    event.stopPropagation();
-  });
-  elements.subtitleDictPopup.addEventListener(
-    "wheel",
-    (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      clearDictionaryPopupHideTimer();
-      if (event.deltaY !== 0) {
-        elements.subtitleDictPopup.scrollTop += event.deltaY;
-      }
-      if (event.deltaX !== 0) {
-        elements.subtitleDictPopup.scrollLeft += event.deltaX;
-      }
-    },
-    { passive: false }
-  );
   if (elements.bookmarkList) {
     elements.bookmarkList.addEventListener(
       "wheel",
@@ -4809,7 +5009,7 @@ function bindEvents() {
       return;
     }
     const target = event.target instanceof Element ? event.target : null;
-    if (target && target.closest(".subtitle-word, #subtitleDictPopup, #subtitleDictBridge")) {
+    if (target && target.closest(".subtitle-word, .subtitle-dict-popup, #subtitleDictBridge")) {
       return;
     }
     hideSubtitleDictionaryPopup();
