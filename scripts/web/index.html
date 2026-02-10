@@ -42,7 +42,11 @@
         <section class="player-column" aria-label="Video Feed">
           <div class="phone-shell" id="phoneShell">
             <video id="videoPlayer" playsinline preload="metadata"></video>
+            <div id="videoProgressTimer" class="video-progress-timer" aria-hidden="true">
+              <div id="videoProgressTimerFill" class="video-progress-timer-fill"></div>
+            </div>
             <div id="subtitleOverlay" class="subtitle-overlay">字幕を読み込み中...</div>
+            <div id="subtitleDictBridge" class="subtitle-dict-bridge hidden" aria-hidden="true"></div>
             <div id="subtitleDictPopup" class="subtitle-dict-popup hidden" aria-hidden="true"></div>
             <div id="lyricReelOverlay" class="lyric-reel-overlay hidden" aria-hidden="true">
               <div id="lyricReelList" class="lyric-reel-list"></div>

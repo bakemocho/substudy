@@ -21,6 +21,11 @@ const DICT_PREFETCH_HEAD_TERMS = 64;
 const DICT_PREFETCH_BATCH_SIZE = 12;
 const DICT_PREFETCH_BATCH_DELAY_MS = 32;
 const DICT_PREFETCH_START_DELAY_MS = 90;
+const PLAYER_CARD_SNAP_THRESHOLD_PX = 22;
+const PLAYER_CARD_SNAP_RELEASE_DELTA = 180;
+const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
+const PLAYER_CARD_SNAP_NUDGE_PX = 3.2;
+const PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH = 920;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
@@ -117,15 +122,22 @@ const state = {
   dictPopupHideTimer: null,
   dictLookupRequestId: 0,
   dictPopupWord: "",
+  dictPopupAnchorEl: null,
+  dictPopupContextRootEl: null,
   dictPopupCueStartMs: null,
   dictPopupCueEndMs: null,
   dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
+  dictWordGroupCounter: 0,
   dictBatchApiAvailable: null,
   dictPrefetchToken: 0,
   dictPrefetchedVideoKeys: new Set(),
   dictPrefetchPendingVideoKeys: new Set(),
+  playerSnapEdge: null,
+  playerSnapUnlockDelta: 0,
+  playerSnapReleaseCooldownUntil: 0,
+  playerSnapCheckTimer: null,
   translationFilter: (() => {
     const stored = String(localStorage.getItem("substudy.translation_filter") || "").trim();
     if (TRANSLATION_FILTER_VALUES.has(stored)) {
@@ -145,7 +157,10 @@ const elements = {
   dictHoverLoopToggle: document.getElementById("dictHoverLoopToggle"),
   videoPlayer: document.getElementById("videoPlayer"),
   phoneShell: document.getElementById("phoneShell"),
+  videoProgressTimer: document.getElementById("videoProgressTimer"),
+  videoProgressTimerFill: document.getElementById("videoProgressTimerFill"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
+  subtitleDictBridge: document.getElementById("subtitleDictBridge"),
   subtitleDictPopup: document.getElementById("subtitleDictPopup"),
   lyricReelOverlay: document.getElementById("lyricReelOverlay"),
   lyricReelList: document.getElementById("lyricReelList"),
@@ -326,6 +341,144 @@ function pushHistory(index) {
 
 function updatePlayPauseButton() {
   elements.playPauseBtn.textContent = elements.videoPlayer.paused ? "再生" : "停止";
+}
+
+function updateVideoProgressTimer() {
+  if (!elements.videoProgressTimerFill || !elements.videoPlayer) {
+    return;
+  }
+  const duration = Number(elements.videoPlayer.duration);
+  const currentTime = Number(elements.videoPlayer.currentTime);
+  const hasDuration = Number.isFinite(duration) && duration > 0;
+  const ratio = hasDuration
+    ? Math.max(0, Math.min(1, (Number.isFinite(currentTime) ? currentTime : 0) / duration))
+    : 0;
+  const angle = `${(ratio * 360).toFixed(2)}deg`;
+  elements.videoProgressTimerFill.style.setProperty("--timer-progress-angle", angle);
+}
+
+function isPlayerCardSnapEnabled() {
+  return window.innerWidth >= PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH && !isJumpModalOpen();
+}
+
+function clearPlayerCardSnapCheckTimer() {
+  if (state.playerSnapCheckTimer !== null) {
+    window.clearTimeout(state.playerSnapCheckTimer);
+    state.playerSnapCheckTimer = null;
+  }
+}
+
+function setPlayerCardSnapEdge(edge) {
+  const normalized = edge === "top" || edge === "bottom" ? edge : null;
+  state.playerSnapEdge = normalized;
+  state.playerSnapUnlockDelta = 0;
+  elements.phoneShell.classList.toggle("snap-top", normalized === "top");
+  elements.phoneShell.classList.toggle("snap-bottom", normalized === "bottom");
+}
+
+function releasePlayerCardSnapLock(applyCooldown = false) {
+  setPlayerCardSnapEdge(null);
+  if (applyCooldown) {
+    state.playerSnapReleaseCooldownUntil = Date.now() + PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS;
+  }
+}
+
+function snapPhoneShellToEdge(edge) {
+  if (!elements.phoneShell) {
+    return;
+  }
+  const rect = elements.phoneShell.getBoundingClientRect();
+  const delta = edge === "bottom"
+    ? rect.bottom - window.innerHeight
+    : rect.top;
+  if (Math.abs(delta) > 0.6) {
+    window.scrollBy({
+      top: delta,
+      behavior: "smooth",
+    });
+  }
+  setPlayerCardSnapEdge(edge);
+}
+
+function maybeSnapPhoneShellToViewport() {
+  if (!elements.phoneShell || !isPlayerCardSnapEnabled() || state.lyricReelActive) {
+    releasePlayerCardSnapLock(false);
+    return;
+  }
+  if (state.playerSnapEdge) {
+    const rect = elements.phoneShell.getBoundingClientRect();
+    const edgeDistance = state.playerSnapEdge === "bottom"
+      ? Math.abs(window.innerHeight - rect.bottom)
+      : Math.abs(rect.top);
+    if (edgeDistance > (PLAYER_CARD_SNAP_THRESHOLD_PX + 18)) {
+      releasePlayerCardSnapLock(false);
+    }
+    return;
+  }
+  if (Date.now() < state.playerSnapReleaseCooldownUntil) {
+    return;
+  }
+  const rect = elements.phoneShell.getBoundingClientRect();
+  const topDistance = Math.abs(rect.top);
+  const bottomDistance = Math.abs(window.innerHeight - rect.bottom);
+  if (topDistance > PLAYER_CARD_SNAP_THRESHOLD_PX && bottomDistance > PLAYER_CARD_SNAP_THRESHOLD_PX) {
+    return;
+  }
+  if (topDistance <= bottomDistance) {
+    snapPhoneShellToEdge("top");
+  } else {
+    snapPhoneShellToEdge("bottom");
+  }
+}
+
+function schedulePhoneShellSnapCheck() {
+  if (!isPlayerCardSnapEnabled()) {
+    releasePlayerCardSnapLock(false);
+    clearPlayerCardSnapCheckTimer();
+    return;
+  }
+  clearPlayerCardSnapCheckTimer();
+  state.playerSnapCheckTimer = window.setTimeout(() => {
+    state.playerSnapCheckTimer = null;
+    maybeSnapPhoneShellToViewport();
+  }, 64);
+}
+
+function shouldIgnorePlayerSnapWheelTarget(target) {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  return Boolean(
+    target.closest(
+      "#phoneShell, #subtitleDictPopup, #subtitleDictBridge, #subtitlePanelReel, #bookmarkList, #lyricReelOverlay, #jumpModal, .jump-results, input, textarea, select"
+    )
+  );
+}
+
+function handleWindowWheelForPlayerSnap(event) {
+  if (!state.playerSnapEdge) {
+    return;
+  }
+  if (!isPlayerCardSnapEnabled() || state.lyricReelActive) {
+    releasePlayerCardSnapLock(false);
+    return;
+  }
+  if (shouldIgnorePlayerSnapWheelTarget(event.target)) {
+    return;
+  }
+  if (Date.now() < state.playerSnapReleaseCooldownUntil) {
+    return;
+  }
+  state.playerSnapUnlockDelta += Math.abs(event.deltaY || 0);
+  if (state.playerSnapUnlockDelta < PLAYER_CARD_SNAP_RELEASE_DELTA) {
+    event.preventDefault();
+    const direction = Math.sign(event.deltaY || 0);
+    if (direction !== 0) {
+      window.scrollBy(0, direction * PLAYER_CARD_SNAP_NUDGE_PX);
+    }
+    return;
+  }
+  releasePlayerCardSnapLock(true);
 }
 
 function updateFavoriteButton() {
@@ -1034,7 +1187,48 @@ function clearDictionaryPopupHideTimer() {
   }
 }
 
-function updateDictionaryPopupCueRange() {
+function clearActiveDictionaryWord(exceptEl = null) {
+  const activeWords = document.querySelectorAll(".subtitle-word.active");
+  for (const activeWord of activeWords) {
+    if (exceptEl && activeWord === exceptEl) {
+      continue;
+    }
+    activeWord.classList.remove("active");
+  }
+}
+
+function resolveDictionaryContextRoot(wordEl) {
+  if (!(wordEl instanceof HTMLElement)) {
+    return null;
+  }
+  return wordEl.closest("[data-dict-word-group]");
+}
+
+function extractDictionaryCueRangeFromElement(wordEl) {
+  if (!(wordEl instanceof HTMLElement)) {
+    return null;
+  }
+  const startMs = Number(wordEl.dataset.dictCueStartMs);
+  const endMs = Number(wordEl.dataset.dictCueEndMs);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return null;
+  }
+  return {
+    startMs: Math.max(0, Math.round(startMs)),
+    endMs: Math.round(endMs),
+  };
+}
+
+function updateDictionaryPopupCueRange(wordEl = null) {
+  const explicitRange = extractDictionaryCueRangeFromElement(wordEl);
+  if (explicitRange) {
+    state.dictPopupCueStartMs = explicitRange.startMs;
+    state.dictPopupCueEndMs = Math.max(
+      explicitRange.startMs + DICT_HOVER_LOOP_MIN_MS,
+      explicitRange.endMs
+    );
+    return;
+  }
   const cue = currentCueOrFallback();
   const cueStartMs = Number(cue.start_ms);
   const cueEndMs = Number(cue.end_ms);
@@ -1107,14 +1301,17 @@ function hideSubtitleDictionaryPopup() {
   clearDictionaryPopupHideTimer();
   stopDictionaryHoverLoop();
   state.dictPopupWord = "";
+  state.dictPopupAnchorEl = null;
+  state.dictPopupContextRootEl = null;
   state.dictPopupCueStartMs = null;
   state.dictPopupCueEndMs = null;
+  if (elements.subtitleDictBridge) {
+    elements.subtitleDictBridge.classList.add("hidden");
+    elements.subtitleDictBridge.setAttribute("aria-hidden", "true");
+  }
   elements.subtitleDictPopup.classList.add("hidden");
   elements.subtitleDictPopup.setAttribute("aria-hidden", "true");
-  const activeWord = elements.subtitleOverlay.querySelector(".subtitle-word.active");
-  if (activeWord) {
-    activeWord.classList.remove("active");
-  }
+  clearActiveDictionaryWord();
 }
 
 function scheduleHideSubtitleDictionaryPopup() {
@@ -1147,6 +1344,36 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   elements.subtitleDictPopup.style.left = `${clampedCenterX.toFixed(1)}px`;
   elements.subtitleDictPopup.style.top = `${top.toFixed(1)}px`;
   elements.subtitleDictPopup.style.transform = `translate(-50%, ${translateY})`;
+
+  if (!elements.subtitleDictBridge) {
+    return;
+  }
+  const anchorCenterX = anchorRect.left - shellRect.left + (anchorRect.width / 2);
+  const anchorEdgeY = placeBelow
+    ? (anchorRect.bottom - shellRect.top)
+    : (anchorRect.top - shellRect.top);
+  const popupEdgeY = top;
+  const horizontalPadding = Math.max(20, Math.round(anchorRect.width * 0.6));
+  const bridgeLeft = Math.max(4, Math.min(anchorCenterX, clampedCenterX) - horizontalPadding);
+  const bridgeRight = Math.min(
+    shellRect.width - 4,
+    Math.max(anchorCenterX, clampedCenterX) + horizontalPadding
+  );
+  const bridgeTop = Math.min(anchorEdgeY, popupEdgeY) - 2;
+  const bridgeBottom = Math.max(anchorEdgeY, popupEdgeY) + 2;
+  const bridgeWidth = Math.max(0, bridgeRight - bridgeLeft);
+  const bridgeHeight = Math.max(0, bridgeBottom - bridgeTop);
+  if (bridgeWidth < 4 || bridgeHeight < 4) {
+    elements.subtitleDictBridge.classList.add("hidden");
+    elements.subtitleDictBridge.setAttribute("aria-hidden", "true");
+    return;
+  }
+  elements.subtitleDictBridge.style.left = `${bridgeLeft.toFixed(1)}px`;
+  elements.subtitleDictBridge.style.top = `${bridgeTop.toFixed(1)}px`;
+  elements.subtitleDictBridge.style.width = `${bridgeWidth.toFixed(1)}px`;
+  elements.subtitleDictBridge.style.height = `${bridgeHeight.toFixed(1)}px`;
+  elements.subtitleDictBridge.classList.remove("hidden");
+  elements.subtitleDictBridge.setAttribute("aria-hidden", "false");
 }
 
 function groupDictionaryRows(rows) {
@@ -1606,7 +1833,12 @@ function deriveDictionaryCoreTerms(baseTerm) {
 function buildDictionaryLookupTerms(wordEl, baseTerm) {
   const terms = [];
   const seen = new Set();
-  const wordNodes = Array.from(elements.subtitleOverlay.querySelectorAll(".subtitle-word"));
+  const contextRoot = (
+    resolveDictionaryContextRoot(wordEl)
+    || state.dictPopupContextRootEl
+    || elements.subtitleOverlay
+  );
+  const wordNodes = Array.from(contextRoot.querySelectorAll(".subtitle-word"));
   const index = wordNodes.indexOf(wordEl);
   const words = wordNodes.map((node) => String(node.dataset.dictTerm || node.textContent || "").trim());
   const coreTerms = deriveDictionaryCoreTerms(baseTerm);
@@ -1993,6 +2225,69 @@ async function lookupDictionaryWithContext(wordEl, baseTerm) {
   };
 }
 
+function renderDictionaryWordsIntoElement(element, text, options = {}) {
+  if (!(element instanceof HTMLElement)) {
+    return false;
+  }
+  const value = String(text || "").trim();
+  element.textContent = "";
+  if (!value) {
+    element.removeAttribute("data-dict-word-group");
+    return false;
+  }
+
+  state.dictWordGroupCounter += 1;
+  const groupId = `dict-word-group-${state.dictWordGroupCounter}`;
+  element.dataset.dictWordGroup = groupId;
+
+  const cueStartMsRaw = Number(options.cueStartMs);
+  const cueEndMsRaw = Number(options.cueEndMs);
+  const hasCueRange = (
+    Number.isFinite(cueStartMsRaw)
+    && Number.isFinite(cueEndMsRaw)
+    && cueEndMsRaw > cueStartMsRaw
+  );
+  const cueStartMs = hasCueRange ? Math.max(0, Math.round(cueStartMsRaw)) : null;
+  const cueEndMs = hasCueRange ? Math.round(cueEndMsRaw) : null;
+
+  SUBTITLE_WORD_PATTERN.lastIndex = 0;
+  const fragment = document.createDocumentFragment();
+  let cursor = 0;
+  let hasWord = false;
+  let match = SUBTITLE_WORD_PATTERN.exec(value);
+  while (match) {
+    const [word] = match;
+    const start = match.index;
+    const end = start + word.length;
+    if (start > cursor) {
+      fragment.appendChild(document.createTextNode(value.slice(cursor, start)));
+    }
+    const span = document.createElement("span");
+    span.className = "subtitle-word";
+    span.dataset.dictTerm = word;
+    span.dataset.dictWordGroup = groupId;
+    if (hasCueRange && cueStartMs !== null && cueEndMs !== null) {
+      span.dataset.dictCueStartMs = String(cueStartMs);
+      span.dataset.dictCueEndMs = String(cueEndMs);
+    }
+    span.textContent = word;
+    fragment.appendChild(span);
+    cursor = end;
+    hasWord = true;
+    match = SUBTITLE_WORD_PATTERN.exec(value);
+  }
+  if (cursor < value.length) {
+    fragment.appendChild(document.createTextNode(value.slice(cursor)));
+  }
+  if (!hasWord) {
+    element.textContent = value;
+    element.removeAttribute("data-dict-word-group");
+    return false;
+  }
+  element.appendChild(fragment);
+  return true;
+}
+
 async function showSubtitleDictionaryForWord(wordEl) {
   if (!wordEl) {
     return;
@@ -2003,11 +2298,10 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
-  updateDictionaryPopupCueRange();
-  const previousActive = elements.subtitleOverlay.querySelector(".subtitle-word.active");
-  if (previousActive && previousActive !== wordEl) {
-    previousActive.classList.remove("active");
-  }
+  state.dictPopupAnchorEl = wordEl;
+  state.dictPopupContextRootEl = resolveDictionaryContextRoot(wordEl);
+  updateDictionaryPopupCueRange(wordEl);
+  clearActiveDictionaryWord(wordEl);
   wordEl.classList.add("active");
   renderSubtitleDictionaryPopupLoading(term, wordEl);
 
@@ -2029,7 +2323,14 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
 }
 
-function handleSubtitleOverlayPointerOver(event) {
+function isDictionaryHoverSafeTarget(nextElement) {
+  if (!(nextElement instanceof Element)) {
+    return false;
+  }
+  return Boolean(nextElement.closest(".subtitle-word, #subtitleDictPopup, #subtitleDictBridge"));
+}
+
+function handleDictionaryWordPointerOver(event) {
   const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
   if (!(target instanceof HTMLElement)) {
     return;
@@ -2037,54 +2338,27 @@ function handleSubtitleOverlayPointerOver(event) {
   showSubtitleDictionaryForWord(target).catch((error) => setStatus(error.message, "error"));
 }
 
-function handleSubtitleOverlayPointerOut(event) {
+function handleDictionaryWordPointerOut(event) {
   const fromWord = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
   if (!fromWord) {
     return;
   }
   const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
-  if (nextElement && (nextElement.closest(".subtitle-word") || nextElement.closest("#subtitleDictPopup"))) {
+  if (isDictionaryHoverSafeTarget(nextElement)) {
     return;
   }
   scheduleHideSubtitleDictionaryPopup();
 }
 
 function renderSubtitleOverlayText(text) {
-  const value = String(text || "").trim();
-  hideSubtitleDictionaryPopup();
-  elements.subtitleOverlay.textContent = "";
-  if (!value) {
-    return;
+  const popupAnchorInOverlay = (
+    state.dictPopupAnchorEl instanceof Element
+    && Boolean(state.dictPopupAnchorEl.closest("#subtitleOverlay"))
+  );
+  if (popupAnchorInOverlay) {
+    hideSubtitleDictionaryPopup();
   }
-  SUBTITLE_WORD_PATTERN.lastIndex = 0;
-  const fragment = document.createDocumentFragment();
-  let cursor = 0;
-  let hasWord = false;
-  let match = SUBTITLE_WORD_PATTERN.exec(value);
-  while (match) {
-    const [word] = match;
-    const start = match.index;
-    const end = start + word.length;
-    if (start > cursor) {
-      fragment.appendChild(document.createTextNode(value.slice(cursor, start)));
-    }
-    const span = document.createElement("span");
-    span.className = "subtitle-word";
-    span.dataset.dictTerm = word;
-    span.textContent = word;
-    fragment.appendChild(span);
-    cursor = end;
-    hasWord = true;
-    match = SUBTITLE_WORD_PATTERN.exec(value);
-  }
-  if (cursor < value.length) {
-    fragment.appendChild(document.createTextNode(value.slice(cursor)));
-  }
-  if (!hasWord) {
-    elements.subtitleOverlay.textContent = value;
-    return;
-  }
-  elements.subtitleOverlay.appendChild(fragment);
+  renderDictionaryWordsIntoElement(elements.subtitleOverlay, text);
 }
 
 function clearSubtitleOverlay(message = "字幕がありません") {
@@ -2387,7 +2661,10 @@ function renderSubtitlePanelReel() {
     const enLine = document.createElement("p");
     enLine.className = "subtitle-panel-line en";
     if (row.en_text) {
-      enLine.textContent = row.en_text;
+      renderDictionaryWordsIntoElement(enLine, row.en_text, {
+        cueStartMs: row.start_ms,
+        cueEndMs: row.end_ms,
+      });
     } else {
       enLine.classList.add("missing");
       enLine.textContent = "（英語字幕なし）";
@@ -2979,7 +3256,15 @@ function renderBookmarkList() {
     time.textContent = `${startLabel} - ${endLabel}`;
 
     const text = document.createElement("p");
-    text.textContent = bookmark.text || "(字幕テキストなし)";
+    text.className = "bookmark-item-text";
+    if (bookmark.text) {
+      renderDictionaryWordsIntoElement(text, bookmark.text, {
+        cueStartMs: bookmark.start_ms,
+        cueEndMs: bookmark.end_ms,
+      });
+    } else {
+      text.textContent = "(字幕テキストなし)";
+    }
 
     const meta = document.createElement("p");
     meta.className = "meta";
@@ -3047,6 +3332,7 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   const video = currentVideo();
   elements.videoPlayer.src = video.media_url;
   elements.videoPlayer.load();
+  updateVideoProgressTimer();
   updateUrlVideoSelection(video.source_id, video.video_id);
 
   renderVideoMeta(video);
@@ -3069,6 +3355,7 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   updateMuteButtonLabel();
   updatePlayPauseButton();
   setStatus(`動画を表示中: ${video.source_id} (${state.index + 1}/${state.videos.length})`);
+  schedulePhoneShellSnapCheck();
 }
 
 async function loadFeed(
@@ -3126,6 +3413,8 @@ async function loadFeed(
   if (!state.videos.length) {
     elements.videoPlayer.removeAttribute("src");
     elements.videoPlayer.load();
+    updateVideoProgressTimer();
+    releasePlayerCardSnapLock(false);
     updateUrlVideoSelection(sourceId, "");
     state.playbackHistory = [];
     state.historyPointer = -1;
@@ -3413,7 +3702,7 @@ function toggleDictionaryHoverLoopMode() {
 
 function handleWheel(event) {
   const target = event.target instanceof Element ? event.target : null;
-  if (target && target.closest("#subtitleDictPopup")) {
+  if (target && target.closest("#subtitleDictPopup, #subtitleDictBridge")) {
     clearDictionaryPopupHideTimer();
     return;
   }
@@ -3678,7 +3967,7 @@ function bindEvents() {
     const clickedElement = event.target instanceof Element ? event.target : null;
     if (
       clickedElement &&
-      clickedElement.closest("button, input, select, textarea, a, label, .subtitle-word, .subtitle-dict-popup")
+      clickedElement.closest("button, input, select, textarea, a, label, .subtitle-word, .subtitle-dict-popup, .subtitle-dict-bridge")
     ) {
       return;
     }
@@ -3688,22 +3977,48 @@ function bindEvents() {
     }
     togglePlayPause();
   });
-  elements.subtitleOverlay.addEventListener("pointerover", handleSubtitleOverlayPointerOver);
-  elements.subtitleOverlay.addEventListener("pointerout", handleSubtitleOverlayPointerOut);
+  elements.subtitleOverlay.addEventListener("pointerover", handleDictionaryWordPointerOver);
+  elements.subtitleOverlay.addEventListener("pointerout", handleDictionaryWordPointerOut);
   elements.subtitleOverlay.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest(".subtitle-word") : null;
     if (target) {
       event.stopPropagation();
     }
   });
+  if (elements.subtitlePanelReel) {
+    elements.subtitlePanelReel.addEventListener("pointerover", handleDictionaryWordPointerOver);
+    elements.subtitlePanelReel.addEventListener("pointerout", handleDictionaryWordPointerOut);
+  }
+  if (elements.bookmarkList) {
+    elements.bookmarkList.addEventListener("pointerover", handleDictionaryWordPointerOver);
+    elements.bookmarkList.addEventListener("pointerout", handleDictionaryWordPointerOut);
+  }
   elements.subtitleDictPopup.addEventListener("pointerenter", () => {
     clearDictionaryPopupHideTimer();
     startDictionaryHoverLoop();
   });
-  elements.subtitleDictPopup.addEventListener("pointerleave", () => {
+  elements.subtitleDictPopup.addEventListener("pointerleave", (event) => {
+    const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+    if (isDictionaryHoverSafeTarget(nextElement)) {
+      return;
+    }
     stopDictionaryHoverLoop();
     scheduleHideSubtitleDictionaryPopup();
   });
+  if (elements.subtitleDictBridge) {
+    elements.subtitleDictBridge.addEventListener("pointerenter", () => {
+      clearDictionaryPopupHideTimer();
+      startDictionaryHoverLoop();
+    });
+    elements.subtitleDictBridge.addEventListener("pointerleave", (event) => {
+      const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+      if (isDictionaryHoverSafeTarget(nextElement)) {
+        return;
+      }
+      stopDictionaryHoverLoop();
+      scheduleHideSubtitleDictionaryPopup();
+    });
+  }
   elements.subtitleDictPopup.addEventListener("click", (event) => event.stopPropagation());
   elements.subtitleDictPopup.addEventListener(
     "wheel",
@@ -3759,6 +4074,11 @@ function bindEvents() {
     elements.subtitlePanelReel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target) {
+        return;
+      }
+      const dictionaryWord = target.closest(".subtitle-word");
+      if (dictionaryWord) {
+        event.stopPropagation();
         return;
       }
       const bookmarkButton = target.closest(".subtitle-panel-bookmark-btn");
@@ -3996,21 +4316,34 @@ function bindEvents() {
   });
 
   elements.videoPlayer.addEventListener("timeupdate", () => {
+    updateVideoProgressTimer();
     enforceDictionaryHoverLoop();
     updateSubtitleFromPlayback();
   });
   elements.videoPlayer.addEventListener("play", () => {
     closeLyricReel();
+    updateVideoProgressTimer();
     updatePlayPauseButton();
   });
   elements.videoPlayer.addEventListener("pause", () => {
     stopDictionaryHoverLoop();
+    updateVideoProgressTimer();
     updatePlayPauseButton();
+  });
+  elements.videoPlayer.addEventListener("loadedmetadata", () => {
+    updateVideoProgressTimer();
+  });
+  elements.videoPlayer.addEventListener("durationchange", () => {
+    updateVideoProgressTimer();
+  });
+  elements.videoPlayer.addEventListener("seeked", () => {
+    updateVideoProgressTimer();
   });
   elements.videoPlayer.addEventListener("volumechange", () => {
     updateMuteButtonLabel();
   });
   elements.videoPlayer.addEventListener("ended", () => {
+    updateVideoProgressTimer();
     if (!state.autoplayContinuous) {
       return;
     }
@@ -4029,6 +4362,14 @@ function bindEvents() {
   bindTouchNavigation();
   document.addEventListener("keydown", handleKeydown);
   document.addEventListener("keydown", resetControlsToggleFade);
+  window.addEventListener("scroll", () => {
+    schedulePhoneShellSnapCheck();
+  }, { passive: true });
+  window.addEventListener("resize", () => {
+    releasePlayerCardSnapLock(false);
+    schedulePhoneShellSnapCheck();
+  }, { passive: true });
+  window.addEventListener("wheel", handleWindowWheelForPlayerSnap, { passive: false });
 }
 
 async function initialize() {
@@ -4042,6 +4383,7 @@ async function initialize() {
   updateTranslationFilterSelect();
   updateSubtitlePanelModeButtons();
   loadVolumeSettings();
+  updateVideoProgressTimer();
   updatePlayPauseButton();
   bindEvents();
 
@@ -4058,6 +4400,7 @@ async function initialize() {
       initialSelection.videoId,
       state.translationFilter
     );
+    schedulePhoneShellSnapCheck();
     setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
   } catch (error) {
     setStatus(error.message, "error");

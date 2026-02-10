@@ -254,6 +254,17 @@ Acceptance:
 - Hover dictionary opens from overlay/reel/bookmark consistently.
 - Moving pointer from word to popup does not collapse/switch lookup unexpectedly.
 
+Status (2026-02-10):
+
+- Implemented:
+  - video-card progress timer
+  - viewport snap + release resistance
+  - transparent hover bridge between word and popup
+  - hover dictionary hooks in subtitle reel and saved bookmarks
+- Needs polish:
+  - hover dictionary behavior in non-overlay cards (subtitle reel/bookmark) still has UX tuning room
+  - keep tuning hover stability/intent detection before marking this block fully done
+
 ### 0) Done / baseline
 
 - EIJIRO dictionary indexing (`dict-index`) + hover lookup + collocation ranking.
