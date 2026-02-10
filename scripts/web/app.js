@@ -122,6 +122,7 @@ const state = {
   dictPopupHideTimer: null,
   dictLookupRequestId: 0,
   dictPopupWord: "",
+  dictPopupSource: "",
   dictPopupAnchorEl: null,
   dictPopupContextRootEl: null,
   dictPopupCueStartMs: null,
@@ -1204,6 +1205,26 @@ function resolveDictionaryContextRoot(wordEl) {
   return wordEl.closest("[data-dict-word-group]");
 }
 
+function resolveDictionarySource(wordEl) {
+  if (!(wordEl instanceof HTMLElement)) {
+    return "";
+  }
+  const sourceHolder = wordEl.closest("[data-dict-source]");
+  const source = String(sourceHolder?.dataset?.dictSource || "").trim();
+  if (source === "overlay" || source === "reel" || source === "bookmark") {
+    return source;
+  }
+  return "";
+}
+
+function isDictionaryPopupVisible() {
+  return !elements.subtitleDictPopup.classList.contains("hidden");
+}
+
+function shouldSuspendSubtitlePanelAutoCenterForDictionary() {
+  return isDictionaryPopupVisible() && state.dictPopupSource === "reel";
+}
+
 function extractDictionaryCueRangeFromElement(wordEl) {
   if (!(wordEl instanceof HTMLElement)) {
     return null;
@@ -1301,6 +1322,7 @@ function hideSubtitleDictionaryPopup() {
   clearDictionaryPopupHideTimer();
   stopDictionaryHoverLoop();
   state.dictPopupWord = "";
+  state.dictPopupSource = "";
   state.dictPopupAnchorEl = null;
   state.dictPopupContextRootEl = null;
   state.dictPopupCueStartMs = null;
@@ -1322,23 +1344,44 @@ function scheduleHideSubtitleDictionaryPopup() {
 }
 
 function positionSubtitleDictionaryPopup(anchorEl) {
-  if (!anchorEl || !elements.subtitleDictPopup || elements.subtitleDictPopup.classList.contains("hidden")) {
+  if (
+    !anchorEl
+    || !elements.subtitleDictPopup
+    || elements.subtitleDictPopup.classList.contains("hidden")
+    || !document.body.contains(anchorEl)
+  ) {
     return;
   }
-  const shellRect = elements.phoneShell.getBoundingClientRect();
   const anchorRect = anchorEl.getBoundingClientRect();
   const popupRect = elements.subtitleDictPopup.getBoundingClientRect();
-
-  const centerX = anchorRect.left - shellRect.left + (anchorRect.width / 2);
-  const minCenterX = (popupRect.width / 2) + 8;
-  const maxCenterX = shellRect.width - (popupRect.width / 2) - 8;
+  const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    return;
+  }
+  const centerX = anchorRect.left + (anchorRect.width / 2);
+  const minCenterX = (popupRect.width / 2) + 10;
+  const maxCenterX = viewportWidth - (popupRect.width / 2) - 10;
   const clampedCenterX = Math.max(minCenterX, Math.min(maxCenterX, centerX));
 
-  const spaceAbove = anchorRect.top - shellRect.top;
-  const placeBelow = spaceAbove < (popupRect.height + 16);
-  const top = placeBelow
-    ? (anchorRect.bottom - shellRect.top + 10)
-    : (anchorRect.top - shellRect.top - 10);
+  const gap = 10;
+  const spaceAbove = anchorRect.top - gap;
+  const spaceBelow = viewportHeight - anchorRect.bottom - gap;
+  let placeBelow = spaceAbove < (popupRect.height + 16);
+  if (spaceBelow < (popupRect.height + 16) && spaceAbove > spaceBelow) {
+    placeBelow = false;
+  }
+  let top = placeBelow
+    ? anchorRect.bottom + gap
+    : anchorRect.top - gap;
+  if (placeBelow) {
+    const maxTop = viewportHeight - popupRect.height - 8;
+    top = Math.max(8, Math.min(maxTop, top));
+  } else {
+    const minBottom = popupRect.height + 8;
+    const maxBottom = viewportHeight - 8;
+    top = Math.max(minBottom, Math.min(maxBottom, top));
+  }
   const translateY = placeBelow ? "0%" : "-100%";
 
   elements.subtitleDictPopup.style.left = `${clampedCenterX.toFixed(1)}px`;
@@ -1348,15 +1391,15 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   if (!elements.subtitleDictBridge) {
     return;
   }
-  const anchorCenterX = anchorRect.left - shellRect.left + (anchorRect.width / 2);
+  const anchorCenterX = anchorRect.left + (anchorRect.width / 2);
   const anchorEdgeY = placeBelow
-    ? (anchorRect.bottom - shellRect.top)
-    : (anchorRect.top - shellRect.top);
+    ? anchorRect.bottom
+    : anchorRect.top;
   const popupEdgeY = top;
   const horizontalPadding = Math.max(20, Math.round(anchorRect.width * 0.6));
-  const bridgeLeft = Math.max(4, Math.min(anchorCenterX, clampedCenterX) - horizontalPadding);
+  const bridgeLeft = Math.max(6, Math.min(anchorCenterX, clampedCenterX) - horizontalPadding);
   const bridgeRight = Math.min(
-    shellRect.width - 4,
+    viewportWidth - 6,
     Math.max(anchorCenterX, clampedCenterX) + horizontalPadding
   );
   const bridgeTop = Math.min(anchorEdgeY, popupEdgeY) - 2;
@@ -1374,6 +1417,17 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   elements.subtitleDictBridge.style.height = `${bridgeHeight.toFixed(1)}px`;
   elements.subtitleDictBridge.classList.remove("hidden");
   elements.subtitleDictBridge.setAttribute("aria-hidden", "false");
+}
+
+function repositionActiveDictionaryPopup() {
+  if (!isDictionaryPopupVisible()) {
+    return;
+  }
+  if (!(state.dictPopupAnchorEl instanceof Element) || !document.body.contains(state.dictPopupAnchorEl)) {
+    hideSubtitleDictionaryPopup();
+    return;
+  }
+  positionSubtitleDictionaryPopup(state.dictPopupAnchorEl);
 }
 
 function groupDictionaryRows(rows) {
@@ -2233,12 +2287,19 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
   element.textContent = "";
   if (!value) {
     element.removeAttribute("data-dict-word-group");
+    element.removeAttribute("data-dict-source");
     return false;
   }
 
   state.dictWordGroupCounter += 1;
   const groupId = `dict-word-group-${state.dictWordGroupCounter}`;
   element.dataset.dictWordGroup = groupId;
+  const source = String(options.source || "").trim().toLowerCase();
+  if (source === "overlay" || source === "reel" || source === "bookmark") {
+    element.dataset.dictSource = source;
+  } else {
+    element.removeAttribute("data-dict-source");
+  }
 
   const cueStartMsRaw = Number(options.cueStartMs);
   const cueEndMsRaw = Number(options.cueEndMs);
@@ -2266,6 +2327,9 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
     span.className = "subtitle-word";
     span.dataset.dictTerm = word;
     span.dataset.dictWordGroup = groupId;
+    if (source) {
+      span.dataset.dictSource = source;
+    }
     if (hasCueRange && cueStartMs !== null && cueEndMs !== null) {
       span.dataset.dictCueStartMs = String(cueStartMs);
       span.dataset.dictCueEndMs = String(cueEndMs);
@@ -2282,6 +2346,7 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
   if (!hasWord) {
     element.textContent = value;
     element.removeAttribute("data-dict-word-group");
+    element.removeAttribute("data-dict-source");
     return false;
   }
   element.appendChild(fragment);
@@ -2298,6 +2363,7 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
+  state.dictPopupSource = resolveDictionarySource(wordEl);
   state.dictPopupAnchorEl = wordEl;
   state.dictPopupContextRootEl = resolveDictionaryContextRoot(wordEl);
   updateDictionaryPopupCueRange(wordEl);
@@ -2358,7 +2424,7 @@ function renderSubtitleOverlayText(text) {
   if (popupAnchorInOverlay) {
     hideSubtitleDictionaryPopup();
   }
-  renderDictionaryWordsIntoElement(elements.subtitleOverlay, text);
+  renderDictionaryWordsIntoElement(elements.subtitleOverlay, text, { source: "overlay" });
 }
 
 function clearSubtitleOverlay(message = "字幕がありません") {
@@ -2664,6 +2730,7 @@ function renderSubtitlePanelReel() {
       renderDictionaryWordsIntoElement(enLine, row.en_text, {
         cueStartMs: row.start_ms,
         cueEndMs: row.end_ms,
+        source: "reel",
       });
     } else {
       enLine.classList.add("missing");
@@ -2725,7 +2792,11 @@ function updateSubtitlePanelActiveFromPlayback(options = {}) {
     if (next) {
       next.classList.add("active");
     }
-    if (state.subtitlePanelAutoCenter || force) {
+    const shouldAutoCenter = (
+      (state.subtitlePanelAutoCenter || force)
+      && !shouldSuspendSubtitlePanelAutoCenterForDictionary()
+    );
+    if (shouldAutoCenter) {
       scrollSubtitlePanelRowIntoCenter(nextIndex, smooth, force);
     }
   }
@@ -3138,11 +3209,11 @@ function updateSubtitleFromPlayback() {
   state.activeCueIndex = index;
   if (index < 0) {
     renderSubtitleOverlayText("...");
-    updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
+    updateSubtitlePanelActiveFromPlayback({ smooth: true });
     return;
   }
   renderSubtitleOverlayText(state.cues[index].text);
-  updateSubtitlePanelActiveFromPlayback({ smooth: true, force: true });
+  updateSubtitlePanelActiveFromPlayback({ smooth: true });
 }
 
 function clearCountdown() {
@@ -3261,6 +3332,7 @@ function renderBookmarkList() {
       renderDictionaryWordsIntoElement(text, bookmark.text, {
         cueStartMs: bookmark.start_ms,
         cueEndMs: bookmark.end_ms,
+        source: "bookmark",
       });
     } else {
       text.textContent = "(字幕テキストなし)";
@@ -4047,6 +4119,7 @@ function bindEvents() {
         if (event.deltaX !== 0) {
           elements.bookmarkList.scrollLeft += event.deltaX;
         }
+        repositionActiveDictionaryPopup();
       },
       { passive: false }
     );
@@ -4070,6 +4143,7 @@ function bindEvents() {
       if (!state.subtitlePanelProgrammaticScroll) {
         detachSubtitlePanelAutoCenter();
       }
+      repositionActiveDictionaryPopup();
     });
     elements.subtitlePanelReel.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
@@ -4363,9 +4437,11 @@ function bindEvents() {
   document.addEventListener("keydown", handleKeydown);
   document.addEventListener("keydown", resetControlsToggleFade);
   window.addEventListener("scroll", () => {
+    repositionActiveDictionaryPopup();
     schedulePhoneShellSnapCheck();
   }, { passive: true });
   window.addEventListener("resize", () => {
+    repositionActiveDictionaryPopup();
     releasePlayerCardSnapLock(false);
     schedulePhoneShellSnapCheck();
   }, { passive: true });
