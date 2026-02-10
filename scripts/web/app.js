@@ -22,6 +22,7 @@ const DICT_PREFETCH_BATCH_SIZE = 12;
 const DICT_PREFETCH_BATCH_DELAY_MS = 32;
 const DICT_PREFETCH_START_DELAY_MS = 90;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
+const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
@@ -90,6 +91,13 @@ const state = {
   subtitlePanelAutoCenter: true,
   subtitlePanelProgrammaticScroll: false,
   subtitlePanelProgrammaticScrollTimer: null,
+  subtitlePanelMode: (() => {
+    const stored = String(localStorage.getItem("substudy.subtitle_panel_mode") || "").trim().toLowerCase();
+    if (SUBTITLE_PANEL_MODES.has(stored)) {
+      return stored;
+    }
+    return "en_ja";
+  })(),
   bookmarks: [],
   countdownTimer: null,
   countdownRemaining: 0,
@@ -160,6 +168,8 @@ const elements = {
   muteBtn: document.getElementById("muteBtn"),
   volumeSlider: document.getElementById("volumeSlider"),
   playerActions: document.querySelector(".player-actions"),
+  subtitlePanelModeEnOnlyBtn: document.getElementById("subtitlePanelModeEnOnlyBtn"),
+  subtitlePanelModeEnJaBtn: document.getElementById("subtitlePanelModeEnJaBtn"),
   subtitlePanelReel: document.getElementById("subtitlePanelReel"),
   trackSelect: document.getElementById("trackSelect"),
   bookmarkCueBtn: document.getElementById("bookmarkCueBtn"),
@@ -473,6 +483,43 @@ function normalizeTranslationFilter(value, fallback = "all") {
     : "all";
 }
 
+function normalizeSubtitlePanelMode(value, fallback = "en_ja") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (SUBTITLE_PANEL_MODES.has(normalized)) {
+    return normalized;
+  }
+  return SUBTITLE_PANEL_MODES.has(String(fallback || "").trim().toLowerCase())
+    ? String(fallback).trim().toLowerCase()
+    : "en_ja";
+}
+
+function updateSubtitlePanelModeButtons() {
+  if (!elements.subtitlePanelModeEnOnlyBtn || !elements.subtitlePanelModeEnJaBtn) {
+    return;
+  }
+  const mode = normalizeSubtitlePanelMode(state.subtitlePanelMode, "en_ja");
+  elements.subtitlePanelModeEnOnlyBtn.classList.toggle("active", mode === "en_only");
+  elements.subtitlePanelModeEnJaBtn.classList.toggle("active", mode === "en_ja");
+}
+
+function setSubtitlePanelMode(mode, options = {}) {
+  const normalizedMode = normalizeSubtitlePanelMode(mode, state.subtitlePanelMode);
+  const { persist = true, rerender = true } = options;
+  if (state.subtitlePanelMode === normalizedMode) {
+    updateSubtitlePanelModeButtons();
+    return;
+  }
+  state.subtitlePanelMode = normalizedMode;
+  if (persist) {
+    localStorage.setItem("substudy.subtitle_panel_mode", normalizedMode);
+  }
+  updateSubtitlePanelModeButtons();
+  if (rerender) {
+    renderSubtitlePanelReel();
+    updateSubtitlePanelActiveFromPlayback({ smooth: false, force: true });
+  }
+}
+
 function hasJaSubtitleTrack(video) {
   const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
   return tracks.some((track) => {
@@ -561,6 +608,53 @@ function truncateText(value, maxLength = 120) {
     return text;
   }
   return `${text.slice(0, maxLength)}...`;
+}
+
+function decodeTrackPathToken(token) {
+  const value = String(token || "").trim();
+  if (!value) {
+    return "";
+  }
+  let normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  while (normalized.length % 4 !== 0) {
+    normalized += "=";
+  }
+  try {
+    return atob(normalized);
+  } catch (_error) {
+    return "";
+  }
+}
+
+function extractPathBasename(pathValue) {
+  const normalized = String(pathValue || "").trim().replace(/\\/g, "/");
+  if (!normalized) {
+    return "";
+  }
+  const segments = normalized.split("/");
+  return segments[segments.length - 1] || normalized;
+}
+
+function formatBookmarkTrackLabel(trackValue) {
+  const raw = String(trackValue || "").trim();
+  if (!raw) {
+    return "track: none";
+  }
+  const separatorIndex = raw.indexOf(":");
+  if (separatorIndex <= 0) {
+    return truncateText(raw, 56);
+  }
+  const kind = raw.slice(0, separatorIndex);
+  const token = raw.slice(separatorIndex + 1);
+  const decodedPath = decodeTrackPathToken(token);
+  if (!decodedPath) {
+    return kind;
+  }
+  const basename = extractPathBasename(decodedPath);
+  if (!basename) {
+    return kind;
+  }
+  return `${kind}:${truncateText(basename, 52)}`;
 }
 
 function parseJumpIndex(queryText) {
@@ -2155,14 +2249,14 @@ function buildSubtitlePanelRows(primaryCues, jaCues) {
   return rows;
 }
 
-function isSubtitlePanelRowBookmarked(row) {
+function getSubtitlePanelRowBookmarkMatches(row) {
   if (!row) {
-    return false;
+    return [];
   }
   const rowTrackId = String(state.subtitlePanelPrimaryTrackId || state.currentTrackId || "");
   const rowStart = Math.round(Number(row.start_ms) || 0);
   const rowEnd = Math.round(Number(row.end_ms) || rowStart);
-  return state.bookmarks.some((bookmark) => {
+  return state.bookmarks.filter((bookmark) => {
     const bookmarkStart = Math.round(Number(bookmark.start_ms) || 0);
     const bookmarkEnd = Math.round(Number(bookmark.end_ms) || bookmarkStart);
     const bookmarkTrack = String(bookmark.track || "");
@@ -2173,6 +2267,10 @@ function isSubtitlePanelRowBookmarked(row) {
     const endClose = Math.abs(bookmarkEnd - rowEnd) <= 160;
     return startClose && endClose;
   });
+}
+
+function isSubtitlePanelRowBookmarked(row) {
+  return getSubtitlePanelRowBookmarkMatches(row).length > 0;
 }
 
 function updateSubtitlePanelBookmarkStates() {
@@ -2284,7 +2382,12 @@ function renderSubtitlePanelReel() {
 
     const enLine = document.createElement("p");
     enLine.className = "subtitle-panel-line en";
-    enLine.textContent = row.en_text || "(English cue unavailable)";
+    if (row.en_text) {
+      enLine.textContent = row.en_text;
+    } else {
+      enLine.classList.add("missing");
+      enLine.textContent = "（英語字幕なし）";
+    }
 
     const jaLine = document.createElement("p");
     jaLine.className = "subtitle-panel-line ja";
@@ -2294,7 +2397,8 @@ function renderSubtitlePanelReel() {
 
     rowEl.appendChild(head);
     rowEl.appendChild(enLine);
-    if (row.ja_text) {
+    const showJa = state.subtitlePanelMode === "en_ja";
+    if (showJa && row.ja_text) {
       rowEl.appendChild(jaLine);
     }
     elements.subtitlePanelReel.appendChild(rowEl);
@@ -2365,20 +2469,33 @@ function seekToSubtitlePanelRow(index) {
 
 async function bookmarkSubtitlePanelRow(index) {
   if (!Array.isArray(state.subtitlePanelRows) || index < 0 || index >= state.subtitlePanelRows.length) {
-    return;
+    return { status: "invalid" };
   }
   const row = state.subtitlePanelRows[index];
   if (!row) {
-    return;
+    return { status: "invalid" };
   }
-  if (isSubtitlePanelRowBookmarked(row)) {
-    setStatus("この字幕はすでに保存済みです。", "info");
-    return;
+  const matches = getSubtitlePanelRowBookmarkMatches(row);
+  if (matches.length) {
+    const uniqueBookmarkIds = [...new Set(
+      matches
+        .map((bookmark) => Number(bookmark?.id))
+        .filter((bookmarkId) => Number.isInteger(bookmarkId) && bookmarkId > 0)
+    )];
+    if (uniqueBookmarkIds.length) {
+      await Promise.all(uniqueBookmarkIds.map((bookmarkId) => (
+        apiRequest(`/api/bookmarks/${bookmarkId}`, { method: "DELETE" })
+      )));
+      await loadBookmarks();
+    }
+    setStatus("ブックマークを削除しました。", "ok");
+    return { status: "removed" };
   }
   const text = row.en_text || row.ja_text || "";
   await createBookmark(row.start_ms, row.end_ms, text, {
     trackId: state.subtitlePanelPrimaryTrackId || state.currentTrackId,
   });
+  return { status: "saved" };
 }
 
 async function fetchTrackCues(video, trackId) {
@@ -2854,7 +2971,7 @@ function renderBookmarkList() {
 
     const meta = document.createElement("p");
     meta.className = "meta";
-    meta.textContent = `${bookmark.track || "track: none"} • ${bookmark.created_at || ""}`;
+    meta.textContent = `${formatBookmarkTrackLabel(bookmark.track)} • ${bookmark.created_at || ""}`;
 
     const noteInput = document.createElement("textarea");
     noteInput.rows = 2;
@@ -3572,6 +3689,22 @@ function bindEvents() {
     },
     { passive: false }
   );
+  if (elements.bookmarkList) {
+    elements.bookmarkList.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.deltaY !== 0) {
+          elements.bookmarkList.scrollTop += event.deltaY;
+        }
+        if (event.deltaX !== 0) {
+          elements.bookmarkList.scrollLeft += event.deltaX;
+        }
+      },
+      { passive: false }
+    );
+  }
   if (elements.subtitlePanelReel) {
     elements.subtitlePanelReel.addEventListener(
       "wheel",
@@ -3603,7 +3736,30 @@ function bindEvents() {
         event.stopPropagation();
         const index = Number(bookmarkButton.dataset.index);
         if (Number.isInteger(index) && index >= 0) {
-          bookmarkSubtitlePanelRow(index).catch((error) => setStatus(error.message, "error"));
+          const row = state.subtitlePanelRows[index];
+          const wasSaved = isSubtitlePanelRowBookmarked(row);
+          const originalLabel = bookmarkButton.textContent;
+          bookmarkButton.disabled = true;
+          bookmarkButton.textContent = wasSaved ? "解除中..." : "保存中...";
+          bookmarkSubtitlePanelRow(index)
+            .then((result) => {
+              if (result?.status === "saved") {
+                bookmarkButton.textContent = "★ 保存済み";
+                bookmarkButton.classList.add("saved");
+              } else if (result?.status === "removed") {
+                bookmarkButton.textContent = "☆ 保存";
+                bookmarkButton.classList.remove("saved");
+              } else {
+                bookmarkButton.textContent = originalLabel;
+              }
+            })
+            .catch((error) => {
+              bookmarkButton.textContent = originalLabel;
+              setStatus(error.message, "error");
+            })
+            .finally(() => {
+              bookmarkButton.disabled = false;
+            });
           resetControlsToggleFade();
         }
         return;
@@ -3618,6 +3774,18 @@ function bindEvents() {
         return;
       }
       seekToSubtitlePanelRow(index);
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.subtitlePanelModeEnOnlyBtn) {
+    elements.subtitlePanelModeEnOnlyBtn.addEventListener("click", () => {
+      setSubtitlePanelMode("en_only");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.subtitlePanelModeEnJaBtn) {
+    elements.subtitlePanelModeEnJaBtn.addEventListener("click", () => {
+      setSubtitlePanelMode("en_ja");
       resetControlsToggleFade();
     });
   }
@@ -3840,6 +4008,7 @@ async function initialize() {
   updateNormalizationToggle();
   updateDictHoverLoopToggle();
   updateTranslationFilterSelect();
+  updateSubtitlePanelModeButtons();
   loadVolumeSettings();
   updatePlayPauseButton();
   bindEvents();

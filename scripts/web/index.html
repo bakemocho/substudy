@@ -88,7 +88,10 @@
               <span>再生字幕トラック</span>
               <select id="trackSelect"></select>
             </label>
-            <p class="hint">行クリックでシーク、右上ボタンでその字幕を保存。</p>
+            <div class="subtitle-panel-mode-toggle" role="group" aria-label="字幕表示モード">
+              <button id="subtitlePanelModeEnOnlyBtn" type="button">EN only</button>
+              <button id="subtitlePanelModeEnJaBtn" type="button">EN + JA</button>
+            </div>
             <div id="subtitlePanelReel" class="subtitle-panel-reel" aria-live="polite"></div>
             <details class="bookmark-inline-tools">
               <summary>手動ブックマーク操作</summary>
