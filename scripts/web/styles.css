@@ -253,6 +253,25 @@ body {
   transform: none;
   left: -9999px;
   top: -9999px;
+  transition: left 420ms cubic-bezier(0.16, 0.74, 0.22, 1), top 420ms cubic-bezier(0.16, 0.74, 0.22, 1);
+}
+
+.subtitle-dict-edges {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  z-index: 28;
+  overflow: visible;
+}
+
+.subtitle-dict-edge {
+  fill: none;
+  stroke: rgba(143, 201, 255, 0.55);
+  stroke-width: 1.35;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 5px rgba(85, 175, 245, 0.33));
 }
 
 .subtitle-dict-bridge {

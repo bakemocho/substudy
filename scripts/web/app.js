@@ -11,6 +11,7 @@ const SUBTITLE_PANEL_PROGRAMMATIC_SCROLL_RESET_MS = 720;
 const SUBTITLE_PANEL_AUTO_CENTER_RESTORE_IDLE_MS = 2600;
 const DICT_POPUP_HIDE_DELAY_MS = 160;
 const DICT_HOVER_LOOP_MIN_MS = 900;
+const DICT_GRAPH_TRACK_MS = 760;
 const DICT_CONTEXT_MAX_CANDIDATES = 9;
 const DICT_CONTEXT_PER_TERM_LIMIT = 4;
 const DICT_CONTEXT_TOTAL_LIMIT = 12;
@@ -135,6 +136,12 @@ const state = {
   dictPopupNodeElements: new Map(),
   dictPopupNodeRequests: new Map(),
   dictPopupRequestSeq: 0,
+  dictPinnedChildren: new Map(),
+  dictTransientChildren: new Map(),
+  dictPopupNodeLayout: new Map(),
+  dictHoveredNodeId: null,
+  dictGraphTrackFrame: null,
+  dictGraphTrackUntil: 0,
   dictTreeNodes: new Map(),
   dictTreeRootNodeId: null,
   dictTreeCurrentNodeId: null,
@@ -174,6 +181,7 @@ const elements = {
   videoProgressTimerFill: document.getElementById("videoProgressTimerFill"),
   subtitleOverlay: document.getElementById("subtitleOverlay"),
   subtitleDictBridge: document.getElementById("subtitleDictBridge"),
+  subtitleDictGraphEdges: document.getElementById("subtitleDictGraphEdges"),
   subtitleDictPopup: document.getElementById("subtitleDictPopup"),
   lyricReelOverlay: document.getElementById("lyricReelOverlay"),
   lyricReelList: document.getElementById("lyricReelList"),
@@ -1201,6 +1209,14 @@ function clearDictionaryPopupHideTimer() {
   }
 }
 
+function clearDictionaryGraphTrack() {
+  if (Number.isInteger(state.dictGraphTrackFrame)) {
+    window.cancelAnimationFrame(state.dictGraphTrackFrame);
+  }
+  state.dictGraphTrackFrame = null;
+  state.dictGraphTrackUntil = 0;
+}
+
 function setDictionaryPopupPinned(pinned) {
   const nextPinned = Boolean(pinned);
   state.dictPopupPinned = nextPinned;
@@ -1241,6 +1257,20 @@ function removeDictionaryPopupNodeElements() {
   state.dictPopupNodeElements = new Map();
 }
 
+function resolveDictionaryPopupNodeIdFromElement(popupEl) {
+  if (!(popupEl instanceof HTMLElement)) {
+    return null;
+  }
+  if (popupEl === elements.subtitleDictPopup) {
+    return Number.isInteger(state.dictTreeRootNodeId) ? state.dictTreeRootNodeId : null;
+  }
+  const nodeId = Number(popupEl.dataset.dictPopupNodeId);
+  if (!Number.isInteger(nodeId) || nodeId <= 0) {
+    return null;
+  }
+  return nodeId;
+}
+
 function bindDictionaryPopupElementEvents(popupEl) {
   if (!(popupEl instanceof HTMLElement) || popupEl.dataset.dictPopupEventsBound === "1") {
     return;
@@ -1249,11 +1279,18 @@ function bindDictionaryPopupElementEvents(popupEl) {
   popupEl.addEventListener("pointerover", handleDictionaryWordPointerOver);
   popupEl.addEventListener("pointerout", handleDictionaryWordPointerOut);
   popupEl.addEventListener("pointerenter", () => {
+    const hoveredNodeId = resolveDictionaryPopupNodeIdFromElement(popupEl);
+    if (Number.isInteger(hoveredNodeId) && hoveredNodeId > 0) {
+      state.dictHoveredNodeId = hoveredNodeId;
+    }
     clearDictionaryPopupHideTimer();
     startDictionaryHoverLoop();
   });
   popupEl.addEventListener("pointerleave", (event) => {
     const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
+    if (!nextElement || !nextElement.closest(".subtitle-dict-popup")) {
+      state.dictHoveredNodeId = null;
+    }
     if (isDictionaryHoverSafeTarget(nextElement)) {
       return;
     }
@@ -1355,7 +1392,12 @@ function retainDictionaryPopupPath(nodeId) {
 }
 
 function resetDictionaryTreeState() {
+  clearDictionaryGraphTrack();
   state.dictPopupNodeRequests = new Map();
+  state.dictPinnedChildren = new Map();
+  state.dictTransientChildren = new Map();
+  state.dictPopupNodeLayout = new Map();
+  state.dictHoveredNodeId = null;
   removeDictionaryPopupNodeElements();
   state.dictTreeNodes = new Map();
   state.dictTreeRootNodeId = null;
@@ -1394,6 +1436,8 @@ function createDictionaryTreeNode({ term, normalizedTerm, parentId = null, sourc
     parentId: parentNode ? parentNode.id : null,
     depth: parentNode ? parentNode.depth + 1 : 0,
     source: String(source || "").trim(),
+    lockedByClick: false,
+    transient: false,
     createdAt: Date.now(),
   };
   state.dictTreeNodes.set(id, node);
@@ -1416,13 +1460,175 @@ function findDictionaryTreeChild(parentId, normalizedTerm) {
   return null;
 }
 
-function ensureDictionaryTreeNodeForWord(wordEl, term) {
+function collectDictionaryDescendantIds(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return [];
+  }
+  const descendants = [];
+  const queue = [safeNodeId];
+  while (queue.length) {
+    const parentId = queue.shift();
+    for (const node of state.dictTreeNodes.values()) {
+      if (node.parentId !== parentId) {
+        continue;
+      }
+      descendants.push(node.id);
+      queue.push(node.id);
+    }
+  }
+  return descendants;
+}
+
+function pruneDictionarySubtree(nodeId, options = {}) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return;
+  }
+  const keepRoot = options.keepRoot === true;
+  const descendantIds = collectDictionaryDescendantIds(safeNodeId);
+  const removeIds = keepRoot ? descendantIds : [safeNodeId, ...descendantIds];
+  if (!removeIds.length) {
+    return;
+  }
+  const removeSet = new Set(removeIds);
+  for (const removeId of removeIds) {
+    state.dictPopupNodeRequests.delete(removeId);
+    state.dictPopupNodeLayout.delete(removeId);
+    if (state.dictHoveredNodeId === removeId) {
+      state.dictHoveredNodeId = null;
+    }
+    const popupEl = state.dictPopupNodeElements.get(removeId);
+    if (popupEl instanceof HTMLElement) {
+      popupEl.remove();
+    }
+    state.dictPopupNodeElements.delete(removeId);
+    state.dictTreeNodes.delete(removeId);
+    if (state.dictTreeCurrentNodeId === removeId) {
+      state.dictTreeCurrentNodeId = null;
+    }
+  }
+  for (const [parentId, childId] of state.dictPinnedChildren.entries()) {
+    if (removeSet.has(parentId) || removeSet.has(childId)) {
+      state.dictPinnedChildren.delete(parentId);
+    }
+  }
+  for (const [parentId, childId] of state.dictTransientChildren.entries()) {
+    if (removeSet.has(parentId) || removeSet.has(childId)) {
+      state.dictTransientChildren.delete(parentId);
+    }
+  }
+
+  if (keepRoot) {
+    const rootNode = getDictionaryTreeNode(safeNodeId);
+    if (rootNode) {
+      rootNode.lockedByClick = false;
+      rootNode.updatedAt = Date.now();
+      state.dictTreeCurrentNodeId = rootNode.id;
+    }
+  }
+}
+
+function clearPinnedDictionarySubtree(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return;
+  }
+  pruneDictionarySubtree(safeNodeId);
+}
+
+function setPinnedDictionaryChild(parentId, childId) {
+  const safeParentId = Number(parentId);
+  const safeChildId = Number(childId);
+  if (!Number.isInteger(safeParentId) || safeParentId <= 0 || !Number.isInteger(safeChildId) || safeChildId <= 0) {
+    return;
+  }
+  const previousChildId = state.dictPinnedChildren.get(safeParentId);
+  if (Number.isInteger(previousChildId) && previousChildId > 0 && previousChildId !== safeChildId) {
+    clearPinnedDictionarySubtree(previousChildId);
+  }
+  const transientChildId = state.dictTransientChildren.get(safeParentId);
+  if (Number.isInteger(transientChildId) && transientChildId > 0 && transientChildId !== safeChildId) {
+    clearPinnedDictionarySubtree(transientChildId);
+  }
+  state.dictTransientChildren.delete(safeParentId);
+  state.dictPinnedChildren.set(safeParentId, safeChildId);
+  const childNode = getDictionaryTreeNode(safeChildId);
+  if (childNode) {
+    childNode.lockedByClick = true;
+    childNode.transient = false;
+  }
+}
+
+function resolveDictionaryTransientChild(parentNode, term, normalizedTerm, source) {
+  if (!parentNode || !Number.isInteger(parentNode.id) || parentNode.id <= 0) {
+    return null;
+  }
+  const parentId = parentNode.id;
+  const transientChildId = state.dictTransientChildren.get(parentId);
+  const transientChild = getDictionaryTreeNode(transientChildId);
+  if (transientChild) {
+    if (transientChild.normalizedTerm === normalizedTerm) {
+      state.dictTreeCurrentNodeId = transientChild.id;
+      return transientChild;
+    }
+    pruneDictionarySubtree(transientChild.id, { keepRoot: true });
+    transientChild.term = String(term || "").trim();
+    transientChild.normalizedTerm = String(normalizedTerm || "").trim();
+    transientChild.source = String(source || "").trim();
+    transientChild.updatedAt = Date.now();
+    transientChild.anchorEl = null;
+    transientChild.resultCount = 0;
+    transientChild.lockedByClick = false;
+    transientChild.transient = true;
+    state.dictTreeCurrentNodeId = transientChild.id;
+    return transientChild;
+  }
+
+  const existing = findDictionaryTreeChild(parentId, normalizedTerm);
+  if (existing && !existing.lockedByClick) {
+    state.dictTransientChildren.set(parentId, existing.id);
+    existing.transient = true;
+    state.dictTreeCurrentNodeId = existing.id;
+    return existing;
+  }
+
+  const created = createDictionaryTreeNode({
+    term,
+    normalizedTerm,
+    parentId,
+    source,
+  });
+  created.transient = true;
+  state.dictTransientChildren.set(parentId, created.id);
+  return created;
+}
+
+function getDictionaryParentNodeForWord(wordEl) {
+  const source = resolveDictionarySource(wordEl);
+  if (source !== "dict_popup") {
+    return null;
+  }
+  const parentNodeId = Number(wordEl?.dataset?.dictNodeId);
+  let parentNode = getDictionaryTreeNode(parentNodeId);
+  if (!parentNode) {
+    parentNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
+  }
+  return parentNode;
+}
+
+function ensureDictionaryTreeNodeForWord(wordEl, term, options = {}) {
   const normalizedTerm = normalizeDictionaryTerm(term);
   if (!normalizedTerm) {
     return { ok: false, reason: "empty", node: null };
   }
 
   const source = resolveDictionarySource(wordEl);
+  const parentNodeOverride = (
+    options.parentNode
+    && typeof options.parentNode === "object"
+    && Number.isInteger(options.parentNode.id)
+  ) ? options.parentNode : null;
   if (source !== "dict_popup") {
     resetDictionaryTreeState();
     const root = createDictionaryTreeNode({
@@ -1434,8 +1640,11 @@ function ensureDictionaryTreeNodeForWord(wordEl, term) {
     return { ok: true, node: root };
   }
 
-  const parentNodeId = Number(wordEl?.dataset?.dictNodeId);
-  let parentNode = getDictionaryTreeNode(parentNodeId);
+  let parentNode = parentNodeOverride;
+  if (!parentNode) {
+    const parentNodeId = Number(wordEl?.dataset?.dictNodeId);
+    parentNode = getDictionaryTreeNode(parentNodeId);
+  }
   if (!parentNode) {
     parentNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
   }
@@ -1619,6 +1828,7 @@ function enforceDictionaryHoverLoop() {
 function hideSubtitleDictionaryPopup() {
   setDictionaryPopupPinned(false);
   clearDictionaryPopupHideTimer();
+  clearDictionaryGraphTrack();
   stopDictionaryHoverLoop();
   resetDictionaryTreeState();
   state.dictPopupWord = "";
@@ -1630,6 +1840,11 @@ function hideSubtitleDictionaryPopup() {
   if (elements.subtitleDictBridge) {
     elements.subtitleDictBridge.classList.add("hidden");
     elements.subtitleDictBridge.setAttribute("aria-hidden", "true");
+  }
+  if (elements.subtitleDictGraphEdges) {
+    elements.subtitleDictGraphEdges.textContent = "";
+    elements.subtitleDictGraphEdges.classList.add("hidden");
+    elements.subtitleDictGraphEdges.setAttribute("aria-hidden", "true");
   }
   elements.subtitleDictPopup.classList.add("hidden");
   elements.subtitleDictPopup.setAttribute("aria-hidden", "true");
@@ -1722,6 +1937,254 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   elements.subtitleDictBridge.setAttribute("aria-hidden", "false");
 }
 
+function resolveDictionaryViewportSize() {
+  const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+  return { viewportWidth, viewportHeight };
+}
+
+function clampDictionaryPopupCenter(x, y, width, height, viewportWidth, viewportHeight) {
+  const minX = (width / 2) + 8;
+  const maxX = viewportWidth - (width / 2) - 8;
+  const minY = (height / 2) + 8;
+  const maxY = viewportHeight - (height / 2) - 8;
+  return {
+    x: Math.max(minX, Math.min(maxX, x)),
+    y: Math.max(minY, Math.min(maxY, y)),
+  };
+}
+
+function getActiveDictionaryTreePath() {
+  const activeNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
+  return collectDictionaryTreePath(activeNode?.id || state.dictTreeRootNodeId);
+}
+
+function collectVisibleDictionaryPopupRects(excludeNodeId = null) {
+  const safeExcludeId = Number(excludeNodeId);
+  const hasExclude = Number.isInteger(safeExcludeId) && safeExcludeId > 0;
+  const rects = [];
+  for (const popupEl of getDictionaryPopupElements()) {
+    if (!(popupEl instanceof HTMLElement) || popupEl.classList.contains("hidden")) {
+      continue;
+    }
+    const popupNodeId = resolveDictionaryPopupNodeIdFromElement(popupEl);
+    if (hasExclude && popupNodeId === safeExcludeId) {
+      continue;
+    }
+    const rect = popupEl.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      continue;
+    }
+    rects.push({
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height,
+      nodeId: popupNodeId,
+    });
+  }
+  return rects;
+}
+
+function getDictionaryPopupRectForNode(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return null;
+  }
+  const popupEl = getDictionaryPopupElementForNode(safeNodeId);
+  if (!(popupEl instanceof HTMLElement) || popupEl.classList.contains("hidden")) {
+    return null;
+  }
+  const rect = popupEl.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return null;
+  }
+  return {
+    left: rect.left,
+    top: rect.top,
+    right: rect.right,
+    bottom: rect.bottom,
+    width: rect.width,
+    height: rect.height,
+    nodeId: safeNodeId,
+  };
+}
+
+function collectDictionaryHoverObstacleRects(excludeNodeId = null) {
+  const safeExcludeId = Number(excludeNodeId);
+  const hoveredNodeId = Number(state.dictHoveredNodeId);
+  if (!Number.isInteger(hoveredNodeId) || hoveredNodeId <= 0) {
+    return [];
+  }
+  if (Number.isInteger(safeExcludeId) && safeExcludeId > 0 && safeExcludeId === hoveredNodeId) {
+    return [];
+  }
+  const hoveredRect = getDictionaryPopupRectForNode(hoveredNodeId);
+  return hoveredRect ? [hoveredRect] : [];
+}
+
+function computeRectangleOverlapArea(a, b) {
+  if (!a || !b) {
+    return 0;
+  }
+  const overlapWidth = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+  const overlapHeight = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+  return overlapWidth * overlapHeight;
+}
+
+function scoreDictionaryPopupCandidate(candidateRect, otherRects, anchorRect, parentRect) {
+  if (!candidateRect) {
+    return Number.POSITIVE_INFINITY;
+  }
+  let overlapArea = 0;
+  for (const rect of otherRects) {
+    overlapArea += computeRectangleOverlapArea(candidateRect, rect);
+  }
+  const candidateCenterX = candidateRect.left + (candidateRect.width / 2);
+  const candidateCenterY = candidateRect.top + (candidateRect.height / 2);
+  const anchorCenterX = anchorRect.left + (anchorRect.width / 2);
+  const anchorCenterY = anchorRect.top + (anchorRect.height / 2);
+  const parentCenterX = parentRect.left + (parentRect.width / 2);
+  const parentCenterY = parentRect.top + (parentRect.height / 2);
+  const anchorDistance = Math.hypot(candidateCenterX - anchorCenterX, candidateCenterY - anchorCenterY);
+  const parentDistance = Math.hypot(candidateCenterX - parentCenterX, candidateCenterY - parentCenterY);
+  return (overlapArea * 2.3) + (anchorDistance * 0.12) + (parentDistance * 0.045);
+}
+
+function forceSeparateEntryFromObstacle(entry, obstacle, viewportWidth, viewportHeight, margin = 16) {
+  if (!entry || !obstacle) {
+    return false;
+  }
+  const halfWidth = (entry.width / 2) + (obstacle.width / 2) + margin;
+  const halfHeight = (entry.height / 2) + (obstacle.height / 2) + margin;
+  let dx = entry.x - (obstacle.left + (obstacle.width / 2));
+  let dy = entry.y - (obstacle.top + (obstacle.height / 2));
+  const overlapX = halfWidth - Math.abs(dx);
+  const overlapY = halfHeight - Math.abs(dy);
+  if (overlapX <= 0 || overlapY <= 0) {
+    return false;
+  }
+
+  if (Math.abs(dx) < 0.01) {
+    dx = entry.targetX >= (obstacle.left + (obstacle.width / 2)) ? 1 : -1;
+  }
+  if (Math.abs(dy) < 0.01) {
+    dy = entry.targetY >= (obstacle.top + (obstacle.height / 2)) ? 1 : -1;
+  }
+
+  if (overlapX < overlapY) {
+    entry.x += Math.sign(dx) * (overlapX + 0.8);
+  } else {
+    entry.y += Math.sign(dy) * (overlapY + 0.8);
+  }
+
+  const clamped = clampDictionaryPopupCenter(
+    entry.x,
+    entry.y,
+    entry.width,
+    entry.height,
+    viewportWidth,
+    viewportHeight
+  );
+  entry.x = clamped.x;
+  entry.y = clamped.y;
+  return true;
+}
+
+function computeDictionaryChildPopupTargetPosition(node, popupEl, parentPopupEl) {
+  if (!node || !(popupEl instanceof HTMLElement) || !(parentPopupEl instanceof HTMLElement)) {
+    return null;
+  }
+  const parentRect = parentPopupEl.getBoundingClientRect();
+  const popupRectRaw = popupEl.getBoundingClientRect();
+  const popupWidth = popupRectRaw.width > 0 ? popupRectRaw.width : Math.max(240, popupEl.offsetWidth || 0);
+  const popupHeight = popupRectRaw.height > 0 ? popupRectRaw.height : Math.max(140, popupEl.offsetHeight || 0);
+  const anchorRect = (node.anchorEl instanceof Element)
+    ? node.anchorEl.getBoundingClientRect()
+    : parentRect;
+  const { viewportWidth, viewportHeight } = resolveDictionaryViewportSize();
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    return null;
+  }
+
+  const gap = 12;
+  const anchorCenterX = anchorRect.left + (anchorRect.width / 2);
+  const anchorCenterY = anchorRect.top + (anchorRect.height / 2);
+  const parentCenterY = parentRect.top + (parentRect.height / 2);
+  const candidates = [
+    { left: parentRect.right + gap, top: anchorRect.top - Math.min(22, Math.max(8, anchorRect.height * 0.35)) },
+    { left: parentRect.left - popupWidth - gap, top: anchorRect.top - Math.min(22, Math.max(8, anchorRect.height * 0.35)) },
+    { left: anchorCenterX - (popupWidth / 2), top: parentRect.bottom + gap },
+    { left: anchorCenterX - (popupWidth / 2), top: parentRect.top - popupHeight - gap },
+    { left: parentRect.right + gap, top: parentCenterY - (popupHeight * 0.45) },
+    { left: parentRect.left - popupWidth - gap, top: parentCenterY - (popupHeight * 0.55) },
+    { left: anchorCenterX - (popupWidth / 2), top: anchorCenterY - (popupHeight / 2) },
+  ];
+  const occupiedRects = collectVisibleDictionaryPopupRects(node.id);
+  const hoverObstacleRects = collectDictionaryHoverObstacleRects(node.id);
+  let best = null;
+  for (const raw of candidates) {
+    const unclampedLeft = raw.left;
+    const unclampedTop = raw.top;
+    const left = Math.max(8, Math.min(viewportWidth - popupWidth - 8, unclampedLeft));
+    const top = Math.max(8, Math.min(viewportHeight - popupHeight - 8, unclampedTop));
+    const clampedAmount = Math.abs(left - unclampedLeft) + Math.abs(top - unclampedTop);
+    const candidateRect = {
+      left,
+      top,
+      right: left + popupWidth,
+      bottom: top + popupHeight,
+      width: popupWidth,
+      height: popupHeight,
+    };
+    let hoverOverlapArea = 0;
+    for (const obstacle of hoverObstacleRects) {
+      hoverOverlapArea += computeRectangleOverlapArea(candidateRect, obstacle);
+    }
+    if (hoverOverlapArea > 0) {
+      continue;
+    }
+    const score = scoreDictionaryPopupCandidate(candidateRect, occupiedRects, anchorRect, parentRect) + (clampedAmount * 6.5);
+    if (!best || score < best.score) {
+      best = {
+        left,
+        top,
+        score,
+      };
+    }
+  }
+  if (!best) {
+    return null;
+  }
+  const left = best.left;
+  const top = best.top;
+  return {
+    left,
+    top,
+    width: popupWidth,
+    height: popupHeight,
+    centerX: left + (popupWidth / 2),
+    centerY: top + (popupHeight / 2),
+    viewportWidth,
+    viewportHeight,
+  };
+}
+
+function readDictionaryPopupCenter(popupEl) {
+  if (!(popupEl instanceof HTMLElement)) {
+    return null;
+  }
+  const rect = popupEl.getBoundingClientRect();
+  return {
+    x: rect.left + (rect.width / 2),
+    y: rect.top + (rect.height / 2),
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
 function positionDictionaryChildPopup(nodeId) {
   const safeNodeId = Number(nodeId);
   if (!Number.isInteger(safeNodeId) || safeNodeId <= 0 || safeNodeId === state.dictTreeRootNodeId) {
@@ -1736,33 +2199,285 @@ function positionDictionaryChildPopup(nodeId) {
     return;
   }
   const parentPopupEl = getDictionaryPopupElementForNode(node.parentId);
-  if (!(parentPopupEl instanceof HTMLElement)) {
+  const target = computeDictionaryChildPopupTargetPosition(node, popupEl, parentPopupEl);
+  if (!target) {
     return;
   }
-  const parentRect = parentPopupEl.getBoundingClientRect();
-  const popupRect = popupEl.getBoundingClientRect();
-  const anchorRect = (node.anchorEl instanceof Element)
-    ? node.anchorEl.getBoundingClientRect()
-    : parentRect;
-  const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
-  const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+  popupEl.style.left = `${target.left.toFixed(1)}px`;
+  popupEl.style.top = `${target.top.toFixed(1)}px`;
+  popupEl.style.transform = "none";
+}
+
+function runDictionaryPopupForceLayout(path) {
+  if (!Array.isArray(path) || path.length <= 1) {
+    return;
+  }
+  const rootNode = path[0];
+  const rootPopupEl = getDictionaryPopupElementForNode(rootNode.id);
+  const rootCenter = readDictionaryPopupCenter(rootPopupEl);
+  if (!rootCenter) {
+    return;
+  }
+  const { viewportWidth, viewportHeight } = resolveDictionaryViewportSize();
   if (viewportWidth <= 0 || viewportHeight <= 0) {
     return;
   }
+  const hoverObstacleRects = collectDictionaryHoverObstacleRects();
 
-  const gap = 10;
-  let left = parentRect.right + gap;
-  if (left + popupRect.width > viewportWidth - 8) {
-    left = parentRect.left - popupRect.width - gap;
+  const layoutEntries = [];
+  const byId = new Map();
+  const rootEntry = {
+    id: rootNode.id,
+    popupEl: rootPopupEl,
+    width: rootCenter.width,
+    height: rootCenter.height,
+    x: rootCenter.x,
+    y: rootCenter.y,
+    targetX: rootCenter.x,
+    targetY: rootCenter.y,
+    movable: false,
+  };
+  layoutEntries.push(rootEntry);
+  byId.set(rootEntry.id, rootEntry);
+
+  for (let idx = 1; idx < path.length; idx += 1) {
+    const node = path[idx];
+    const popupEl = getDictionaryPopupElementForNode(node.id);
+    if (!(popupEl instanceof HTMLElement) || popupEl.classList.contains("hidden")) {
+      continue;
+    }
+    const parentEntry = byId.get(node.parentId);
+    if (!parentEntry) {
+      continue;
+    }
+    const parentPopupEl = getDictionaryPopupElementForNode(node.parentId);
+    const target = computeDictionaryChildPopupTargetPosition(node, popupEl, parentPopupEl);
+    if (!target) {
+      continue;
+    }
+    const stored = state.dictPopupNodeLayout.get(node.id) || null;
+    const currentCenter = readDictionaryPopupCenter(popupEl);
+    const isHoverLocked = Number.isInteger(state.dictHoveredNodeId) && state.dictHoveredNodeId === node.id;
+    const shouldSnap = !node.lockedByClick && !isHoverLocked && !node.transient;
+    let targetX = target.centerX;
+    let targetY = target.centerY;
+    if (node.lockedByClick && !isHoverLocked) {
+      const parentDirectionRight = parentEntry.x <= (viewportWidth / 2);
+      const horizontalDirection = parentDirectionRight ? 1 : -1;
+      const detachedDistance = ((parentEntry.width + target.width) * 0.5) + 40 + (node.depth * 8);
+      targetX = parentEntry.x + (horizontalDirection * detachedDistance);
+      targetY = parentEntry.y + ((node.depth % 2 === 0 ? -1 : 1) * (14 + (node.depth * 3)));
+      const clampedTarget = clampDictionaryPopupCenter(
+        targetX,
+        targetY,
+        target.width,
+        target.height,
+        viewportWidth,
+        viewportHeight
+      );
+      targetX = clampedTarget.x;
+      targetY = clampedTarget.y;
+    }
+    const initialX = shouldSnap
+      ? targetX
+      : (
+        Number.isFinite(currentCenter?.x)
+          ? currentCenter.x
+          : (Number.isFinite(stored?.x) ? stored.x : targetX)
+      );
+    const initialY = shouldSnap
+      ? targetY
+      : (
+        Number.isFinite(currentCenter?.y)
+          ? currentCenter.y
+          : (Number.isFinite(stored?.y) ? stored.y : targetY)
+      );
+    const clamped = clampDictionaryPopupCenter(
+      initialX,
+      initialY,
+      target.width,
+      target.height,
+      viewportWidth,
+      viewportHeight
+    );
+    const entry = {
+      id: node.id,
+      popupEl,
+      width: target.width,
+      height: target.height,
+      x: clamped.x,
+      y: clamped.y,
+      targetX,
+      targetY,
+      movable: node.lockedByClick && !isHoverLocked,
+    };
+    layoutEntries.push(entry);
+    byId.set(entry.id, entry);
   }
-  left = Math.max(8, Math.min(viewportWidth - popupRect.width - 8, left));
 
-  const targetTop = anchorRect.top - Math.min(22, Math.max(8, anchorRect.height * 0.35));
-  const top = Math.max(8, Math.min(viewportHeight - popupRect.height - 8, targetTop));
+  if (layoutEntries.length <= 1) {
+    return;
+  }
 
-  popupEl.style.left = `${left.toFixed(1)}px`;
-  popupEl.style.top = `${top.toFixed(1)}px`;
-  popupEl.style.transform = "none";
+  const iterations = 22;
+  for (let iter = 0; iter < iterations; iter += 1) {
+    for (const entry of layoutEntries) {
+      if (!entry.movable) {
+        continue;
+      }
+      let forceX = (entry.targetX - entry.x) * 0.18;
+      let forceY = (entry.targetY - entry.y) * 0.18;
+      for (const other of layoutEntries) {
+        if (other.id === entry.id) {
+          continue;
+        }
+        const dx = entry.x - other.x;
+        const dy = entry.y - other.y;
+        const distance = Math.max(0.001, Math.hypot(dx, dy));
+        const minDistance = ((entry.width + other.width) * 0.5) + 18;
+        if (distance >= minDistance) {
+          continue;
+        }
+        const repel = (minDistance - distance) * 0.26;
+        forceX += (dx / distance) * repel;
+        forceY += (dy / distance) * repel;
+      }
+      const nextCenter = clampDictionaryPopupCenter(
+        entry.x + forceX,
+        entry.y + forceY,
+        entry.width,
+        entry.height,
+        viewportWidth,
+        viewportHeight
+      );
+      entry.x = nextCenter.x;
+      entry.y = nextCenter.y;
+    }
+  }
+
+  if (hoverObstacleRects.length) {
+    for (let pass = 0; pass < 18; pass += 1) {
+      let moved = false;
+      for (const entry of layoutEntries) {
+        if (entry.id === state.dictTreeRootNodeId) {
+          continue;
+        }
+        if (Number.isInteger(state.dictHoveredNodeId) && state.dictHoveredNodeId === entry.id) {
+          continue;
+        }
+        for (const obstacle of hoverObstacleRects) {
+          const changed = forceSeparateEntryFromObstacle(
+            entry,
+            obstacle,
+            viewportWidth,
+            viewportHeight,
+            18
+          );
+          moved = moved || changed;
+        }
+      }
+      if (!moved) {
+        break;
+      }
+    }
+  }
+
+  for (const entry of layoutEntries) {
+    if (entry.id === state.dictTreeRootNodeId) {
+      continue;
+    }
+    const left = entry.x - (entry.width / 2);
+    const top = entry.y - (entry.height / 2);
+    entry.popupEl.style.left = `${left.toFixed(1)}px`;
+    entry.popupEl.style.top = `${top.toFixed(1)}px`;
+    entry.popupEl.style.transform = "none";
+    state.dictPopupNodeLayout.set(entry.id, { x: entry.x, y: entry.y });
+  }
+}
+
+function renderDictionaryGraphEdges(path) {
+  if (!(elements.subtitleDictGraphEdges instanceof SVGElement)) {
+    return;
+  }
+  if (!Array.isArray(path) || path.length <= 1 || !isDictionaryPopupVisible()) {
+    elements.subtitleDictGraphEdges.textContent = "";
+    elements.subtitleDictGraphEdges.classList.add("hidden");
+    elements.subtitleDictGraphEdges.setAttribute("aria-hidden", "true");
+    return;
+  }
+  const { viewportWidth, viewportHeight } = resolveDictionaryViewportSize();
+  elements.subtitleDictGraphEdges.setAttribute("viewBox", `0 0 ${Math.max(1, viewportWidth)} ${Math.max(1, viewportHeight)}`);
+  elements.subtitleDictGraphEdges.setAttribute("width", String(Math.max(1, viewportWidth)));
+  elements.subtitleDictGraphEdges.setAttribute("height", String(Math.max(1, viewportHeight)));
+  elements.subtitleDictGraphEdges.textContent = "";
+
+  let drawn = 0;
+  for (let idx = 1; idx < path.length; idx += 1) {
+    const node = path[idx];
+    const parentPopupEl = getDictionaryPopupElementForNode(node.parentId);
+    const childPopupEl = getDictionaryPopupElementForNode(node.id);
+    if (!(parentPopupEl instanceof HTMLElement) || !(childPopupEl instanceof HTMLElement)) {
+      continue;
+    }
+    if (parentPopupEl.classList.contains("hidden") || childPopupEl.classList.contains("hidden")) {
+      continue;
+    }
+    const parentRect = parentPopupEl.getBoundingClientRect();
+    const childRect = childPopupEl.getBoundingClientRect();
+    const startX = parentRect.left + (parentRect.width / 2);
+    const startY = parentRect.top + (parentRect.height / 2);
+    const endX = childRect.left + (childRect.width / 2);
+    const endY = childRect.top + (childRect.height / 2);
+    const horizontalDirection = endX >= startX ? 1 : -1;
+    const controlDelta = Math.max(26, Math.min(96, Math.abs(endX - startX) * 0.28));
+    const control1X = startX + (horizontalDirection * controlDelta);
+    const control2X = endX - (horizontalDirection * controlDelta);
+
+    const edgePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    edgePath.setAttribute(
+      "d",
+      `M ${startX.toFixed(1)} ${startY.toFixed(1)} C ${control1X.toFixed(1)} ${startY.toFixed(1)}, ${control2X.toFixed(1)} ${endY.toFixed(1)}, ${endX.toFixed(1)} ${endY.toFixed(1)}`
+    );
+    edgePath.setAttribute("class", "subtitle-dict-edge");
+    elements.subtitleDictGraphEdges.appendChild(edgePath);
+    drawn += 1;
+  }
+
+  if (drawn <= 0) {
+    elements.subtitleDictGraphEdges.classList.add("hidden");
+    elements.subtitleDictGraphEdges.setAttribute("aria-hidden", "true");
+    return;
+  }
+  elements.subtitleDictGraphEdges.classList.remove("hidden");
+  elements.subtitleDictGraphEdges.setAttribute("aria-hidden", "false");
+}
+
+function renderActiveDictionaryGraphEdges() {
+  const path = getActiveDictionaryTreePath();
+  renderDictionaryGraphEdges(path);
+}
+
+function runDictionaryGraphTrackFrame() {
+  state.dictGraphTrackFrame = null;
+  if (!isDictionaryPopupVisible()) {
+    renderDictionaryGraphEdges([]);
+    clearDictionaryGraphTrack();
+    return;
+  }
+  renderActiveDictionaryGraphEdges();
+  if (Date.now() < state.dictGraphTrackUntil) {
+    state.dictGraphTrackFrame = window.requestAnimationFrame(runDictionaryGraphTrackFrame);
+  } else {
+    clearDictionaryGraphTrack();
+  }
+}
+
+function scheduleDictionaryGraphTrack(durationMs = DICT_GRAPH_TRACK_MS) {
+  const safeDuration = Math.max(120, Math.round(Number(durationMs) || DICT_GRAPH_TRACK_MS));
+  state.dictGraphTrackUntil = Math.max(state.dictGraphTrackUntil, Date.now() + safeDuration);
+  if (state.dictGraphTrackFrame === null) {
+    state.dictGraphTrackFrame = window.requestAnimationFrame(runDictionaryGraphTrackFrame);
+  }
 }
 
 function positionDictionaryPopupForNode(nodeId) {
@@ -1779,6 +2494,8 @@ function positionDictionaryPopupForNode(nodeId) {
 
 function repositionActiveDictionaryPopup() {
   if (!isDictionaryPopupVisible()) {
+    renderDictionaryGraphEdges([]);
+    clearDictionaryGraphTrack();
     return;
   }
   if (
@@ -1791,9 +2508,18 @@ function repositionActiveDictionaryPopup() {
   }
   const activeNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
   const path = collectDictionaryTreePath(activeNode?.id || state.dictTreeRootNodeId);
-  for (const node of path) {
-    positionDictionaryPopupForNode(node.id);
+  if (!path.length) {
+    renderDictionaryGraphEdges([]);
+    clearDictionaryGraphTrack();
+    return;
   }
+  positionDictionaryPopupForNode(path[0].id);
+  for (let idx = 1; idx < path.length; idx += 1) {
+    positionDictionaryPopupForNode(path[idx].id);
+  }
+  runDictionaryPopupForceLayout(path);
+  renderDictionaryGraphEdges(path);
+  scheduleDictionaryGraphTrack(DICT_GRAPH_TRACK_MS);
 }
 
 function groupDictionaryRows(rows) {
@@ -2001,10 +2727,9 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
   showDictionaryPopupElement(popupEl);
   requestAnimationFrame(() => {
     if (nodeId === state.dictTreeRootNodeId) {
-      positionSubtitleDictionaryPopup(anchorEl);
-    } else {
-      positionDictionaryPopupForNode(nodeId);
+      state.dictPopupAnchorEl = anchorEl;
     }
+    repositionActiveDictionaryPopup();
   });
 }
 
@@ -2035,10 +2760,9 @@ function renderSubtitleDictionaryPopupLoading(term, anchorEl, options = {}) {
   showDictionaryPopupElement(popupEl);
   requestAnimationFrame(() => {
     if (nodeId === state.dictTreeRootNodeId) {
-      positionSubtitleDictionaryPopup(anchorEl);
-    } else {
-      positionDictionaryPopupForNode(nodeId);
+      state.dictPopupAnchorEl = anchorEl;
     }
+    repositionActiveDictionaryPopup();
   });
 }
 
@@ -2838,15 +3562,37 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
   return true;
 }
 
-async function showSubtitleDictionaryForWord(wordEl) {
+async function showSubtitleDictionaryForWord(wordEl, options = {}) {
   if (!wordEl) {
     return;
   }
+  const shouldPin = options.pin === true;
   const term = String(wordEl.dataset.dictTerm || "").trim();
   if (!term) {
     return;
   }
-  const treeResult = ensureDictionaryTreeNodeForWord(wordEl, term);
+  const source = resolveDictionarySource(wordEl);
+  const parentNode = getDictionaryParentNodeForWord(wordEl);
+  const normalizedTerm = normalizeDictionaryTerm(term);
+  let treeResult = null;
+  if (!shouldPin && source === "dict_popup" && parentNode) {
+    const pinnedChildId = state.dictPinnedChildren.get(parentNode.id);
+    if (Number.isInteger(pinnedChildId) && pinnedChildId > 0) {
+      const pinnedChild = getDictionaryTreeNode(pinnedChildId);
+      if (pinnedChild && pinnedChild.normalizedTerm && pinnedChild.normalizedTerm !== normalizedTerm) {
+        return;
+      }
+      if (pinnedChild) {
+        treeResult = { ok: true, node: pinnedChild };
+      }
+    } else {
+      const transientNode = resolveDictionaryTransientChild(parentNode, term, normalizedTerm, source);
+      treeResult = transientNode ? { ok: true, node: transientNode } : null;
+    }
+  }
+  if (!treeResult) {
+    treeResult = ensureDictionaryTreeNodeForWord(wordEl, term, { parentNode });
+  }
   if (!treeResult.ok || !treeResult.node) {
     if (treeResult.reason === "depth") {
       setStatus(`辞書の深さ上限 (lv.${DICT_TREE_MAX_DEPTH + 1}) に到達しました。`, "info");
@@ -2855,12 +3601,20 @@ async function showSubtitleDictionaryForWord(wordEl) {
   }
   const activeNode = treeResult.node;
   const activeNodeId = activeNode.id;
+  if (shouldPin) {
+    if (source === "dict_popup" && parentNode) {
+      setPinnedDictionaryChild(parentNode.id, activeNodeId);
+    } else {
+      activeNode.lockedByClick = true;
+    }
+    setDictionaryPopupPinned(true);
+  }
   activeNode.anchorEl = wordEl;
   const popupEl = ensureDictionaryPopupElementForNode(activeNodeId);
   clearDictionaryPopupHideTimer();
   state.dictPopupWord = term;
   state.dictPopupNodeId = activeNodeId;
-  state.dictPopupSource = resolveDictionarySource(wordEl);
+  state.dictPopupSource = source;
   if (activeNodeId === state.dictTreeRootNodeId) {
     state.dictPopupAnchorEl = wordEl;
   }
@@ -2897,8 +3651,7 @@ function pinSubtitleDictionaryWord(wordEl) {
   if (!(wordEl instanceof HTMLElement)) {
     return;
   }
-  setDictionaryPopupPinned(true);
-  showSubtitleDictionaryForWord(wordEl).catch((error) => setStatus(error.message, "error"));
+  showSubtitleDictionaryForWord(wordEl, { pin: true }).catch((error) => setStatus(error.message, "error"));
 }
 
 function isDictionaryHoverSafeTarget(nextElement) {
@@ -2922,7 +3675,7 @@ function handleDictionaryWordPointerOver(event) {
   ) {
     return;
   }
-  showSubtitleDictionaryForWord(target).catch((error) => setStatus(error.message, "error"));
+  showSubtitleDictionaryForWord(target, { pin: false }).catch((error) => setStatus(error.message, "error"));
 }
 
 function handleDictionaryWordPointerOut(event) {
