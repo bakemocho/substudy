@@ -40,6 +40,8 @@ Local-first workflow for English study from downloaded short videos.
 cp config/sources.example.toml config/sources.toml
 ```
 
+`config/sources.toml` is gitignored. Keep machine-specific paths only in this local file.
+
 2. Dry-run daily sync:
 
 ```bash
@@ -98,6 +100,15 @@ python3 scripts/substudy.py web --host 127.0.0.1 --port 8876
 
 Open `http://127.0.0.1:8876`.
 
+11. Run privacy check before sharing/publishing:
+
+```bash
+make privacy-check
+```
+
+GitHub Actions also runs this check on pull requests and pushes to `master`
+via `.github/workflows/privacy-check.yml`.
+
 ## Web study features (MVP)
 
 - 9:16 vertical video feed with up/down navigation (`↑/↓`, `J/K`, wheel, swipe)
@@ -140,6 +151,12 @@ Learning tables added to the same SQLite ledger:
   - Optional explicit initial cursor. If unset, starts from `playlist_end + 1`.
 - `break_on_existing`, `break_per_input`, `lazy_playlist`
   - Optional listing controls. Keep `break_on_existing=false` for TikTok profiles unless you have verified ordering safety.
+- `cookies_file` / `cookies_from_browser`
+  - `cookies_file` is preferred for scheduled runs to avoid macOS keychain password popups.
+  - If both are set, `cookies_file` is used first; browser cookies are fallback only.
+  - To fully disable browser access, set `cookies_from_browser = ""`.
+  - Refresh command example:
+    `yt-dlp --cookies-from-browser chrome --cookies ~/.local/share/substudy/cookies.txt "https://www.tiktok.com"`
 - `media_archive` / `subs_archive`
   - If missing, `sync` bootstraps archive IDs from existing local files to avoid repeated re-fetch attempts.
 - `asr_*`
@@ -188,7 +205,7 @@ Custom schedule:
 Example:
 
 ```bash
-./scripts/install_launchd.sh 6 30 0 7 0 com.bakemocho.substudy
+./scripts/install_launchd.sh 6 30 0 7 0 com.substudy
 ```
 
 Check jobs:
@@ -201,7 +218,7 @@ launchctl list | rg substudy
 
 Use EIJIRO as source data with `cp932` decoding, then keep a UTF-8 normalized copy for editor-friendly access.
 
-- source: `/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
+- source: `~/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT`
 - normalized copy (local artifact): `data/eijiro-1449.utf8.txt`
 - note: `data/` is gitignored in this repo.
 
@@ -210,7 +227,7 @@ Generate/update normalized copy:
 ```bash
 python3 - <<'PY'
 from pathlib import Path
-src = Path('/Users/bakemocho/Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT')
+src = Path.home() / 'Library/Mobile Documents/com~apple~CloudDocs/Foundation/dict/EIJIRO-1449.TXT'
 dst = Path('data/eijiro-1449.utf8.txt')
 text = src.read_bytes().decode('cp932')
 text = text.replace('\r\n', '\n').replace('\r', '\n').replace('\x85', '\n')
@@ -456,4 +473,15 @@ Acceptance:
 ## Add more creators
 
 Add another `[[sources]]` block in `config/sources.toml`.
-Each source can point to its own directory under `/Users/bakemocho/Audio/tiktok/english`.
+Each source can point to its own directory under your local `base_data_dir` (for example `~/substudy-data`).
+
+Example:
+
+```toml
+[global]
+base_data_dir = "~/substudy-data"
+
+[[sources]]
+id = "creator_a"
+data_dir = "creator_a"
+```

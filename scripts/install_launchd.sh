@@ -11,7 +11,7 @@ DAILY_MINUTE="${2:-30}"
 WEEKLY_WEEKDAY="${3:-0}"   # 0 or 7 = Sunday
 WEEKLY_HOUR="${4:-7}"
 WEEKLY_MINUTE="${5:-0}"
-LABEL_PREFIX="${6:-com.bakemocho.substudy}"
+LABEL_PREFIX="${6:-com.substudy}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"

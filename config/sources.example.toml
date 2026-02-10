@@ -1,5 +1,8 @@
 [global]
-base_data_dir = "/Users/bakemocho/Audio/tiktok/english"
+base_data_dir = "~/substudy-data"
+# Prefer cookies.txt for automation to avoid macOS keychain password prompts.
+# Generate/update once: yt-dlp --cookies-from-browser chrome --cookies ~/.local/share/substudy/cookies.txt "https://www.tiktok.com"
+# cookies_file = "~/.local/share/substudy/cookies.txt"
 cookies_from_browser = "chrome"
 video_format = "bv*+ba/best"
 sub_langs = "en.*,en,und"
@@ -25,7 +28,7 @@ asr_max_per_run = 20
 asr_timeout_sec = 0
 asr_prefer_exts = ["srt", "vtt"]
 # asr_command = [
-#   "/Users/bakemocho/gitwork_bk/vseg/.venv/bin/python",
+#   "python3",
 #   "-m", "avseg.main_transcribe",
 #   "--with-subtitles",
 #   "--language", "en",
@@ -36,24 +39,24 @@ ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
 
 [[sources]]
-id = "storiesofcz"
+id = "example_creator"
 platform = "tiktok"
-url = "https://www.tiktok.com/@storiesofcz"
+url = "https://www.tiktok.com/@example_creator"
 enabled = true
 
-# Existing on-disk layout (no migration needed):
-data_dir = "/Users/bakemocho/Audio/tiktok/english/storiesofcz"
-media_dir = "storiesofcz"
-subs_dir = "storiesofcz_subs"
-meta_dir = "storiesofcz_meta"
-media_archive = "storiesofcz.archive.txt"
-subs_archive = "storiesofcz_subs.archive.txt"
-urls_file = "storiesofcz.urls.txt"
-video_id_regex = "_(\\d{19})_"
-asr_dir = "storiesofcz_asr"
+# Paths can be absolute or relative. Relative paths are resolved from data_dir.
+data_dir = "example_creator"
+media_dir = "media"
+subs_dir = "subs"
+meta_dir = "meta"
+media_archive = "archives/media.archive.txt"
+subs_archive = "archives/subs.archive.txt"
+urls_file = "archives/urls.txt"
+video_id_regex = "_(\\d{10,})_"
+asr_dir = "asr"
 
 # Optional overrides:
-# handle = "storiesofcz"
+# handle = "example_creator"
 # video_url_template = "https://www.tiktok.com/@{handle}/video/{id}"
 # break_on_existing = true
 # break_per_input = true

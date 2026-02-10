@@ -72,7 +72,8 @@ class SourceConfig:
     video_url_template: str | None
     video_id_regex: str
     ytdlp_bin: str
-    cookies_browser: str
+    cookies_browser: str | None
+    cookies_file: Path | None
     video_format: str
     sub_langs: str
     sub_format: str
@@ -107,6 +108,15 @@ def resolve_path(base: Path, raw_value: str | None, default: str) -> Path:
     candidate = Path(value).expanduser()
     if candidate.is_absolute():
         return candidate
+    return (base / candidate).resolve()
+
+
+def parse_optional_path(base: Path, raw_value: Any) -> Path | None:
+    if raw_value in (None, ""):
+        return None
+    candidate = Path(str(raw_value)).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
     return (base / candidate).resolve()
 
 
@@ -213,6 +223,13 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
     global_asr_timeout_sec = int(global_raw.get("asr_timeout_sec", 0))
     global_asr_prefer_exts = parse_ext_list(global_raw.get("asr_prefer_exts"))
     global_asr_enabled = bool(global_raw.get("asr_enabled", False))
+    global_cookies_browser_raw = global_raw.get("cookies_from_browser", "chrome")
+    global_cookies_browser = (
+        str(global_cookies_browser_raw)
+        if global_cookies_browser_raw not in (None, "")
+        else None
+    )
+    global_cookies_file = parse_optional_path(cwd, global_raw.get("cookies_file"))
 
     sources_raw = raw.get("sources", [])
     if not sources_raw:
@@ -249,6 +266,21 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
         )
         if source_backfill_windows_per_run <= 0:
             source_backfill_windows_per_run = 1
+        source_cookies_browser_raw = source_raw.get(
+            "cookies_from_browser",
+            global_cookies_browser,
+        )
+        source_cookies_browser = (
+            str(source_cookies_browser_raw)
+            if source_cookies_browser_raw not in (None, "")
+            else None
+        )
+        source_cookies_file_raw = source_raw.get("cookies_file")
+        source_cookies_file = (
+            parse_optional_path(data_dir, source_cookies_file_raw)
+            if source_cookies_file_raw not in (None, "")
+            else global_cookies_file
+        )
 
         source = SourceConfig(
             id=source_id,
@@ -266,9 +298,8 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             video_url_template=source_raw.get("video_url_template"),
             video_id_regex=str(source_raw.get("video_id_regex", r"_(\d{10,})_")),
             ytdlp_bin=str(source_raw.get("ytdlp_bin", global_raw.get("ytdlp_bin", "yt-dlp"))),
-            cookies_browser=str(
-                source_raw.get("cookies_from_browser", global_raw.get("cookies_from_browser", "chrome"))
-            ),
+            cookies_browser=source_cookies_browser,
+            cookies_file=source_cookies_file,
             video_format=str(source_raw.get("video_format", global_raw.get("video_format", "bv*+ba/best"))),
             sub_langs=str(source_raw.get("sub_langs", global_raw.get("sub_langs", "en.*,en,und"))),
             sub_format=str(source_raw.get("sub_format", global_raw.get("sub_format", "vtt/ttml/best"))),
@@ -331,6 +362,20 @@ def select_sources(all_sources: list[SourceConfig], selected_ids: list[str] | No
         if source not in selected:
             selected.append(source)
     return selected
+
+
+def resolve_cookie_flags(source: SourceConfig) -> list[str]:
+    if source.cookies_file is not None:
+        if source.cookies_file.exists():
+            return ["--cookies", str(source.cookies_file)]
+        print(
+            f"[cookies] {source.id}: configured file not found ({source.cookies_file}); "
+            "falling back to browser cookies",
+            file=sys.stderr,
+        )
+    if source.cookies_browser:
+        return ["--cookies-from-browser", source.cookies_browser]
+    return []
 
 
 def run_command(command: list[str], dry_run: bool, raise_on_error: bool = True) -> int:
@@ -484,6 +529,7 @@ def sync_source(
     effective_playlist_end = playlist_end if playlist_end is not None else source.playlist_end
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
+    cookie_flags = resolve_cookie_flags(source)
 
     def safe_video_url(video_id: str) -> str | None:
         try:
@@ -495,8 +541,7 @@ def sync_source(
     if not skip_media:
         media_command = [
             source.ytdlp_bin,
-            "--cookies-from-browser",
-            source.cookies_browser,
+            *cookie_flags,
             "--download-archive",
             str(source.media_archive),
             "--continue",
@@ -572,8 +617,7 @@ def sync_source(
     if not skip_subs:
         subs_command = [
             source.ytdlp_bin,
-            "--cookies-from-browser",
-            source.cookies_browser,
+            *cookie_flags,
             "--download-archive",
             str(source.subs_archive),
             "--continue",
@@ -725,8 +769,7 @@ def sync_source(
 
     metadata_command = [
         source.ytdlp_bin,
-        "--cookies-from-browser",
-        source.cookies_browser,
+        *cookie_flags,
         "--skip-download",
         "--write-info-json",
         "--write-description",
@@ -2204,10 +2247,10 @@ def discover_playlist_window_ids(
     playlist_end: int,
     dry_run: bool,
 ) -> list[str]:
+    cookie_flags = resolve_cookie_flags(source)
     command = [
         source.ytdlp_bin,
-        "--cookies-from-browser",
-        source.cookies_browser,
+        *cookie_flags,
         "--flat-playlist",
         "--print",
         "%(id)s",

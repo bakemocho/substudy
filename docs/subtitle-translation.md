@@ -42,7 +42,7 @@
 ## 4. 推奨保存先と命名
 
 - 推奨: 元字幕と同じ `subs_dir` に保存。
-- 例: `/Users/.../storiesofcz_subs/7603444228575890709.ja.srt`
+- 例: `/path/to/subs/7603444228575890709.ja.srt`
 - 既存が `video_id.en.srt` の場合でも、和訳は `video_id.ja.srt` で統一。
 
 ## 5. 実行手順
@@ -50,7 +50,7 @@
 1. 翻訳対象ファイルを列挙する（動画あり字幕のみ）。
 
 ```bash
-cd /Users/bakemocho/gitwork_bk/substudy
+cd /path/to/substudy
 mkdir -p logs
 python3 scripts/substudy.py ledger --config config/sources.toml --incremental
 sqlite3 data/master_ledger.sqlite "
@@ -285,7 +285,7 @@ conn = sqlite3.connect(db_path)
 try:
     conn.execute("PRAGMA foreign_keys = ON")
     for row in rows:
-        source_id = str(row.get("source_id") or "storiesofcz")
+        source_id = str(row.get("source_id") or "source_1")
         video_id = str(row.get("video_id") or "")
         if not video_id:
             continue

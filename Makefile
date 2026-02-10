@@ -1,7 +1,7 @@
 PYTHON ?= python3
 CONFIG ?= config/sources.toml
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index privacy-check
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -35,3 +35,6 @@ loudness:
 
 dict-index:
 	$(PYTHON) scripts/substudy.py dict-index --config $(CONFIG)
+
+privacy-check:
+	./scripts/privacy_check.sh
