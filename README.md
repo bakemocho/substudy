@@ -224,6 +224,36 @@ PY
 
 Current priority is subtitle-first study UX: fast cue navigation + EN/JA parallel reading.
 
+### Immediate: playback-card UX polish + dictionary continuity
+
+Goal: reduce visual/interaction friction during continuous study.
+
+- Add progress timer in video card (bottom-right overlay):
+  - circular pie-style timer on top of video card
+  - base color: semi-transparent milky gray/white
+  - fill grows clockwise from 12 o'clock based on playback progress ratio
+  - near video end, filled semi-transparent area should cover the full circle
+  - keep timer in sync with pause/seek/replay
+- Add viewport snap behavior for video card:
+  - card snaps to top/bottom edges while scrolling (sticky "click" feeling)
+  - apply slight resistance/hysteresis when leaving snapped state
+  - avoid scroll-chain conflict with subtitle reel / bookmark panel internal scroll
+- Expand hover dictionary targets:
+  - enable same hover dictionary in English words inside subtitle reel rows
+  - enable same hover dictionary in English words inside saved bookmark text
+  - keep existing subtitle-overlay hover behavior unchanged
+- Add hover bridge between word and popup:
+  - fill the gap with transparent hover-hit region so pointer can travel without losing context
+  - prevent accidental re-target to words behind the gap while moving to popup
+  - keep popup hide timing stable (no flicker while crossing)
+
+Acceptance:
+
+- Timer draw direction/fill matches actual video progress for play/pause/seek.
+- Card snap feels deterministic: easy to snap, slightly resistant to unsnap.
+- Hover dictionary opens from overlay/reel/bookmark consistently.
+- Moving pointer from word to popup does not collapse/switch lookup unexpectedly.
+
 ### 0) Done / baseline
 
 - EIJIRO dictionary indexing (`dict-index`) + hover lookup + collocation ranking.
