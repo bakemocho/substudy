@@ -1383,6 +1383,16 @@ function retainDictionaryPopupPath(nodeId) {
   }
   const path = collectDictionaryTreePath(safeNodeId);
   const keepIds = new Set(path.map((node) => node.id));
+  for (const node of state.dictTreeNodes.values()) {
+    if (!node.lockedByClick) {
+      continue;
+    }
+    keepIds.add(node.id);
+    const ancestorPath = collectDictionaryTreePath(node.id);
+    for (const ancestor of ancestorPath) {
+      keepIds.add(ancestor.id);
+    }
+  }
   for (const [popupNodeId, popupEl] of state.dictPopupNodeElements.entries()) {
     if (keepIds.has(popupNodeId)) {
       continue;
@@ -1460,6 +1470,43 @@ function findDictionaryTreeChild(parentId, normalizedTerm) {
   return null;
 }
 
+function getPinnedDictionaryChildIds(parentId) {
+  const safeParentId = Number(parentId);
+  if (!Number.isInteger(safeParentId) || safeParentId <= 0) {
+    return new Set();
+  }
+  const pinned = state.dictPinnedChildren.get(safeParentId);
+  if (pinned instanceof Set) {
+    return pinned;
+  }
+  if (Number.isInteger(pinned) && pinned > 0) {
+    const set = new Set([pinned]);
+    state.dictPinnedChildren.set(safeParentId, set);
+    return set;
+  }
+  const set = new Set();
+  state.dictPinnedChildren.set(safeParentId, set);
+  return set;
+}
+
+function findPinnedDictionaryChildByTerm(parentId, normalizedTerm) {
+  const safeParentId = Number(parentId);
+  if (!Number.isInteger(safeParentId) || safeParentId <= 0 || !normalizedTerm) {
+    return null;
+  }
+  const childIds = getPinnedDictionaryChildIds(safeParentId);
+  for (const childId of childIds) {
+    const childNode = getDictionaryTreeNode(childId);
+    if (!childNode || childNode.parentId !== safeParentId || !childNode.lockedByClick) {
+      continue;
+    }
+    if (childNode.normalizedTerm === normalizedTerm) {
+      return childNode;
+    }
+  }
+  return null;
+}
+
 function collectDictionaryDescendantIds(nodeId) {
   const safeNodeId = Number(nodeId);
   if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
@@ -1509,8 +1556,26 @@ function pruneDictionarySubtree(nodeId, options = {}) {
     }
   }
   for (const [parentId, childId] of state.dictPinnedChildren.entries()) {
-    if (removeSet.has(parentId) || removeSet.has(childId)) {
+    if (removeSet.has(parentId)) {
       state.dictPinnedChildren.delete(parentId);
+      continue;
+    }
+    if (!(childId instanceof Set)) {
+      if (removeSet.has(childId)) {
+        state.dictPinnedChildren.delete(parentId);
+      }
+      continue;
+    }
+    const filtered = new Set();
+    for (const pinnedChildId of childId) {
+      if (!removeSet.has(pinnedChildId)) {
+        filtered.add(pinnedChildId);
+      }
+    }
+    if (filtered.size <= 0) {
+      state.dictPinnedChildren.delete(parentId);
+    } else {
+      state.dictPinnedChildren.set(parentId, filtered);
     }
   }
   for (const [parentId, childId] of state.dictTransientChildren.entries()) {
@@ -1543,16 +1608,14 @@ function setPinnedDictionaryChild(parentId, childId) {
   if (!Number.isInteger(safeParentId) || safeParentId <= 0 || !Number.isInteger(safeChildId) || safeChildId <= 0) {
     return;
   }
-  const previousChildId = state.dictPinnedChildren.get(safeParentId);
-  if (Number.isInteger(previousChildId) && previousChildId > 0 && previousChildId !== safeChildId) {
-    clearPinnedDictionarySubtree(previousChildId);
-  }
   const transientChildId = state.dictTransientChildren.get(safeParentId);
   if (Number.isInteger(transientChildId) && transientChildId > 0 && transientChildId !== safeChildId) {
     clearPinnedDictionarySubtree(transientChildId);
   }
   state.dictTransientChildren.delete(safeParentId);
-  state.dictPinnedChildren.set(safeParentId, safeChildId);
+  const pinnedChildIds = getPinnedDictionaryChildIds(safeParentId);
+  pinnedChildIds.add(safeChildId);
+  state.dictPinnedChildren.set(safeParentId, pinnedChildIds);
   const childNode = getDictionaryTreeNode(safeChildId);
   if (childNode) {
     childNode.lockedByClick = true;
@@ -1955,8 +2018,38 @@ function clampDictionaryPopupCenter(x, y, width, height, viewportWidth, viewport
 }
 
 function getActiveDictionaryTreePath() {
+  const keepIds = new Set();
   const activeNode = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
-  return collectDictionaryTreePath(activeNode?.id || state.dictTreeRootNodeId);
+  const activePath = collectDictionaryTreePath(activeNode?.id || state.dictTreeRootNodeId);
+  for (const node of activePath) {
+    keepIds.add(node.id);
+  }
+
+  for (const node of state.dictTreeNodes.values()) {
+    if (!node.lockedByClick) {
+      continue;
+    }
+    keepIds.add(node.id);
+    const ancestorPath = collectDictionaryTreePath(node.id);
+    for (const ancestor of ancestorPath) {
+      keepIds.add(ancestor.id);
+    }
+  }
+
+  const nodes = [];
+  for (const nodeId of keepIds) {
+    const node = getDictionaryTreeNode(nodeId);
+    if (node) {
+      nodes.push(node);
+    }
+  }
+  nodes.sort((left, right) => {
+    if (left.depth !== right.depth) {
+      return left.depth - right.depth;
+    }
+    return left.id - right.id;
+  });
+  return nodes;
 }
 
 function collectVisibleDictionaryPopupRects(excludeNodeId = null) {
@@ -2093,6 +2186,111 @@ function forceSeparateEntryFromObstacle(entry, obstacle, viewportWidth, viewport
   return true;
 }
 
+function buildDictionarySiblingMeta(path) {
+  const childrenByParent = new Map();
+  for (const node of path) {
+    if (!Number.isInteger(node?.parentId) || node.parentId <= 0) {
+      continue;
+    }
+    if (!childrenByParent.has(node.parentId)) {
+      childrenByParent.set(node.parentId, []);
+    }
+    childrenByParent.get(node.parentId).push(node);
+  }
+
+  const siblingMeta = new Map();
+  for (const siblings of childrenByParent.values()) {
+    siblings.sort((left, right) => left.id - right.id);
+    const count = siblings.length;
+    for (let index = 0; index < count; index += 1) {
+      const node = siblings[index];
+      siblingMeta.set(node.id, {
+        index,
+        count,
+      });
+    }
+  }
+  return siblingMeta;
+}
+
+function forceSeparatePopupEntries(entries, viewportWidth, viewportHeight, margin = 16) {
+  if (!Array.isArray(entries) || entries.length <= 1) {
+    return;
+  }
+  const iterations = 20;
+  for (let pass = 0; pass < iterations; pass += 1) {
+    let moved = false;
+    for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) {
+      const leftEntry = entries[leftIndex];
+      for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+        const rightEntry = entries[rightIndex];
+        const minHalfWidth = (leftEntry.width + rightEntry.width) * 0.5 + margin;
+        const minHalfHeight = (leftEntry.height + rightEntry.height) * 0.5 + margin;
+        const dx = leftEntry.x - rightEntry.x;
+        const dy = leftEntry.y - rightEntry.y;
+        const overlapX = minHalfWidth - Math.abs(dx);
+        const overlapY = minHalfHeight - Math.abs(dy);
+        if (overlapX <= 0 || overlapY <= 0) {
+          continue;
+        }
+        const moveLeft = leftEntry.movable;
+        const moveRight = rightEntry.movable;
+        if (!moveLeft && !moveRight) {
+          continue;
+        }
+
+        let adjustX = 0;
+        let adjustY = 0;
+        if (overlapX < overlapY) {
+          const direction = dx >= 0 ? 1 : -1;
+          adjustX = (overlapX + 0.9) * direction;
+        } else {
+          const direction = dy >= 0 ? 1 : -1;
+          adjustY = (overlapY + 0.9) * direction;
+        }
+
+        if (moveLeft && moveRight) {
+          leftEntry.x += adjustX * 0.5;
+          leftEntry.y += adjustY * 0.5;
+          rightEntry.x -= adjustX * 0.5;
+          rightEntry.y -= adjustY * 0.5;
+        } else if (moveLeft) {
+          leftEntry.x += adjustX;
+          leftEntry.y += adjustY;
+        } else {
+          rightEntry.x -= adjustX;
+          rightEntry.y -= adjustY;
+        }
+
+        const leftClamped = clampDictionaryPopupCenter(
+          leftEntry.x,
+          leftEntry.y,
+          leftEntry.width,
+          leftEntry.height,
+          viewportWidth,
+          viewportHeight
+        );
+        leftEntry.x = leftClamped.x;
+        leftEntry.y = leftClamped.y;
+        const rightClamped = clampDictionaryPopupCenter(
+          rightEntry.x,
+          rightEntry.y,
+          rightEntry.width,
+          rightEntry.height,
+          viewportWidth,
+          viewportHeight
+        );
+        rightEntry.x = rightClamped.x;
+        rightEntry.y = rightClamped.y;
+        moved = true;
+      }
+    }
+    if (!moved) {
+      break;
+    }
+  }
+}
+
 function computeDictionaryChildPopupTargetPosition(node, popupEl, parentPopupEl) {
   if (!node || !(popupEl instanceof HTMLElement) || !(parentPopupEl instanceof HTMLElement)) {
     return null;
@@ -2223,6 +2421,7 @@ function runDictionaryPopupForceLayout(path) {
     return;
   }
   const hoverObstacleRects = collectDictionaryHoverObstacleRects();
+  const siblingMeta = buildDictionarySiblingMeta(path);
 
   const layoutEntries = [];
   const byId = new Map();
@@ -2262,11 +2461,23 @@ function runDictionaryPopupForceLayout(path) {
     let targetX = target.centerX;
     let targetY = target.centerY;
     if (node.lockedByClick && !isHoverLocked) {
-      const parentDirectionRight = parentEntry.x <= (viewportWidth / 2);
-      const horizontalDirection = parentDirectionRight ? 1 : -1;
-      const detachedDistance = ((parentEntry.width + target.width) * 0.5) + 40 + (node.depth * 8);
-      targetX = parentEntry.x + (horizontalDirection * detachedDistance);
-      targetY = parentEntry.y + ((node.depth % 2 === 0 ? -1 : 1) * (14 + (node.depth * 3)));
+      const sibling = siblingMeta.get(node.id) || { index: 0, count: 1 };
+      const rightSpace = viewportWidth - (parentEntry.x + (parentEntry.width / 2));
+      const leftSpace = parentEntry.x - (parentEntry.width / 2);
+      const primaryDirection = rightSpace >= leftSpace ? 1 : -1;
+      const alternateDirection = (sibling.index % 2 === 0) ? primaryDirection : -primaryDirection;
+      const lane = Math.floor(sibling.index / 2);
+      const verticalGap = Math.max(32, Math.min(78, target.height * 0.62));
+      const centeredIndex = sibling.index - ((sibling.count - 1) / 2);
+      const verticalOffset = centeredIndex * verticalGap;
+      const detachedDistance = (
+        ((parentEntry.width + target.width) * 0.5)
+        + 54
+        + (lane * (Math.max(24, target.width * 0.48)))
+        + (node.depth * 10)
+      );
+      targetX = parentEntry.x + (alternateDirection * detachedDistance);
+      targetY = parentEntry.y + verticalOffset;
       const clampedTarget = clampDictionaryPopupCenter(
         targetX,
         targetY,
@@ -2354,6 +2565,8 @@ function runDictionaryPopupForceLayout(path) {
       entry.y = nextCenter.y;
     }
   }
+
+  forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 16);
 
   if (hoverObstacleRects.length) {
     for (let pass = 0; pass < 18; pass += 1) {
@@ -3576,15 +3789,9 @@ async function showSubtitleDictionaryForWord(wordEl, options = {}) {
   const normalizedTerm = normalizeDictionaryTerm(term);
   let treeResult = null;
   if (!shouldPin && source === "dict_popup" && parentNode) {
-    const pinnedChildId = state.dictPinnedChildren.get(parentNode.id);
-    if (Number.isInteger(pinnedChildId) && pinnedChildId > 0) {
-      const pinnedChild = getDictionaryTreeNode(pinnedChildId);
-      if (pinnedChild && pinnedChild.normalizedTerm && pinnedChild.normalizedTerm !== normalizedTerm) {
-        return;
-      }
-      if (pinnedChild) {
-        treeResult = { ok: true, node: pinnedChild };
-      }
+    const pinnedChild = findPinnedDictionaryChildByTerm(parentNode.id, normalizedTerm);
+    if (pinnedChild) {
+      treeResult = { ok: true, node: pinnedChild };
     } else {
       const transientNode = resolveDictionaryTransientChild(parentNode, term, normalizedTerm, source);
       treeResult = transientNode ? { ok: true, node: transientNode } : null;
