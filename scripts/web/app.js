@@ -24,6 +24,7 @@ const DICT_PREFETCH_HEAD_TERMS = 64;
 const DICT_PREFETCH_BATCH_SIZE = 12;
 const DICT_PREFETCH_BATCH_DELAY_MS = 32;
 const DICT_PREFETCH_START_DELAY_MS = 90;
+const DICT_POPUP_Z_BASE = 30;
 const PLAYER_CARD_SNAP_THRESHOLD_PX = 22;
 const PLAYER_CARD_SNAP_RELEASE_DELTA = 180;
 const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
@@ -1233,12 +1234,113 @@ function getDictionaryPopupElements() {
   return [elements.subtitleDictPopup, ...state.dictPopupNodeElements.values()];
 }
 
+function updateDictionaryPopupStacking() {
+  const hoveredNodeId = Number(state.dictHoveredNodeId);
+  const activeNodeId = Number(state.dictTreeCurrentNodeId);
+  const rootNodeId = Number(state.dictTreeRootNodeId);
+  const visiblePopups = [];
+
+  for (const popupEl of getDictionaryPopupElements()) {
+    if (!(popupEl instanceof HTMLElement)) {
+      continue;
+    }
+    if (popupEl.classList.contains("hidden")) {
+      popupEl.style.removeProperty("z-index");
+      continue;
+    }
+    const nodeId = resolveDictionaryPopupNodeIdFromElement(popupEl);
+    const node = getDictionaryTreeNode(nodeId);
+    let priority = 0;
+    if (node && Number.isInteger(node.depth)) {
+      priority += node.depth * 4;
+    }
+    if (node?.lockedByClick) {
+      priority += 36;
+    }
+    if (node?.transient) {
+      priority += 52;
+    }
+    if (Number.isInteger(rootNodeId) && rootNodeId > 0 && nodeId === rootNodeId) {
+      priority += 20;
+    }
+    if (Number.isInteger(activeNodeId) && activeNodeId > 0 && nodeId === activeNodeId) {
+      priority += 260;
+    }
+    if (Number.isInteger(hoveredNodeId) && hoveredNodeId > 0 && nodeId === hoveredNodeId) {
+      priority += 520;
+    }
+    visiblePopups.push({
+      popupEl,
+      priority,
+      basePriority: priority,
+      node,
+      nodeId: Number.isInteger(nodeId) && nodeId > 0 ? nodeId : 0,
+    });
+  }
+
+  const visibleNodeIds = new Set();
+  for (const popup of visiblePopups) {
+    if (popup.nodeId > 0) {
+      visibleNodeIds.add(popup.nodeId);
+    }
+  }
+
+  let browsingNodeId = null;
+  if (Number.isInteger(hoveredNodeId) && hoveredNodeId > 0 && visibleNodeIds.has(hoveredNodeId)) {
+    browsingNodeId = hoveredNodeId;
+  } else if (Number.isInteger(activeNodeId) && activeNodeId > 0 && visibleNodeIds.has(activeNodeId)) {
+    browsingNodeId = activeNodeId;
+  }
+
+  let candidateNodeId = null;
+  let parentNodeId = null;
+  if (Number.isInteger(browsingNodeId) && browsingNodeId > 0) {
+    const transientChildId = Number(state.dictTransientChildren.get(browsingNodeId));
+    if (Number.isInteger(transientChildId) && transientChildId > 0 && visibleNodeIds.has(transientChildId)) {
+      candidateNodeId = transientChildId;
+    }
+    const browsingNode = getDictionaryTreeNode(browsingNodeId);
+    const maybeParentNodeId = Number(browsingNode?.parentId);
+    if (Number.isInteger(maybeParentNodeId) && maybeParentNodeId > 0 && visibleNodeIds.has(maybeParentNodeId)) {
+      parentNodeId = maybeParentNodeId;
+    }
+  }
+
+  for (const popup of visiblePopups) {
+    popup.priority = popup.basePriority;
+    if (Number.isInteger(parentNodeId) && parentNodeId > 0 && popup.nodeId === parentNodeId) {
+      popup.priority += 3000;
+    }
+    if (Number.isInteger(candidateNodeId) && candidateNodeId > 0 && popup.nodeId === candidateNodeId) {
+      popup.priority += 4000;
+    }
+    if (Number.isInteger(browsingNodeId) && browsingNodeId > 0 && popup.nodeId === browsingNodeId) {
+      popup.priority += 5000;
+    }
+  }
+
+  visiblePopups.sort((left, right) => {
+    if (left.priority !== right.priority) {
+      return left.priority - right.priority;
+    }
+    return left.nodeId - right.nodeId;
+  });
+
+  let zIndex = DICT_POPUP_Z_BASE;
+  for (const popup of visiblePopups) {
+    popup.popupEl.style.zIndex = String(zIndex);
+    zIndex += 1;
+  }
+}
+
 function hideDictionaryPopupElement(popupEl) {
   if (!(popupEl instanceof HTMLElement)) {
     return;
   }
   popupEl.classList.add("hidden");
   popupEl.setAttribute("aria-hidden", "true");
+  popupEl.style.removeProperty("z-index");
+  updateDictionaryPopupStacking();
 }
 
 function showDictionaryPopupElement(popupEl) {
@@ -1248,6 +1350,7 @@ function showDictionaryPopupElement(popupEl) {
   popupEl.classList.remove("hidden");
   popupEl.setAttribute("aria-hidden", "false");
   popupEl.classList.toggle("pinned", state.dictPopupPinned);
+  updateDictionaryPopupStacking();
 }
 
 function removeDictionaryPopupNodeElements() {
@@ -1283,6 +1386,7 @@ function bindDictionaryPopupElementEvents(popupEl) {
     if (Number.isInteger(hoveredNodeId) && hoveredNodeId > 0) {
       state.dictHoveredNodeId = hoveredNodeId;
     }
+    updateDictionaryPopupStacking();
     clearDictionaryPopupHideTimer();
     startDictionaryHoverLoop();
   });
@@ -1291,6 +1395,7 @@ function bindDictionaryPopupElementEvents(popupEl) {
     if (!nextElement || !nextElement.closest(".subtitle-dict-popup")) {
       state.dictHoveredNodeId = null;
     }
+    updateDictionaryPopupStacking();
     if (isDictionaryHoverSafeTarget(nextElement)) {
       return;
     }
@@ -1379,6 +1484,7 @@ function retainDictionaryPopupPath(nodeId) {
     for (const popupEl of state.dictPopupNodeElements.values()) {
       hideDictionaryPopupElement(popupEl);
     }
+    updateDictionaryPopupStacking();
     return;
   }
   const path = collectDictionaryTreePath(safeNodeId);
@@ -1410,6 +1516,7 @@ function retainDictionaryPopupPath(nodeId) {
     }
     hideDictionaryPopupElement(popupEl);
   }
+  updateDictionaryPopupStacking();
 }
 
 function resetDictionaryTreeState() {
@@ -1922,6 +2029,8 @@ function hideSubtitleDictionaryPopup() {
   }
   elements.subtitleDictPopup.classList.add("hidden");
   elements.subtitleDictPopup.setAttribute("aria-hidden", "true");
+  elements.subtitleDictPopup.style.removeProperty("z-index");
+  updateDictionaryPopupStacking();
   clearActiveDictionaryWord();
 }
 
@@ -2584,6 +2693,183 @@ function positionDictionaryChildPopup(nodeId) {
   popupEl.style.transform = "none";
 }
 
+function applyDictionaryPopupLayoutEntries(layoutEntries) {
+  for (const entry of layoutEntries) {
+    if (entry.id === state.dictTreeRootNodeId) {
+      continue;
+    }
+    const left = entry.x - (entry.width / 2);
+    const top = entry.y - (entry.height / 2);
+    entry.popupEl.style.left = `${left.toFixed(1)}px`;
+    entry.popupEl.style.top = `${top.toFixed(1)}px`;
+    entry.popupEl.style.transform = "none";
+    state.dictPopupNodeLayout.set(entry.id, { x: entry.x, y: entry.y });
+  }
+}
+
+function runDictionaryPopupD3ForceLayout({
+  layoutEntries,
+  path,
+  hoverObstacleRects,
+  viewportWidth,
+  viewportHeight,
+}) {
+  const d3 = window.d3;
+  if (
+    !d3
+    || typeof d3.forceSimulation !== "function"
+    || typeof d3.forceLink !== "function"
+    || typeof d3.forceManyBody !== "function"
+    || typeof d3.forceCollide !== "function"
+    || typeof d3.forceX !== "function"
+    || typeof d3.forceY !== "function"
+  ) {
+    return false;
+  }
+  if (!Array.isArray(layoutEntries) || layoutEntries.length <= 1) {
+    return false;
+  }
+
+  const nodes = [];
+  const entryNodeById = new Map();
+  for (const entry of layoutEntries) {
+    const node = {
+      id: `entry:${entry.id}`,
+      entryId: entry.id,
+      entry,
+      movable: Boolean(entry.movable),
+      x: entry.x,
+      y: entry.y,
+      targetX: entry.targetX,
+      targetY: entry.targetY,
+      radius: Math.hypot(entry.width * 0.5, entry.height * 0.5) + 20,
+    };
+    if (!entry.movable) {
+      node.fx = entry.x;
+      node.fy = entry.y;
+    }
+    nodes.push(node);
+    entryNodeById.set(entry.id, node);
+  }
+
+  for (let idx = 0; idx < hoverObstacleRects.length; idx += 1) {
+    const obstacle = hoverObstacleRects[idx];
+    if (
+      !obstacle
+      || !Number.isFinite(obstacle.left)
+      || !Number.isFinite(obstacle.top)
+      || !Number.isFinite(obstacle.width)
+      || !Number.isFinite(obstacle.height)
+      || obstacle.width <= 0
+      || obstacle.height <= 0
+    ) {
+      continue;
+    }
+    const centerX = obstacle.left + (obstacle.width / 2);
+    const centerY = obstacle.top + (obstacle.height / 2);
+    nodes.push({
+      id: `obstacle:${idx}`,
+      obstacle: true,
+      x: centerX,
+      y: centerY,
+      fx: centerX,
+      fy: centerY,
+      radius: Math.hypot(obstacle.width * 0.5, obstacle.height * 0.5) + 28,
+    });
+  }
+
+  const links = [];
+  for (const node of path) {
+    const child = entryNodeById.get(node.id);
+    const parent = entryNodeById.get(node.parentId);
+    if (!child || !parent || !child.entry || !parent.entry) {
+      continue;
+    }
+    const distance = ((child.entry.width + parent.entry.width) * 0.5) + 56;
+    links.push({
+      source: parent.id,
+      target: child.id,
+      distance,
+      strength: child.movable ? 0.22 : 0.06,
+    });
+  }
+
+  const simulation = d3.forceSimulation(nodes)
+    .alpha(0.96)
+    .alphaMin(0.03)
+    .velocityDecay(0.42)
+    .force(
+      "link",
+      d3.forceLink(links)
+        .id((node) => node.id)
+        .distance((link) => link.distance)
+        .strength((link) => link.strength)
+    )
+    .force("charge", d3.forceManyBody().strength((node) => (node.obstacle ? 0 : -220)))
+    .force("collide", d3.forceCollide().radius((node) => node.radius).iterations(3))
+    .force("x", d3.forceX((node) => (node.entry ? node.targetX : node.x)).strength((node) => (
+      node.entry && node.movable ? 0.085 : 0
+    )))
+    .force("y", d3.forceY((node) => (node.entry ? node.targetY : node.y)).strength((node) => (
+      node.entry && node.movable ? 0.085 : 0
+    )))
+    .stop();
+
+  const tickCount = Math.max(30, Math.min(120, 26 + (layoutEntries.length * 10)));
+  for (let tick = 0; tick < tickCount; tick += 1) {
+    simulation.tick();
+    for (const node of nodes) {
+      if (!node.entry) {
+        continue;
+      }
+      const clamped = clampDictionaryPopupCenter(
+        node.x,
+        node.y,
+        node.entry.width,
+        node.entry.height,
+        viewportWidth,
+        viewportHeight
+      );
+      node.x = clamped.x;
+      node.y = clamped.y;
+      if (!node.movable) {
+        node.fx = clamped.x;
+        node.fy = clamped.y;
+      }
+    }
+  }
+  simulation.stop();
+
+  for (const node of nodes) {
+    if (!node.entry) {
+      continue;
+    }
+    node.entry.x = node.x;
+    node.entry.y = node.y;
+  }
+
+  forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 24);
+  for (let pass = 0; pass < 3; pass += 1) {
+    let moved = false;
+    for (const entry of layoutEntries) {
+      if (!entry.movable) {
+        continue;
+      }
+      for (const obstacle of hoverObstacleRects) {
+        if (forceSeparateEntryFromObstacle(entry, obstacle, viewportWidth, viewportHeight, 22)) {
+          moved = true;
+        }
+      }
+    }
+    forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 24);
+    if (!moved) {
+      break;
+    }
+  }
+
+  return true;
+}
+
 function runDictionaryPopupForceLayout(path) {
   if (!Array.isArray(path) || path.length <= 1) {
     return;
@@ -2714,6 +3000,19 @@ function runDictionaryPopupForceLayout(path) {
     return;
   }
 
+  if (
+    runDictionaryPopupD3ForceLayout({
+      layoutEntries,
+      path,
+      hoverObstacleRects,
+      viewportWidth,
+      viewportHeight,
+    })
+  ) {
+    applyDictionaryPopupLayoutEntries(layoutEntries);
+    return;
+  }
+
   const fixedEntries = [];
   const movableEntries = [];
   for (const entry of layoutEntries) {
@@ -2790,17 +3089,7 @@ function runDictionaryPopupForceLayout(path) {
     }
   }
 
-  for (const entry of layoutEntries) {
-    if (entry.id === state.dictTreeRootNodeId) {
-      continue;
-    }
-    const left = entry.x - (entry.width / 2);
-    const top = entry.y - (entry.height / 2);
-    entry.popupEl.style.left = `${left.toFixed(1)}px`;
-    entry.popupEl.style.top = `${top.toFixed(1)}px`;
-    entry.popupEl.style.transform = "none";
-    state.dictPopupNodeLayout.set(entry.id, { x: entry.x, y: entry.y });
-  }
+  applyDictionaryPopupLayoutEntries(layoutEntries);
 }
 
 function renderDictionaryGraphEdges(path) {
@@ -2923,6 +3212,7 @@ function repositionActiveDictionaryPopup() {
   }
   positionDictionaryPopupForNode(path[0].id);
   runDictionaryPopupForceLayout(path);
+  updateDictionaryPopupStacking();
   renderDictionaryGraphEdges(path);
   scheduleDictionaryGraphTrack(DICT_GRAPH_TRACK_MS);
 }

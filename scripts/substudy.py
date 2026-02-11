@@ -4693,6 +4693,9 @@ def build_web_handler(
                 if path == "/styles.css":
                     self._serve_static_file("styles.css")
                     return
+                if path.startswith("/vendor/"):
+                    self._serve_static_file(path.lstrip("/"))
+                    return
                 if path.startswith("/media/"):
                     token = path[len("/media/") :]
                     self._serve_media_file(token)
