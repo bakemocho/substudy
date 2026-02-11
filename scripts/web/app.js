@@ -1393,6 +1393,17 @@ function retainDictionaryPopupPath(nodeId) {
       keepIds.add(ancestor.id);
     }
   }
+  const hoveredNodeId = Number(state.dictHoveredNodeId);
+  if (Number.isInteger(hoveredNodeId) && hoveredNodeId > 0) {
+    const transientChildId = Number(state.dictTransientChildren.get(hoveredNodeId));
+    if (Number.isInteger(transientChildId) && transientChildId > 0) {
+      keepIds.add(transientChildId);
+      const transientPath = collectDictionaryTreePath(transientChildId);
+      for (const transientNode of transientPath) {
+        keepIds.add(transientNode.id);
+      }
+    }
+  }
   for (const [popupNodeId, popupEl] of state.dictPopupNodeElements.entries()) {
     if (keepIds.has(popupNodeId)) {
       continue;
@@ -2213,6 +2224,17 @@ function buildDictionarySiblingMeta(path) {
   return siblingMeta;
 }
 
+function isDictionaryNodeCandidateLocked(node) {
+  if (!node || !node.transient) {
+    return false;
+  }
+  const hoveredNodeId = Number(state.dictHoveredNodeId);
+  if (!Number.isInteger(hoveredNodeId) || hoveredNodeId <= 0) {
+    return false;
+  }
+  return node.parentId === hoveredNodeId;
+}
+
 function forceSeparatePopupEntries(entries, viewportWidth, viewportHeight, margin = 16) {
   if (!Array.isArray(entries) || entries.length <= 1) {
     return;
@@ -2289,6 +2311,148 @@ function forceSeparatePopupEntries(entries, viewportWidth, viewportHeight, margi
       break;
     }
   }
+}
+
+function doesDictionaryEntryOverlapAny(entry, reservedRects, margin = 12) {
+  if (!entry || !Array.isArray(reservedRects) || reservedRects.length <= 0) {
+    return false;
+  }
+  const entryRect = buildDictionaryEntryRect(entry, entry.x, entry.y, margin);
+  for (const reservedRect of reservedRects) {
+    if (computeRectangleOverlapArea(entryRect, reservedRect) > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function repackMovableDictionaryEntries({
+  movableEntries,
+  fixedRects,
+  viewportWidth,
+  viewportHeight,
+  margin = 14,
+}) {
+  if (!Array.isArray(movableEntries) || movableEntries.length <= 0) {
+    return;
+  }
+  const maxPasses = 4;
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    let moved = false;
+    const reservedRects = fixedRects.slice();
+    for (const entry of movableEntries) {
+      const preferred = findDictionaryFreeCenter({
+        entry,
+        preferredX: entry.targetX,
+        preferredY: entry.targetY,
+        reservedRects,
+        viewportWidth,
+        viewportHeight,
+        margin,
+      });
+      const nextX = preferred.x;
+      const nextY = preferred.y;
+      if (Math.abs(nextX - entry.x) > 0.5 || Math.abs(nextY - entry.y) > 0.5) {
+        moved = true;
+      }
+      entry.x = nextX;
+      entry.y = nextY;
+      reservedRects.push(buildDictionaryEntryRect(entry, entry.x, entry.y, margin));
+    }
+    if (!moved) {
+      break;
+    }
+  }
+}
+
+function buildDictionaryEntryRect(entry, centerX = entry.x, centerY = entry.y, margin = 0) {
+  const halfWidth = (entry.width / 2) + margin;
+  const halfHeight = (entry.height / 2) + margin;
+  return {
+    left: centerX - halfWidth,
+    right: centerX + halfWidth,
+    top: centerY - halfHeight,
+    bottom: centerY + halfHeight,
+    width: entry.width + (margin * 2),
+    height: entry.height + (margin * 2),
+  };
+}
+
+function computeDictionaryRectTotalOverlap(rect, reservedRects) {
+  if (!rect || !Array.isArray(reservedRects) || !reservedRects.length) {
+    return 0;
+  }
+  let total = 0;
+  for (const reservedRect of reservedRects) {
+    total += computeRectangleOverlapArea(rect, reservedRect);
+  }
+  return total;
+}
+
+function findDictionaryFreeCenter({
+  entry,
+  preferredX,
+  preferredY,
+  reservedRects,
+  viewportWidth,
+  viewportHeight,
+  margin = 12,
+}) {
+  const initialCenter = clampDictionaryPopupCenter(
+    preferredX,
+    preferredY,
+    entry.width,
+    entry.height,
+    viewportWidth,
+    viewportHeight
+  );
+  const initialRect = buildDictionaryEntryRect(entry, initialCenter.x, initialCenter.y, margin);
+  const initialOverlap = computeDictionaryRectTotalOverlap(initialRect, reservedRects);
+  let best = {
+    x: initialCenter.x,
+    y: initialCenter.y,
+    overlap: initialOverlap,
+    distance: 0,
+  };
+  if (initialOverlap <= 0) {
+    return best;
+  }
+
+  const maxRadius = Math.max(viewportWidth, viewportHeight) + Math.max(entry.width, entry.height);
+  const ringStep = Math.max(24, Math.min(64, Math.round(Math.min(entry.width, entry.height) * 0.22)));
+  for (let radius = ringStep; radius <= maxRadius; radius += ringStep) {
+    const sampleCount = Math.max(12, Math.round((Math.PI * 2 * radius) / ringStep));
+    for (let sample = 0; sample < sampleCount; sample += 1) {
+      const angle = (Math.PI * 2 * sample) / sampleCount;
+      const candidateCenter = clampDictionaryPopupCenter(
+        preferredX + (Math.cos(angle) * radius),
+        preferredY + (Math.sin(angle) * radius),
+        entry.width,
+        entry.height,
+        viewportWidth,
+        viewportHeight
+      );
+      const candidateRect = buildDictionaryEntryRect(entry, candidateCenter.x, candidateCenter.y, margin);
+      const overlap = computeDictionaryRectTotalOverlap(candidateRect, reservedRects);
+      const distance = Math.hypot(candidateCenter.x - preferredX, candidateCenter.y - preferredY);
+      if (
+        overlap < best.overlap
+        || (overlap === best.overlap && distance < best.distance)
+      ) {
+        best = {
+          x: candidateCenter.x,
+          y: candidateCenter.y,
+          overlap,
+          distance,
+        };
+      }
+      if (overlap <= 0) {
+        return best;
+      }
+    }
+  }
+
+  return best;
 }
 
 function computeDictionaryChildPopupTargetPosition(node, popupEl, parentPopupEl) {
@@ -2383,6 +2547,20 @@ function readDictionaryPopupCenter(popupEl) {
   };
 }
 
+function isDictionaryPopupCenterUsable(center, viewportWidth, viewportHeight) {
+  if (!center || !Number.isFinite(center.x) || !Number.isFinite(center.y)) {
+    return false;
+  }
+  if (viewportWidth <= 0 || viewportHeight <= 0) {
+    return false;
+  }
+  const minX = -viewportWidth * 0.5;
+  const maxX = viewportWidth * 1.5;
+  const minY = -viewportHeight * 0.5;
+  const maxY = viewportHeight * 1.5;
+  return center.x >= minX && center.x <= maxX && center.y >= minY && center.y <= maxY;
+}
+
 function positionDictionaryChildPopup(nodeId) {
   const safeNodeId = Number(nodeId);
   if (!Number.isInteger(safeNodeId) || safeNodeId <= 0 || safeNodeId === state.dictTreeRootNodeId) {
@@ -2422,6 +2600,7 @@ function runDictionaryPopupForceLayout(path) {
   }
   const hoverObstacleRects = collectDictionaryHoverObstacleRects();
   const siblingMeta = buildDictionarySiblingMeta(path);
+  const hoveredNodeId = Number(state.dictHoveredNodeId);
 
   const layoutEntries = [];
   const byId = new Map();
@@ -2456,28 +2635,32 @@ function runDictionaryPopupForceLayout(path) {
     }
     const stored = state.dictPopupNodeLayout.get(node.id) || null;
     const currentCenter = readDictionaryPopupCenter(popupEl);
-    const isHoverLocked = Number.isInteger(state.dictHoveredNodeId) && state.dictHoveredNodeId === node.id;
-    const shouldSnap = !node.lockedByClick && !isHoverLocked && !node.transient;
+    const isHoverLocked = Number.isInteger(hoveredNodeId) && hoveredNodeId === node.id;
+    const isCandidateLocked = isDictionaryNodeCandidateLocked(node);
+    const isPinnedUnderHoveredParent = (
+      node.lockedByClick
+      && Number.isInteger(hoveredNodeId)
+      && hoveredNodeId > 0
+      && node.parentId === hoveredNodeId
+    );
+    const layoutLocked = isHoverLocked || isCandidateLocked || isPinnedUnderHoveredParent;
     let targetX = target.centerX;
     let targetY = target.centerY;
-    if (node.lockedByClick && !isHoverLocked) {
+    if (!layoutLocked) {
       const sibling = siblingMeta.get(node.id) || { index: 0, count: 1 };
-      const rightSpace = viewportWidth - (parentEntry.x + (parentEntry.width / 2));
-      const leftSpace = parentEntry.x - (parentEntry.width / 2);
-      const primaryDirection = rightSpace >= leftSpace ? 1 : -1;
-      const alternateDirection = (sibling.index % 2 === 0) ? primaryDirection : -primaryDirection;
-      const lane = Math.floor(sibling.index / 2);
-      const verticalGap = Math.max(32, Math.min(78, target.height * 0.62));
-      const centeredIndex = sibling.index - ((sibling.count - 1) / 2);
-      const verticalOffset = centeredIndex * verticalGap;
+      const slotsPerRing = Math.max(5, Math.min(8, sibling.count));
+      const ring = Math.floor(sibling.index / slotsPerRing);
+      const slot = sibling.index % slotsPerRing;
+      const angleStep = (Math.PI * 2) / slotsPerRing;
+      const angle = (-Math.PI / 2) + (slot * angleStep);
       const detachedDistance = (
         ((parentEntry.width + target.width) * 0.5)
-        + 54
-        + (lane * (Math.max(24, target.width * 0.48)))
+        + 56
+        + (ring * Math.max(54, target.width * 0.62))
         + (node.depth * 10)
       );
-      targetX = parentEntry.x + (alternateDirection * detachedDistance);
-      targetY = parentEntry.y + verticalOffset;
+      targetX = parentEntry.x + (Math.cos(angle) * detachedDistance);
+      targetY = parentEntry.y + (Math.sin(angle) * detachedDistance);
       const clampedTarget = clampDictionaryPopupCenter(
         targetX,
         targetY,
@@ -2489,20 +2672,21 @@ function runDictionaryPopupForceLayout(path) {
       targetX = clampedTarget.x;
       targetY = clampedTarget.y;
     }
-    const initialX = shouldSnap
-      ? targetX
-      : (
-        Number.isFinite(currentCenter?.x)
-          ? currentCenter.x
-          : (Number.isFinite(stored?.x) ? stored.x : targetX)
-      );
-    const initialY = shouldSnap
-      ? targetY
-      : (
-        Number.isFinite(currentCenter?.y)
-          ? currentCenter.y
-          : (Number.isFinite(stored?.y) ? stored.y : targetY)
-      );
+    const hasUsableCurrentCenter = isDictionaryPopupCenterUsable(
+      currentCenter,
+      viewportWidth,
+      viewportHeight
+    );
+    const initialX = (
+      hasUsableCurrentCenter
+        ? currentCenter.x
+        : (Number.isFinite(stored?.x) ? stored.x : targetX)
+    );
+    const initialY = (
+      hasUsableCurrentCenter
+        ? currentCenter.y
+        : (Number.isFinite(stored?.y) ? stored.y : targetY)
+    );
     const clamped = clampDictionaryPopupCenter(
       initialX,
       initialY,
@@ -2520,7 +2704,7 @@ function runDictionaryPopupForceLayout(path) {
       y: clamped.y,
       targetX,
       targetY,
-      movable: node.lockedByClick && !isHoverLocked,
+      movable: !layoutLocked,
     };
     layoutEntries.push(entry);
     byId.set(entry.id, entry);
@@ -2530,68 +2714,79 @@ function runDictionaryPopupForceLayout(path) {
     return;
   }
 
-  const iterations = 22;
-  for (let iter = 0; iter < iterations; iter += 1) {
-    for (const entry of layoutEntries) {
-      if (!entry.movable) {
-        continue;
-      }
-      let forceX = (entry.targetX - entry.x) * 0.18;
-      let forceY = (entry.targetY - entry.y) * 0.18;
-      for (const other of layoutEntries) {
-        if (other.id === entry.id) {
-          continue;
-        }
-        const dx = entry.x - other.x;
-        const dy = entry.y - other.y;
-        const distance = Math.max(0.001, Math.hypot(dx, dy));
-        const minDistance = ((entry.width + other.width) * 0.5) + 18;
-        if (distance >= minDistance) {
-          continue;
-        }
-        const repel = (minDistance - distance) * 0.26;
-        forceX += (dx / distance) * repel;
-        forceY += (dy / distance) * repel;
-      }
-      const nextCenter = clampDictionaryPopupCenter(
-        entry.x + forceX,
-        entry.y + forceY,
-        entry.width,
-        entry.height,
-        viewportWidth,
-        viewportHeight
-      );
-      entry.x = nextCenter.x;
-      entry.y = nextCenter.y;
+  const fixedEntries = [];
+  const movableEntries = [];
+  for (const entry of layoutEntries) {
+    if (entry.movable) {
+      movableEntries.push(entry);
+    } else {
+      fixedEntries.push(entry);
+    }
+  }
+  movableEntries.sort((left, right) => {
+    if (left.id === right.id) {
+      return 0;
+    }
+    const leftNode = getDictionaryTreeNode(left.id);
+    const rightNode = getDictionaryTreeNode(right.id);
+    const leftDepth = Number.isInteger(leftNode?.depth) ? leftNode.depth : 0;
+    const rightDepth = Number.isInteger(rightNode?.depth) ? rightNode.depth : 0;
+    if (leftDepth !== rightDepth) {
+      return leftDepth - rightDepth;
+    }
+    return left.id - right.id;
+  });
+
+  const fixedReservedRects = [];
+  for (const fixedEntry of fixedEntries) {
+    fixedReservedRects.push(buildDictionaryEntryRect(fixedEntry, fixedEntry.x, fixedEntry.y, 20));
+  }
+  for (const obstacle of hoverObstacleRects) {
+    if (obstacle && Number.isFinite(obstacle.left) && Number.isFinite(obstacle.top)) {
+      fixedReservedRects.push({
+        left: obstacle.left - 20,
+        top: obstacle.top - 20,
+        right: obstacle.right + 20,
+        bottom: obstacle.bottom + 20,
+        width: obstacle.width + 40,
+        height: obstacle.height + 40,
+      });
     }
   }
 
-  forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 16);
+  repackMovableDictionaryEntries({
+    movableEntries,
+    fixedRects: fixedReservedRects,
+    viewportWidth,
+    viewportHeight,
+    margin: 16,
+  });
 
-  if (hoverObstacleRects.length) {
-    for (let pass = 0; pass < 18; pass += 1) {
-      let moved = false;
-      for (const entry of layoutEntries) {
-        if (entry.id === state.dictTreeRootNodeId) {
-          continue;
-        }
-        if (Number.isInteger(state.dictHoveredNodeId) && state.dictHoveredNodeId === entry.id) {
-          continue;
-        }
-        for (const obstacle of hoverObstacleRects) {
-          const changed = forceSeparateEntryFromObstacle(
-            entry,
-            obstacle,
-            viewportWidth,
-            viewportHeight,
-            18
-          );
-          moved = moved || changed;
-        }
+  forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 24);
+
+  for (let pass = 0; pass < 3; pass += 1) {
+    const dynamicReserved = fixedReservedRects.slice();
+    let stillOverlapping = false;
+    for (const entry of movableEntries) {
+      if (doesDictionaryEntryOverlapAny(entry, dynamicReserved, 16)) {
+        const preferred = findDictionaryFreeCenter({
+          entry,
+          preferredX: entry.x,
+          preferredY: entry.y,
+          reservedRects: dynamicReserved,
+          viewportWidth,
+          viewportHeight,
+          margin: 16,
+        });
+        entry.x = preferred.x;
+        entry.y = preferred.y;
+        stillOverlapping = stillOverlapping || preferred.overlap > 0;
       }
-      if (!moved) {
-        break;
-      }
+      dynamicReserved.push(buildDictionaryEntryRect(entry, entry.x, entry.y, 16));
+    }
+    forceSeparatePopupEntries(layoutEntries, viewportWidth, viewportHeight, 24);
+    if (!stillOverlapping) {
+      break;
     }
   }
 
@@ -2727,9 +2922,6 @@ function repositionActiveDictionaryPopup() {
     return;
   }
   positionDictionaryPopupForNode(path[0].id);
-  for (let idx = 1; idx < path.length; idx += 1) {
-    positionDictionaryPopupForNode(path[idx].id);
-  }
   runDictionaryPopupForceLayout(path);
   renderDictionaryGraphEdges(path);
   scheduleDictionaryGraphTrack(DICT_GRAPH_TRACK_MS);
