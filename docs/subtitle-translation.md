@@ -14,6 +14,11 @@
 - `substudy` は字幕ファイル名から `video_id` と `language` を推定する。
 - 追加した字幕をUIで使うには、翻訳後に `ledger` 更新が必要。
 - **動画ファイルが存在する字幕のみ**を翻訳対象とする（字幕だけあって動画がないものは対象外）。
+- `source_id` は `config/sources.toml` の `[sources.<name>]` の `<name>` 部分。`sources` テーブルの FK であり、対象選定や記録で必須。確認方法:
+
+```bash
+sqlite3 data/master_ledger.sqlite "SELECT source_id FROM sources;"
+```
 
 ## 3. 出力要件
 
@@ -47,23 +52,32 @@
 
 ## 5. 実行手順
 
-1. 翻訳対象ファイルを列挙する（動画あり字幕のみ）。
+1. 翻訳対象ファイルを列挙する（動画あり・未翻訳・指定ソースのみ）。
 
 ```bash
 cd /path/to/substudy
 mkdir -p logs
 python3 scripts/substudy.py ledger --config config/sources.toml --incremental
+SOURCE_ID="storiesofcz"   # ← 対象ソースに合わせて変更
 sqlite3 data/master_ledger.sqlite "
-SELECT DISTINCT s.subtitle_path
+SELECT DISTINCT s.source_id, s.video_id, s.subtitle_path
 FROM subtitles s
 JOIN videos v
-  ON v.source_id = s.source_id
- AND v.video_id = s.video_id
+  ON v.source_id = s.source_id AND v.video_id = s.video_id
 WHERE v.has_media = 1
+  AND s.source_id = '${SOURCE_ID}'      -- ソース指定
+  AND s.language <> 'ja'                 -- 和訳自体を除外
   AND s.subtitle_path IS NOT NULL
   AND s.subtitle_path <> ''
   AND lower(COALESCE(s.ext, '')) IN ('srt', 'vtt')
-ORDER BY s.subtitle_path;
+  AND NOT EXISTS (                       -- 翻訳済み除外
+    SELECT 1 FROM translation_runs tr
+    WHERE tr.source_id = s.source_id
+      AND tr.video_id = s.video_id
+      AND tr.target_lang = 'ja'
+      AND tr.status = 'active'
+  )
+ORDER BY CAST(s.video_id AS INTEGER);
 " > logs/translation_targets.txt
 ```
 
@@ -72,10 +86,15 @@ ORDER BY s.subtitle_path;
    - 段階的に拡大: 1件 → 5件 → 15〜20件 → 30〜50件。
    - 昇格条件: キュー数一致・時刻一致が全件OK、失敗率1%未満、手動サンプルで致命的誤訳なし。
 
-3. 「入力ファイル」「出力規則」「要件」を明示して翻訳実行させる。
+3. **1件ごとに「翻訳 → 検証 → DB記録」をアトミックに行う。**
+
+   バッチ内の各ファイルについて、以下の 3a〜3c を繰り返す。
+   中断しても完了分は DB に記録済みとなり、再開時は同じ対象選定クエリ（ステップ1）を再実行するだけで翻訳済みが自動除外される。
+
+   **3a.** 「入力ファイル」「出力規則」「要件」を明示して翻訳を実行する。
    - 下の「依頼テンプレート」をそのまま使ってよい。
 
-4. 翻訳後に検証する（キュー数・時刻一致）。
+   **3b.** 翻訳後に検証する（キュー数・時刻一致）。
 
 ```bash
 python3 - <<'PY'
@@ -111,7 +130,7 @@ raise SystemExit(0 if ok else 1)
 PY
 ```
 
-5. 翻訳ログに記録する（`master_ledger.sqlite` の `translation_runs` テーブル）。
+   **3c.** 検証OKなら即座に翻訳ログへ記録する（`master_ledger.sqlite` の `translation_runs` テーブル）。
 
    各レコードに以下を含める:
    - `source_id`, `video_id`, `source_path`, `output_path`, `cue_count`, `cue_match`
@@ -119,17 +138,50 @@ PY
    - `created_at`, `finished_at`（ISO 8601 UTC）
    - `summary`（内容の日本語要約。学習時の内容把握に有用）
 
-6. ledger を更新して翻訳字幕をトラックに反映する。
+   > **重要:** DB記録をバッチ末尾にまとめず、1件ごとに行うことで中断耐性を確保する。
+
+4. バッチ全件の処理が完了したら、ledger を更新して翻訳字幕をトラックに反映する。
 
 ```bash
 python3 scripts/substudy.py ledger --config config/sources.toml --incremental
 ```
 
-7. Web UI でトラック選択に `ja` が出るか確認する。
+5. Web UI でトラック選択に `ja` が出るか確認する。
 
 ```bash
 python3 scripts/substudy.py web --config config/sources.toml
 ```
+
+## 5.5. 中断復旧
+
+### ケースA: 正常な再開
+
+対象選定クエリ（ステップ1）を再実行するだけでよい。翻訳済み（DB記録済み）は `NOT EXISTS` 条件で自動除外されるため、追加作業は不要。
+
+### ケースB: ディスクにファイルはあるがDB未記録（orphan）
+
+rate limit 等でバッチが中断し、ファイルは書き出されたがDB記録前に停止した場合に発生する。
+以下のクエリで orphan を検出する:
+
+```sql
+SELECT s.source_id, s.video_id, s.subtitle_path
+FROM subtitles s
+WHERE s.language = 'ja'
+  AND s.source_id = :source_id
+  AND NOT EXISTS (
+    SELECT 1 FROM translation_runs tr
+    WHERE tr.source_id = s.source_id
+      AND tr.video_id = s.video_id
+      AND tr.target_lang = 'ja'
+      AND tr.status = 'active'
+  );
+```
+
+orphan が見つかった場合:
+
+1. 検証スクリプト（ステップ3b）で各 orphan のキュー数・時刻一致を確認する。
+2. 検証OKなら、ステップ3c と同じ手順で `translation_runs` に記録する。
+3. 検証NGなら、ファイルを削除して対象選定クエリから再翻訳する。
 
 ## 6. 依頼テンプレート
 
@@ -137,10 +189,13 @@ python3 scripts/substudy.py web --config config/sources.toml
 
 ### テンプレート
 
-以下をそのまま渡して、`INPUT_FILES` と `OUTPUT_DIR` だけ埋める。
+以下をそのまま渡して、`SOURCE_ID`、`INPUT_FILES`、`OUTPUT_DIR` を埋める。
 
 ```text
 字幕ファイルを英語から日本語へ翻訳してください。
+
+対象ソース:
+- SOURCE_ID（例: storiesofcz）
 
 目的:
 - 学習用途の日本語字幕を作成する。
@@ -165,13 +220,15 @@ python3 scripts/substudy.py web --config config/sources.toml
 - 口語フィラーは必要に応じて軽く反映
 
 実行手順:
+- 1件ごとに「翻訳 → 検証 → DB記録」をアトミックに行う
 - 既存の .ja.* があれば上書きせずスキップ
 - 処理した件数、スキップ件数、失敗件数を最後に報告
 - 失敗ファイルは理由とともに一覧化
+- 中断しても完了分はDB記録済みのため、同じ対象選定クエリで再開可能
 
 記録:
 - 翻訳後、各ファイルの内容を日本語で短く要約し summary として報告
-- 翻訳ログ (master_ledger.sqlite の translation_runs テーブル) にレコードを追記
+- 翻訳ログ (master_ledger.sqlite の translation_runs テーブル) に1件ずつレコードを追記
 ```
 
 ## 7. 翻訳ログ
