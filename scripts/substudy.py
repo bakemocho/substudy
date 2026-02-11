@@ -530,6 +530,19 @@ def sync_source(
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
     cookie_flags = resolve_cookie_flags(source)
+    if connection is not None and not dry_run:
+        recovered_any = False
+        for stage in ("media", "subs", "meta"):
+            recovered = recover_interrupted_download_runs(
+                connection=connection,
+                source_id=source.id,
+                stage=stage,
+            )
+            if recovered:
+                recovered_any = True
+                print(f"[sync] {source.id} {stage}: recovered {recovered} interrupted runs")
+        if recovered_any:
+            connection.commit()
 
     def safe_video_url(video_id: str) -> str | None:
         try:
@@ -538,6 +551,7 @@ def sync_source(
             return None
 
     media_before_ids = set(read_archive_ids(source.media_archive))
+    new_media_ids: list[str] = []
     if not skip_media:
         media_command = [
             source.ytdlp_bin,
@@ -615,82 +629,210 @@ def sync_source(
 
     subs_before_ids = set(read_archive_ids(source.subs_archive))
     if not skip_subs:
-        subs_command = [
-            source.ytdlp_bin,
-            *cookie_flags,
-            "--download-archive",
-            str(source.subs_archive),
-            "--continue",
-            "--no-overwrites",
-            *retry_flags,
-            *discovery_flags,
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            source.sub_langs,
-            "--sub-format",
-            source.sub_format,
-            "-o",
-            str(source.subs_dir / source.subs_output_template),
-            "--no-playlist",
-            source.url,
+        if metadata_candidate_ids is not None:
+            subtitle_candidate_ids = []
+            seen_subtitle_candidates: set[str] = set()
+            for video_id in metadata_candidate_ids:
+                if video_id in seen_subtitle_candidates:
+                    continue
+                seen_subtitle_candidates.add(video_id)
+                subtitle_candidate_ids.append(video_id)
+        else:
+            subtitle_candidate_ids = list(new_media_ids)
+
+        local_sub_ids = set(scan_subtitles(source).keys())
+        missing_sub_ids = [
+            video_id
+            for video_id in subtitle_candidate_ids
+            if video_id not in subs_before_ids and video_id not in local_sub_ids
         ]
-        subs_started_at = now_utc_iso()
-        subs_run_id: int | None = None
+
+        deferred_sub_ids: list[str] = []
+        missing_retryable_sub_ids = list(missing_sub_ids)
         if connection is not None and not dry_run:
-            subs_run_id = begin_download_run(
+            missing_retryable_sub_ids, deferred_sub_ids = split_retryable_ids(
                 connection=connection,
                 source_id=source.id,
                 stage="subs",
-                command=subs_command,
-                target_count=None,
-                started_at=subs_started_at,
+                candidate_ids=missing_sub_ids,
             )
-            connection.commit()
 
-        subs_exit_code = 0
-        subs_error: str | None = None
-        try:
-            subs_exit_code = run_command(subs_command, dry_run=dry_run, raise_on_error=False)
-        except Exception as exc:
-            subs_exit_code = 1
-            subs_error = str(exc)
-            print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
-
-        subs_after_ids = set(read_archive_ids(source.subs_archive))
-        new_subs_ids = sorted(subs_after_ids - subs_before_ids)
+        retry_sub_ids: list[str] = []
         if connection is not None and not dry_run:
-            for video_id in new_subs_ids:
-                upsert_download_state(
+            retry_sub_ids = get_due_retry_ids(connection, source.id, "subs")
+
+        subtitle_target_ids: list[str] = []
+        seen_target_ids: set[str] = set()
+        for video_id in [*missing_retryable_sub_ids, *retry_sub_ids]:
+            if video_id in seen_target_ids:
+                continue
+            seen_target_ids.add(video_id)
+            subtitle_target_ids.append(video_id)
+
+        if not subtitle_target_ids:
+            if connection is not None and not dry_run:
+                subs_started_at = now_utc_iso()
+                subs_run_id = begin_download_run(
                     connection=connection,
                     source_id=source.id,
                     stage="subs",
-                    video_id=video_id,
-                    status="success",
-                    run_id=subs_run_id,
-                    attempt_at=subs_started_at,
-                    url=safe_video_url(video_id),
-                    last_error=None,
-                    retry_count=0,
-                    next_retry_at=None,
+                    command=None,
+                    target_count=0,
+                    started_at=subs_started_at,
                 )
-
-            finish_download_run(
-                connection=connection,
-                run_id=subs_run_id if subs_run_id is not None else -1,
-                status="success" if subs_exit_code == 0 else "error",
-                finished_at=now_utc_iso(),
-                exit_code=subs_exit_code,
-                success_count=len(new_subs_ids),
-                failure_count=None if subs_exit_code != 0 else 0,
-                error_message=subs_error or (
-                    None if subs_exit_code == 0 else f"command exit code {subs_exit_code}"
-                ),
+                finish_download_run(
+                    connection=connection,
+                    run_id=subs_run_id,
+                    status="success",
+                    finished_at=now_utc_iso(),
+                    exit_code=0,
+                    success_count=0,
+                    failure_count=0,
+                    error_message=None,
+                )
+                connection.commit()
+            print(
+                f"subtitle targets=0 success=0 failed=0 "
+                f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                f"deferred={len(deferred_sub_ids)})"
             )
-            connection.commit()
+        else:
+            subtitle_urls = [build_video_url(source, video_id) for video_id in subtitle_target_ids]
+            if dry_run:
+                print(
+                    f"subtitle targets (dry-run): {len(subtitle_target_ids)} "
+                    f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"deferred={len(deferred_sub_ids)})"
+                )
+            else:
+                write_urls_file(source.urls_file, subtitle_urls)
 
-        print(f"subtitle new IDs: {len(new_subs_ids)}")
+            subs_command = [
+                source.ytdlp_bin,
+                *cookie_flags,
+                "--download-archive",
+                str(source.subs_archive),
+                "--continue",
+                "--no-overwrites",
+                *retry_flags,
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-langs",
+                source.sub_langs,
+                "--sub-format",
+                source.sub_format,
+                "-o",
+                str(source.subs_dir / source.subs_output_template),
+                "--no-playlist",
+                "-a",
+                str(source.urls_file),
+            ]
+            subs_started_at = now_utc_iso()
+            subs_run_id: int | None = None
+            if connection is not None and not dry_run:
+                subs_run_id = begin_download_run(
+                    connection=connection,
+                    source_id=source.id,
+                    stage="subs",
+                    command=subs_command,
+                    target_count=len(subtitle_target_ids),
+                    started_at=subs_started_at,
+                )
+                connection.commit()
+
+            subs_exit_code = 0
+            subs_error: str | None = None
+            try:
+                subs_exit_code = run_command(subs_command, dry_run=dry_run, raise_on_error=False)
+            except Exception as exc:
+                subs_exit_code = 1
+                subs_error = str(exc)
+                print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
+
+            if not dry_run:
+                subs_after_ids = set(read_archive_ids(source.subs_archive))
+                local_sub_after_ids = set(scan_subtitles(source).keys())
+                success_sub_ids = [
+                    video_id
+                    for video_id in subtitle_target_ids
+                    if video_id in subs_after_ids or video_id in local_sub_after_ids
+                ]
+                failed_sub_ids = [
+                    video_id
+                    for video_id in subtitle_target_ids
+                    if video_id not in subs_after_ids and video_id not in local_sub_after_ids
+                ]
+
+                if connection is not None:
+                    for video_id in success_sub_ids:
+                        upsert_download_state(
+                            connection=connection,
+                            source_id=source.id,
+                            stage="subs",
+                            video_id=video_id,
+                            status="success",
+                            run_id=subs_run_id,
+                            attempt_at=subs_started_at,
+                            url=safe_video_url(video_id),
+                            last_error=None,
+                            retry_count=0,
+                            next_retry_at=None,
+                        )
+
+                    for video_id in failed_sub_ids:
+                        current = connection.execute(
+                            """
+                            SELECT retry_count
+                            FROM download_state
+                            WHERE source_id = ? AND stage = ? AND video_id = ?
+                            """,
+                            (source.id, "subs", video_id),
+                        ).fetchone()
+                        next_retry_count = (int(current[0]) if current else 0) + 1
+                        failure_reason = subs_error or (
+                            f"command exit code {subs_exit_code}"
+                            if subs_exit_code != 0
+                            else "subtitle file missing after download attempt"
+                        )
+                        upsert_download_state(
+                            connection=connection,
+                            source_id=source.id,
+                            stage="subs",
+                            video_id=video_id,
+                            status="error",
+                            run_id=subs_run_id,
+                            attempt_at=subs_started_at,
+                            url=safe_video_url(video_id),
+                            last_error=failure_reason,
+                            retry_count=next_retry_count,
+                            next_retry_at=schedule_next_retry_iso(next_retry_count),
+                        )
+
+                    finish_download_run(
+                        connection=connection,
+                        run_id=subs_run_id if subs_run_id is not None else -1,
+                        status="success" if not failed_sub_ids else "error",
+                        finished_at=now_utc_iso(),
+                        exit_code=subs_exit_code,
+                        success_count=len(success_sub_ids),
+                        failure_count=len(failed_sub_ids),
+                        error_message=None if not failed_sub_ids else (
+                            subs_error or (
+                                f"command exit code {subs_exit_code}"
+                                if subs_exit_code != 0
+                                else "some subtitle items are still missing"
+                            )
+                        ),
+                    )
+                    connection.commit()
+
+                print(
+                    f"subtitle targets={len(subtitle_target_ids)} "
+                    f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
+                    f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"deferred={len(deferred_sub_ids)})"
+                )
     else:
         print("skip subtitles")
 
@@ -2072,6 +2214,36 @@ def begin_download_run(
     return int(run_id)
 
 
+def recover_interrupted_download_runs(
+    connection: sqlite3.Connection,
+    source_id: str,
+    stage: str,
+    finished_at: str | None = None,
+) -> int:
+    finished_value = finished_at or now_utc_iso()
+    cursor = connection.execute(
+        """
+        UPDATE download_runs
+        SET status = 'error',
+            finished_at = COALESCE(finished_at, ?),
+            exit_code = COALESCE(exit_code, 130),
+            error_message = CASE
+                WHEN error_message IS NULL OR error_message = '' THEN 'interrupted previous run'
+                ELSE error_message
+            END
+        WHERE source_id = ?
+          AND stage = ?
+          AND status = 'running'
+        """,
+        (
+            finished_value,
+            source_id,
+            stage,
+        ),
+    )
+    return cursor.rowcount
+
+
 def finish_download_run(
     connection: sqlite3.Connection,
     run_id: int,
@@ -2484,6 +2656,11 @@ def pick_asr_subtitle_file(artifact_dir: Path, prefer_exts: list[str]) -> Path |
     return ranked[0][3]
 
 
+def write_empty_srt(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
 def run_asr(
     sources: list[SourceConfig],
     db_path: Path,
@@ -2497,6 +2674,7 @@ def run_asr(
 
     connection = sqlite3.connect(str(db_path))
     create_schema(connection)
+    ffprobe_bin = shutil.which("ffprobe")
 
     for source in sources:
         if not source.asr_enabled:
@@ -2505,6 +2683,32 @@ def run_asr(
         if not source.asr_command:
             print(f"[asr] {source.id}: missing asr_command, skip")
             continue
+
+        interrupted_finished_at = now_utc_iso()
+        marked_rows = connection.execute(
+            """
+            UPDATE asr_runs
+            SET status = 'error',
+                last_error = CASE
+                    WHEN last_error IS NULL OR last_error = '' THEN 'interrupted previous run'
+                    ELSE last_error
+                END,
+                finished_at = COALESCE(finished_at, ?),
+                updated_at = ?
+            WHERE source_id = ?
+              AND status = 'running'
+            """,
+            (
+                interrupted_finished_at,
+                interrupted_finished_at,
+                source.id,
+            ),
+        ).rowcount
+        if marked_rows:
+            connection.commit()
+            print(
+                f"[asr] {source.id}: recovered {marked_rows} interrupted running records"
+            )
 
         rows = connection.execute(
             """
@@ -2599,6 +2803,40 @@ def run_asr(
             connection.commit()
 
             timeout = source.asr_timeout_sec if source.asr_timeout_sec > 0 else None
+            if ffprobe_bin:
+                has_audio_stream, probe_error = detect_audio_stream(
+                    media_path=media_path,
+                    ffprobe_bin=ffprobe_bin,
+                )
+                if has_audio_stream is False:
+                    final_output_path = final_dir / f"{video_id}.asr.srt"
+                    write_empty_srt(final_output_path)
+                    finished_at = now_utc_iso()
+                    upsert_asr_run(
+                        connection=connection,
+                        source_id=source.id,
+                        video_id=video_id,
+                        status="success",
+                        attempts=run_attempt,
+                        engine="command",
+                        output_path=str(final_output_path),
+                        artifact_dir=str(artifact_dir),
+                        last_error=None,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                    )
+                    connection.commit()
+                    print(
+                        f"[asr] {source.id}/{video_id}: no audio stream "
+                        f"(wrote {final_output_path})"
+                    )
+                    continue
+                if has_audio_stream is None and probe_error:
+                    print(
+                        f"[asr] {source.id}/{video_id}: "
+                        f"ffprobe warning ({probe_error}); continuing",
+                        file=sys.stderr,
+                    )
             try:
                 completed = subprocess.run(
                     command,
@@ -2754,6 +2992,35 @@ def analyze_media_loudness(
     return input_lufs, None
 
 
+def detect_audio_stream(
+    media_path: Path,
+    ffprobe_bin: str,
+) -> tuple[bool | None, str | None]:
+    command = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(media_path),
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        merged_output = f"{completed.stderr}\n{completed.stdout}".strip()
+        message = merged_output.splitlines()[-1].strip() if merged_output else ""
+        return None, message or f"ffprobe exited with code {completed.returncode}"
+    return bool(completed.stdout.strip()), None
+
+
 def run_loudness(
     sources: list[SourceConfig],
     db_path: Path,
@@ -2775,6 +3042,14 @@ def run_loudness(
             f"ffmpeg binary '{ffmpeg_bin}' not found in PATH. "
             "Install ffmpeg or pass --ffmpeg-bin."
         )
+    ffprobe_bin = "ffprobe"
+    if has_explicit_path:
+        sibling_ffprobe = ffmpeg_candidate.with_name("ffprobe")
+        if sibling_ffprobe.exists():
+            ffprobe_bin = str(sibling_ffprobe)
+    has_ffprobe = shutil.which(ffprobe_bin) is not None or (
+        Path(ffprobe_bin).expanduser().is_absolute() and Path(ffprobe_bin).exists()
+    )
 
     connection = sqlite3.connect(str(db_path))
     create_schema(connection)
@@ -2851,6 +3126,38 @@ def run_loudness(
                     print(f"[loudness] {source.id}/{video_id}: media file missing")
                     connection.commit()
                     continue
+
+                if has_ffprobe:
+                    has_audio_stream, probe_error = detect_audio_stream(
+                        media_path=media_path,
+                        ffprobe_bin=ffprobe_bin,
+                    )
+                    if has_audio_stream is False:
+                        connection.execute(
+                            """
+                            UPDATE videos
+                            SET audio_lufs = NULL,
+                                audio_gain_db = 0.0,
+                                audio_loudness_analyzed_at = ?,
+                                audio_loudness_error = ''
+                            WHERE source_id = ?
+                              AND video_id = ?
+                            """,
+                            (analyzed_at, source.id, video_id),
+                        )
+                        source_success += 1
+                        print(
+                            f"[loudness] {source.id}/{video_id}: "
+                            "no audio stream (gain=+0.00dB)"
+                        )
+                        connection.commit()
+                        continue
+                    if has_audio_stream is None and probe_error:
+                        print(
+                            f"[loudness] {source.id}/{video_id}: "
+                            f"ffprobe warning ({probe_error}); fallback to loudnorm",
+                            file=sys.stderr,
+                        )
 
                 input_lufs, error = analyze_media_loudness(
                     media_path=media_path,

@@ -29,10 +29,13 @@ asr_timeout_sec = 0
 asr_prefer_exts = ["srt", "vtt"]
 # asr_command = [
 #   "python3",
-#   "-m", "avseg.main_transcribe",
-#   "--with-subtitles",
+#   "-m", "whisper",
+#   "--task", "transcribe",
 #   "--language", "en",
-#   "--output-dir", "{work_dir}",
+#   "--model", "turbo",
+#   "--device", "cpu",
+#   "--output_dir", "{work_dir}",
+#   "--output_format", "srt",
 #   "{input_path}",
 # ]
 ledger_db = "data/master_ledger.sqlite"

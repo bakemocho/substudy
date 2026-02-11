@@ -161,6 +161,7 @@ Learning tables added to the same SQLite ledger:
   - If missing, `sync` bootstraps archive IDs from existing local files to avoid repeated re-fetch attempts.
 - `asr_*`
   - ASR is primary subtitle pipeline.
+  - `asr_command` can use local Whisper CLI (no OpenAI API key required).
   - TikTok subtitles (`subs_dir`) are supplemental.
 
 ## Download Logging + Retry
@@ -169,10 +170,9 @@ Learning tables added to the same SQLite ledger:
   - One row per sync stage execution (`media`, `subs`, `meta`) with status and counts.
 - `download_state` table:
   - Per-video latest status for each stage.
-  - Failed `meta` items are auto-retried in later `sync` runs with exponential backoff.
-
-The current retry scope is metadata stage (`meta`), which has explicit per-video targets.
-Metadata retries now honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
+- Failed `meta` and `subs` items are auto-retried in later `sync` runs with exponential backoff.
+- Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
+- Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
 
 ## Reverse Incremental Backfill
 
