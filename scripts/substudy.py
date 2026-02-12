@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import zlib
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +48,7 @@ DICT_INDEX_BATCH_SIZE = 2000
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8876
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
+MISSING_DICT_ENTRY_ID_BASE = 3_000_000_000
 
 
 @dataclass
@@ -1583,6 +1585,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
             term TEXT NOT NULL,
             term_norm TEXT NOT NULL,
             definition TEXT NOT NULL,
+            missing_entry INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (source_id, video_id, track, cue_start_ms, cue_end_ms, dict_entry_id),
@@ -1602,6 +1605,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     ensure_videos_loudness_columns(connection)
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
+    ensure_dictionary_bookmarks_schema(connection)
 
 
 def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
@@ -1685,6 +1689,26 @@ def ensure_translation_runs_table(connection: sqlite3.Connection) -> None:
             ON translation_runs(source_id, video_id, target_lang, status);
         """
     )
+
+
+def ensure_dictionary_bookmarks_schema(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA table_info(dictionary_bookmarks)").fetchall()
+    if not rows:
+        return
+    existing_columns = {str(row[1]) for row in rows}
+    if "missing_entry" not in existing_columns:
+        connection.execute(
+            """
+            ALTER TABLE dictionary_bookmarks
+            ADD COLUMN missing_entry INTEGER NOT NULL DEFAULT 0
+            """
+        )
+
+
+def make_missing_dict_entry_id(term_norm: str) -> int:
+    normalized = normalize_dictionary_term(term_norm)
+    digest = zlib.crc32(normalized.encode("utf-8")) & 0xFFFFFFFF
+    return MISSING_DICT_ENTRY_ID_BASE + int(digest)
 
 
 def rebuild_dictionary_fts(connection: sqlite3.Connection) -> bool:
@@ -4041,6 +4065,7 @@ def serialize_dictionary_bookmark_row(
         term = str(row["term"])
         term_norm = str(row["term_norm"])
         definition = str(row["definition"])
+        missing_entry = int(row["missing_entry"])
         created_at = str(row["created_at"])
         updated_at = str(row["updated_at"])
     else:
@@ -4058,6 +4083,7 @@ def serialize_dictionary_bookmark_row(
             term,
             term_norm,
             definition,
+            missing_entry,
             created_at,
             updated_at,
         ) = row
@@ -4076,6 +4102,7 @@ def serialize_dictionary_bookmark_row(
         "term": str(term),
         "term_norm": str(term_norm),
         "definition": str(definition),
+        "missing_entry": bool(int(missing_entry)),
         "created_at": str(created_at),
         "updated_at": str(updated_at),
     }
@@ -4295,6 +4322,7 @@ def build_web_handler(
                     term,
                     term_norm,
                     definition,
+                    missing_entry,
                     created_at,
                     updated_at
                 FROM dictionary_bookmarks
@@ -4693,6 +4721,7 @@ def build_web_handler(
                         term,
                         term_norm,
                         definition,
+                        missing_entry,
                         created_at,
                         updated_at
                     FROM dictionary_bookmarks
@@ -4731,6 +4760,11 @@ def build_web_handler(
             dict_source_name = (
                 "" if payload.get("dict_source_name") in (None, "") else str(payload.get("dict_source_name")).strip()
             )
+            missing_entry_raw = payload.get("missing_entry")
+            if isinstance(missing_entry_raw, str):
+                missing_entry = missing_entry_raw.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                missing_entry = bool(missing_entry_raw)
 
             if source_id is None or video_id is None:
                 self._send_error_json(400, "source_id and video_id are required.")
@@ -4745,6 +4779,11 @@ def build_web_handler(
             if not term_norm:
                 self._send_error_json(400, "term_norm is required.")
                 return
+            if missing_entry:
+                if not definition:
+                    definition = "辞書エントリが見つかりません。"
+                if not lookup_term:
+                    lookup_term = term
             if not definition:
                 self._send_error_json(400, "definition is required.")
                 return
@@ -4752,16 +4791,23 @@ def build_web_handler(
             try:
                 cue_start_ms = int(payload.get("cue_start_ms"))
                 cue_end_ms = int(payload.get("cue_end_ms"))
-                dict_entry_id = int(payload.get("dict_entry_id"))
             except (TypeError, ValueError):
                 self._send_error_json(
                     400,
-                    "cue_start_ms, cue_end_ms and dict_entry_id must be integers.",
+                    "cue_start_ms and cue_end_ms must be integers.",
                 )
                 return
-            if dict_entry_id <= 0:
-                self._send_error_json(400, "dict_entry_id must be a positive integer.")
-                return
+            if missing_entry:
+                dict_entry_id = make_missing_dict_entry_id(term_norm)
+            else:
+                try:
+                    dict_entry_id = int(payload.get("dict_entry_id"))
+                except (TypeError, ValueError):
+                    self._send_error_json(400, "dict_entry_id must be an integer.")
+                    return
+                if dict_entry_id <= 0:
+                    self._send_error_json(400, "dict_entry_id must be a positive integer.")
+                    return
             if cue_end_ms < cue_start_ms:
                 cue_start_ms, cue_end_ms = cue_end_ms, cue_start_ms
             cue_start_ms = max(0, cue_start_ms)
@@ -4803,9 +4849,10 @@ def build_web_handler(
                             term,
                             term_norm,
                             definition,
+                            missing_entry,
                             created_at,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             source_id,
@@ -4820,6 +4867,7 @@ def build_web_handler(
                             term,
                             term_norm,
                             definition,
+                            int(missing_entry),
                             now_iso,
                             now_iso,
                         ),
@@ -4845,6 +4893,7 @@ def build_web_handler(
                             term,
                             term_norm,
                             definition,
+                            missing_entry,
                             created_at,
                             updated_at
                         FROM dictionary_bookmarks

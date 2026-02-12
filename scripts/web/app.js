@@ -2064,6 +2064,8 @@ function buildDictionaryBookmarkKeyFromParts(
   cueStartMs,
   cueEndMs,
   dictEntryId,
+  missingEntry = false,
+  termNorm = "",
 ) {
   const safeSourceId = String(sourceId || "").trim();
   const safeVideoId = String(videoId || "").trim();
@@ -2071,8 +2073,22 @@ function buildDictionaryBookmarkKeyFromParts(
   const safeStartMs = Math.max(0, Math.round(Number(cueStartMs) || 0));
   const safeEndMs = Math.max(safeStartMs, Math.round(Number(cueEndMs) || safeStartMs));
   const safeDictEntryId = Math.round(Number(dictEntryId) || 0);
-  if (!safeSourceId || !safeVideoId || safeDictEntryId <= 0) {
+  const safeMissingEntry = Boolean(missingEntry);
+  const safeTermNorm = normalizeDictionaryTerm(termNorm);
+  if (!safeSourceId || !safeVideoId) {
     return "";
+  }
+  let identityPart = "";
+  if (safeMissingEntry) {
+    if (!safeTermNorm) {
+      return "";
+    }
+    identityPart = `missing:${encodeURIComponent(safeTermNorm)}`;
+  } else {
+    if (safeDictEntryId <= 0) {
+      return "";
+    }
+    identityPart = `entry:${safeDictEntryId}`;
   }
   return [
     encodeURIComponent(safeSourceId),
@@ -2080,7 +2096,7 @@ function buildDictionaryBookmarkKeyFromParts(
     encodeURIComponent(safeTrack),
     String(safeStartMs),
     String(safeEndMs),
-    String(safeDictEntryId),
+    identityPart,
   ].join("|");
 }
 
@@ -2095,6 +2111,8 @@ function dictionaryBookmarkKeyFromPayload(payload) {
     payload.cue_start_ms,
     payload.cue_end_ms,
     payload.dict_entry_id,
+    payload.missing_entry,
+    payload.term_norm,
   );
 }
 
@@ -2109,6 +2127,8 @@ function dictionaryBookmarkKeyFromRecord(record) {
     record.cue_start_ms,
     record.cue_end_ms,
     record.dict_entry_id,
+    record.missing_entry,
+    record.term_norm,
   );
 }
 
@@ -2236,6 +2256,29 @@ function buildDictionaryBookmarkPayload(entry, fallbackTerm = "") {
     term,
     term_norm: termNorm,
     definition,
+    missing_entry: false,
+  };
+}
+
+function buildMissingDictionaryBookmarkPayload(term) {
+  const context = getDictionaryBookmarkContext();
+  if (!context) {
+    return null;
+  }
+  const safeTerm = String(term || "").trim();
+  const termNorm = normalizeDictionaryTerm(safeTerm);
+  if (!safeTerm || !termNorm) {
+    return null;
+  }
+  return {
+    ...context,
+    dict_entry_id: 0,
+    dict_source_name: "",
+    lookup_term: safeTerm,
+    term: safeTerm,
+    term_norm: termNorm,
+    definition: "辞書エントリが見つかりません。",
+    missing_entry: true,
   };
 }
 
@@ -2300,15 +2343,27 @@ async function toggleDictionaryBookmark(payload) {
   state.dictBookmarksApiAvailable = true;
   const status = String(response?.status || "");
   const bookmark = response?.bookmark || null;
-  const key = dictionaryBookmarkKeyFromPayload(payload);
-  if (status === "saved" && bookmark) {
+  const keyFromPayload = dictionaryBookmarkKeyFromPayload(payload);
+  const keyFromBookmark = dictionaryBookmarkKeyFromRecord(bookmark);
+  const key = keyFromPayload || keyFromBookmark;
+  if (status === "saved" && bookmark && key) {
     state.dictBookmarks.set(key, bookmark);
   } else if (status === "removed") {
-    state.dictBookmarks.delete(key);
+    if (keyFromPayload) {
+      state.dictBookmarks.delete(keyFromPayload);
+    }
+    if (keyFromBookmark && keyFromBookmark !== keyFromPayload) {
+      state.dictBookmarks.delete(keyFromBookmark);
+    }
   }
   rebuildDictionaryBookmarkedTermNorms();
   refreshSubtitleReelDictionaryBookmarkHighlights();
-  syncDictionaryBookmarkButtonsForKey(key);
+  if (keyFromPayload) {
+    syncDictionaryBookmarkButtonsForKey(keyFromPayload);
+  }
+  if (keyFromBookmark && keyFromBookmark !== keyFromPayload) {
+    syncDictionaryBookmarkButtonsForKey(keyFromBookmark);
+  }
   return {
     status,
     bookmark,
@@ -3783,6 +3838,54 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
     empty.className = "subtitle-dict-empty";
     empty.textContent = "辞書エントリが見つかりません。";
     popupEl.appendChild(empty);
+    const missingBookmarkPayload = buildMissingDictionaryBookmarkPayload(term);
+    if (missingBookmarkPayload) {
+      const actions = document.createElement("div");
+      actions.className = "subtitle-dict-empty-actions";
+      const bookmarkBtn = document.createElement("button");
+      bookmarkBtn.type = "button";
+      bookmarkBtn.className = "subtitle-dict-bookmark-btn subtitle-dict-empty-bookmark-btn";
+      const bookmarkKey = dictionaryBookmarkKeyFromPayload(missingBookmarkPayload);
+      if (bookmarkKey) {
+        bookmarkBtn.dataset.dictBookmarkKey = bookmarkKey;
+      }
+      updateDictionaryBookmarkButtonState(
+        bookmarkBtn,
+        isDictionaryBookmarkSaved(missingBookmarkPayload),
+        false
+      );
+      bookmarkBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        bookmarkBtn.disabled = true;
+        updateDictionaryBookmarkButtonState(bookmarkBtn, false, true);
+        toggleDictionaryBookmark(missingBookmarkPayload)
+          .then((result) => {
+            const saved = result?.status === "saved";
+            updateDictionaryBookmarkButtonState(bookmarkBtn, saved, false);
+            setStatus(saved ? "未登録語をブックマークしました。" : "未登録語ブックマークを解除しました。", "ok");
+          })
+          .catch((error) => {
+            updateDictionaryBookmarkButtonState(
+              bookmarkBtn,
+              isDictionaryBookmarkSaved(missingBookmarkPayload),
+              false
+            );
+            const message = String(error?.message || "");
+            if (message.includes("Not found") || message.includes("404")) {
+              state.dictBookmarksApiAvailable = false;
+              setStatus("辞書ブックマークAPIが未対応です。サーバー再起動後に利用できます。", "error");
+              return;
+            }
+            setStatus(message || "辞書ブックマーク更新に失敗しました。", "error");
+          })
+          .finally(() => {
+            bookmarkBtn.disabled = false;
+          });
+      });
+      actions.appendChild(bookmarkBtn);
+      popupEl.appendChild(actions);
+    }
   } else {
     const list = document.createElement("div");
     list.className = "subtitle-dict-list";

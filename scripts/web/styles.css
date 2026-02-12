@@ -380,6 +380,18 @@ body {
   cursor: default;
 }
 
+.subtitle-dict-empty-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.subtitle-dict-empty-bookmark-btn {
+  position: static;
+  top: auto;
+  right: auto;
+}
+
 .subtitle-dict-inline-word {
   display: inline;
 }
