@@ -50,7 +50,7 @@ Acceptance:
 - Click-pin / outside-click / `Esc` rules coexist with existing hover-hide behavior.
 - In graph-mode, hovered node stays fixed while non-hovered nodes can settle around it.
 
-Status (2026-02-10):
+Status (2026-02-12):
 
 - Implemented:
   - video-card progress timer
@@ -60,11 +60,9 @@ Status (2026-02-10):
   - reel hover session now pauses auto-follow scrolling; auto-follow restores on pointer leave or short idle
   - popup placement now anchors to hover source context (overlay/reel/bookmark), not just video-card fixed position
   - click on subtitle words now pins dictionary popup; outside click or `Esc` clears the popup/loop state
-- Needs polish:
-  - pin rule is currently single-popup scope; recursive tree-level pin/clear behavior is still pending
-  - recursive tree graph-mode (pin + freeze + re-layout) is still design/implementation pending
-  - hover dictionary behavior in non-overlay cards (subtitle reel/bookmark) still has UX tuning room
-  - keep tuning hover stability/intent detection before marking this block fully done
+- Done as immediate scope:
+  - hover dictionary continuity items are treated as complete for current UX baseline
+  - remaining refinements are tracked in later phases (`4`, `7`) as iterative improvements, not blockers
 
 ## 0) Done / baseline
 
@@ -130,29 +128,7 @@ Acceptance:
 - For typical tracks, most cues align without visible mismatch.
 - No crash/blank panel when one language track is missing.
 
-## 4) Next: similar-scene suggestion via cue embeddings
-
-Goal: let users discover semantically similar scenes from current subtitle context.
-
-- Build embeddings for subtitle cue windows (current cue + surrounding cues).
-- Index vectors locally (FAISS or equivalent local ANN index).
-- Add `Similar Scenes` action from current cue / subtitle reel row.
-- Retrieval rules:
-  - exclude near-duplicate neighbors in same video/time neighborhood
-  - return diverse results across videos/sources when possible
-- Result card should show:
-  - EN cue text
-  - JA cue text (if available)
-  - source/video and timestamp
-  - click-to-jump behavior
-
-Acceptance:
-
-- Query from current cue returns relevant top-k candidates quickly.
-- Results are not dominated by same-video adjacent cues.
-- Jump from suggestion lands on correct timestamp and updates subtitle state.
-
-## 5) Next: hover dictionary expansion (bookmark + recursive tree graph)
+## 4) Next: hover dictionary expansion (bookmark + recursive tree graph)
 
 Goal: make hover dictionary a reusable learning surface.
 
@@ -191,6 +167,28 @@ Acceptance:
 - Hovered node freeze + surrounding-node re-layout behavior is visually stable.
 - click-pin / outside-click / `Esc` clear behavior is deterministic.
 - Existing subtitle hover behavior remains intact.
+
+## 5) Next: similar-scene suggestion via cue embeddings
+
+Goal: let users discover semantically similar scenes from current subtitle context.
+
+- Build embeddings for subtitle cue windows (current cue + surrounding cues).
+- Index vectors locally (FAISS or equivalent local ANN index).
+- Add `Similar Scenes` action from current cue / subtitle reel row.
+- Retrieval rules:
+  - exclude near-duplicate neighbors in same video/time neighborhood
+  - return diverse results across videos/sources when possible
+- Result card should show:
+  - EN cue text
+  - JA cue text (if available)
+  - source/video and timestamp
+  - click-to-jump behavior
+
+Acceptance:
+
+- Query from current cue returns relevant top-k candidates quickly.
+- Results are not dominated by same-video adjacent cues.
+- Jump from suggestion lands on correct timestamp and updates subtitle state.
 
 ## 6) Next: reel linguistics overlay (NLP + dependencies)
 
