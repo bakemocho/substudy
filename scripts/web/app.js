@@ -5124,6 +5124,7 @@ function applyLyricReelVisualPosition(position) {
   }
   state.lyricReelVisualPosition = clamped;
   state.lyricReelIndex = Math.max(0, Math.min(state.cues.length - 1, Math.round(clamped)));
+  cancelAutoAdvanceCountdownOnPreviousCue(state.lyricReelIndex);
   state.activeCueIndex = state.lyricReelIndex;
 
   const cueStartMs = getCueStartMsAtLyricPosition(clamped);
@@ -5311,6 +5312,7 @@ function stepSubtitleCue(step) {
     const inCueOffset = Math.min(40, Math.max(1, cueEndMs - cueStartMs - 1));
     seekMs = cueStartMs + inCueOffset;
   }
+  cancelAutoAdvanceCountdownOnPreviousCue(targetIndex);
   state.activeCueIndex = targetIndex;
   elements.videoPlayer.currentTime = seekMs / 1000;
   renderSubtitleOverlayText(cue.text || "...");
@@ -5359,6 +5361,19 @@ function cancelAutoAdvanceCountdown() {
   clearCountdown();
   setStatus("自動遷移をキャンセルしました。", "ok");
   return true;
+}
+
+function cancelAutoAdvanceCountdownOnPreviousCue(cueIndex) {
+  if (state.countdownTimer === null) {
+    return false;
+  }
+  if (!state.cues.length || !Number.isInteger(cueIndex)) {
+    return false;
+  }
+  if (cueIndex < 0 || cueIndex >= state.cues.length - 1) {
+    return false;
+  }
+  return cancelAutoAdvanceCountdown();
 }
 
 function startCountdown() {
@@ -6575,6 +6590,14 @@ function bindEvents() {
     updateVideoProgressTimer();
   });
   elements.videoPlayer.addEventListener("seeked", () => {
+    if (state.countdownTimer !== null && state.cues.length > 1) {
+      const currentMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
+      let cueIndex = findActiveCueIndex(currentMs);
+      if (cueIndex < 0) {
+        cueIndex = findNearestCueIndex(currentMs);
+      }
+      cancelAutoAdvanceCountdownOnPreviousCue(cueIndex);
+    }
     updateVideoProgressTimer();
     syncUrlPlaybackPosition(true);
   });
