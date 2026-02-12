@@ -1569,12 +1569,34 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS dictionary_bookmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            track TEXT NOT NULL DEFAULT '',
+            cue_start_ms INTEGER NOT NULL,
+            cue_end_ms INTEGER NOT NULL,
+            cue_text TEXT,
+            dict_entry_id INTEGER NOT NULL,
+            dict_source_name TEXT,
+            lookup_term TEXT,
+            term TEXT NOT NULL,
+            term_norm TEXT NOT NULL,
+            definition TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (source_id, video_id, track, cue_start_ms, cue_end_ms, dict_entry_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_video_favorites_created_at
             ON video_favorites(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
             ON subtitle_bookmarks(source_id, video_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
             ON video_notes(source_id, video_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_dictionary_bookmarks_lookup
+            ON dictionary_bookmarks(source_id, video_id, updated_at DESC);
         """
     )
     ensure_videos_loudness_columns(connection)
@@ -4002,6 +4024,63 @@ def serialize_bookmark_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]
     }
 
 
+def serialize_dictionary_bookmark_row(
+    row: sqlite3.Row | tuple[Any, ...],
+) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        bookmark_id = int(row["id"])
+        source_id = str(row["source_id"])
+        video_id = str(row["video_id"])
+        track = str(row["track"] or "")
+        cue_start_ms = int(row["cue_start_ms"])
+        cue_end_ms = int(row["cue_end_ms"])
+        cue_text = row["cue_text"]
+        dict_entry_id = int(row["dict_entry_id"])
+        dict_source_name = row["dict_source_name"]
+        lookup_term = row["lookup_term"]
+        term = str(row["term"])
+        term_norm = str(row["term_norm"])
+        definition = str(row["definition"])
+        created_at = str(row["created_at"])
+        updated_at = str(row["updated_at"])
+    else:
+        (
+            bookmark_id,
+            source_id,
+            video_id,
+            track,
+            cue_start_ms,
+            cue_end_ms,
+            cue_text,
+            dict_entry_id,
+            dict_source_name,
+            lookup_term,
+            term,
+            term_norm,
+            definition,
+            created_at,
+            updated_at,
+        ) = row
+
+    return {
+        "id": int(bookmark_id),
+        "source_id": str(source_id),
+        "video_id": str(video_id),
+        "track": str(track or ""),
+        "cue_start_ms": int(cue_start_ms),
+        "cue_end_ms": int(cue_end_ms),
+        "cue_text": "" if cue_text in (None, "") else str(cue_text),
+        "dict_entry_id": int(dict_entry_id),
+        "dict_source_name": "" if dict_source_name in (None, "") else str(dict_source_name),
+        "lookup_term": "" if lookup_term in (None, "") else str(lookup_term),
+        "term": str(term),
+        "term_norm": str(term_norm),
+        "definition": str(definition),
+        "created_at": str(created_at),
+        "updated_at": str(updated_at),
+    }
+
+
 def build_web_handler(
     db_path: Path,
     static_dir: Path,
@@ -4188,6 +4267,53 @@ def build_web_handler(
                 WHERE id = ?
                 """,
                 (bookmark_id,),
+            ).fetchone()
+
+        def _fetch_dictionary_bookmark_by_composite(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+            track: str,
+            cue_start_ms: int,
+            cue_end_ms: int,
+            dict_entry_id: int,
+        ) -> sqlite3.Row | None:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    cue_text,
+                    dict_entry_id,
+                    dict_source_name,
+                    lookup_term,
+                    term,
+                    term_norm,
+                    definition,
+                    created_at,
+                    updated_at
+                FROM dictionary_bookmarks
+                WHERE source_id = ?
+                  AND video_id = ?
+                  AND track = ?
+                  AND cue_start_ms = ?
+                  AND cue_end_ms = ?
+                  AND dict_entry_id = ?
+                LIMIT 1
+                """,
+                (
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    dict_entry_id,
+                ),
             ).fetchone()
 
         def _handle_api_feed(self, query: dict[str, list[str]]) -> None:
@@ -4525,6 +4651,230 @@ def build_web_handler(
                 }
             )
 
+        def _handle_api_dictionary_bookmarks_get(self, query: dict[str, list[str]]) -> None:
+            source_id = self._normalize_source(query.get("source_id", [None])[0])
+            video_id = self._normalize_source(query.get("video_id", [None])[0])
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            track_filter = self._normalize_source(query.get("track", [None])[0])
+            if track_filter is None:
+                track_filter = ""
+            limit = clamp_int(query.get("limit", [None])[0], default=1200, minimum=1, maximum=5000)
+
+            where_clauses = [
+                "source_id = ?",
+                "video_id = ?",
+            ]
+            params: list[Any] = [source_id, video_id]
+            if track_filter:
+                where_clauses.append("track = ?")
+                params.append(track_filter)
+            params.append(limit)
+
+            with self._open_connection() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT
+                        id,
+                        source_id,
+                        video_id,
+                        track,
+                        cue_start_ms,
+                        cue_end_ms,
+                        cue_text,
+                        dict_entry_id,
+                        dict_source_name,
+                        lookup_term,
+                        term,
+                        term_norm,
+                        definition,
+                        created_at,
+                        updated_at
+                    FROM dictionary_bookmarks
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+            bookmarks = [serialize_dictionary_bookmark_row(row) for row in rows]
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "track": track_filter,
+                    "bookmarks": bookmarks,
+                }
+            )
+
+        def _handle_api_toggle_dictionary_bookmark(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            track = self._normalize_source(payload.get("track")) or ""
+            cue_text = "" if payload.get("cue_text") in (None, "") else str(payload.get("cue_text"))
+            lookup_term = "" if payload.get("lookup_term") in (None, "") else str(payload.get("lookup_term"))
+            term = "" if payload.get("term") in (None, "") else str(payload.get("term")).strip()
+            term_norm_value = "" if payload.get("term_norm") in (None, "") else str(payload.get("term_norm"))
+            term_norm = normalize_dictionary_term(term_norm_value or term)
+            definition = "" if payload.get("definition") in (None, "") else str(payload.get("definition")).strip()
+            dict_source_name = (
+                "" if payload.get("dict_source_name") in (None, "") else str(payload.get("dict_source_name")).strip()
+            )
+
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            if not term:
+                self._send_error_json(400, "term is required.")
+                return
+            if not term_norm:
+                self._send_error_json(400, "term_norm is required.")
+                return
+            if not definition:
+                self._send_error_json(400, "definition is required.")
+                return
+
+            try:
+                cue_start_ms = int(payload.get("cue_start_ms"))
+                cue_end_ms = int(payload.get("cue_end_ms"))
+                dict_entry_id = int(payload.get("dict_entry_id"))
+            except (TypeError, ValueError):
+                self._send_error_json(
+                    400,
+                    "cue_start_ms, cue_end_ms and dict_entry_id must be integers.",
+                )
+                return
+            if dict_entry_id <= 0:
+                self._send_error_json(400, "dict_entry_id must be a positive integer.")
+                return
+            if cue_end_ms < cue_start_ms:
+                cue_start_ms, cue_end_ms = cue_end_ms, cue_start_ms
+            cue_start_ms = max(0, cue_start_ms)
+            cue_end_ms = max(cue_start_ms, cue_end_ms)
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+                if track:
+                    valid_track = get_track_for_video(connection, source_id, video_id, track)
+                    if valid_track is None:
+                        self._send_error_json(400, "track is invalid for this video.")
+                        return
+
+                existing = self._fetch_dictionary_bookmark_by_composite(
+                    connection,
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    dict_entry_id,
+                )
+                if existing is None:
+                    now_iso = now_utc_iso()
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO dictionary_bookmarks (
+                            source_id,
+                            video_id,
+                            track,
+                            cue_start_ms,
+                            cue_end_ms,
+                            cue_text,
+                            dict_entry_id,
+                            dict_source_name,
+                            lookup_term,
+                            term,
+                            term_norm,
+                            definition,
+                            created_at,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            source_id,
+                            video_id,
+                            track,
+                            cue_start_ms,
+                            cue_end_ms,
+                            cue_text,
+                            dict_entry_id,
+                            dict_source_name,
+                            lookup_term,
+                            term,
+                            term_norm,
+                            definition,
+                            now_iso,
+                            now_iso,
+                        ),
+                    )
+                    bookmark_id = cursor.lastrowid
+                    if bookmark_id is None:
+                        self._send_error_json(500, "Failed to create dictionary bookmark.")
+                        return
+                    connection.commit()
+                    bookmark = connection.execute(
+                        """
+                        SELECT
+                            id,
+                            source_id,
+                            video_id,
+                            track,
+                            cue_start_ms,
+                            cue_end_ms,
+                            cue_text,
+                            dict_entry_id,
+                            dict_source_name,
+                            lookup_term,
+                            term,
+                            term_norm,
+                            definition,
+                            created_at,
+                            updated_at
+                        FROM dictionary_bookmarks
+                        WHERE id = ?
+                        """,
+                        (int(bookmark_id),),
+                    ).fetchone()
+                    if bookmark is None:
+                        self._send_error_json(500, "Failed to read dictionary bookmark.")
+                        return
+                    self._send_json(
+                        {
+                            "status": "saved",
+                            "bookmark": serialize_dictionary_bookmark_row(bookmark),
+                        }
+                    )
+                    return
+
+                connection.execute(
+                    "DELETE FROM dictionary_bookmarks WHERE id = ?",
+                    (int(existing["id"]),),
+                )
+                connection.commit()
+                self._send_json(
+                    {
+                        "status": "removed",
+                        "bookmark": serialize_dictionary_bookmark_row(existing),
+                    }
+                )
+
         def _validate_video_exists(
             self,
             connection: sqlite3.Connection,
@@ -4848,6 +5198,9 @@ def build_web_handler(
                 if path == "/api/bookmarks":
                     self._handle_api_bookmarks_get(query)
                     return
+                if path == "/api/dictionary-bookmarks":
+                    self._handle_api_dictionary_bookmarks_get(query)
+                    return
                 self._send_error_json(404, "Not found.")
             except BrokenPipeError:
                 return
@@ -4866,6 +5219,9 @@ def build_web_handler(
                     return
                 if path == "/api/bookmarks":
                     self._handle_api_create_bookmark()
+                    return
+                if path == "/api/dictionary-bookmarks/toggle":
+                    self._handle_api_toggle_dictionary_bookmark()
                     return
                 note_match = re.fullmatch(r"/api/bookmarks/(\d+)/note", path)
                 if note_match:

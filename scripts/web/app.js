@@ -132,6 +132,8 @@ const state = {
   dictPopupContextRootEl: null,
   dictPopupCueStartMs: null,
   dictPopupCueEndMs: null,
+  dictPopupCueText: "",
+  dictPopupTrackId: "",
   dictPopupNodeId: null,
   dictPopupPinned: false,
   dictPopupNodeElements: new Map(),
@@ -150,6 +152,8 @@ const state = {
   dictHoverLoopEnabled: localStorage.getItem("substudy.dict_hover_loop") !== "off",
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
+  dictBookmarks: new Map(),
+  dictBookmarksApiAvailable: null,
   dictWordGroupCounter: 0,
   dictBatchApiAvailable: null,
   dictPrefetchToken: 0,
@@ -2045,7 +2049,240 @@ function extractDictionaryCueRangeFromElement(wordEl) {
   };
 }
 
+function normalizeDictionaryBookmarkTrackId(rawValue) {
+  if (rawValue === undefined || rawValue === null) {
+    return "";
+  }
+  return String(rawValue || "").trim();
+}
+
+function buildDictionaryBookmarkKeyFromParts(
+  sourceId,
+  videoId,
+  track,
+  cueStartMs,
+  cueEndMs,
+  dictEntryId,
+) {
+  const safeSourceId = String(sourceId || "").trim();
+  const safeVideoId = String(videoId || "").trim();
+  const safeTrack = normalizeDictionaryBookmarkTrackId(track);
+  const safeStartMs = Math.max(0, Math.round(Number(cueStartMs) || 0));
+  const safeEndMs = Math.max(safeStartMs, Math.round(Number(cueEndMs) || safeStartMs));
+  const safeDictEntryId = Math.round(Number(dictEntryId) || 0);
+  if (!safeSourceId || !safeVideoId || safeDictEntryId <= 0) {
+    return "";
+  }
+  return [
+    encodeURIComponent(safeSourceId),
+    encodeURIComponent(safeVideoId),
+    encodeURIComponent(safeTrack),
+    String(safeStartMs),
+    String(safeEndMs),
+    String(safeDictEntryId),
+  ].join("|");
+}
+
+function dictionaryBookmarkKeyFromPayload(payload) {
+  if (!payload) {
+    return "";
+  }
+  return buildDictionaryBookmarkKeyFromParts(
+    payload.source_id,
+    payload.video_id,
+    payload.track,
+    payload.cue_start_ms,
+    payload.cue_end_ms,
+    payload.dict_entry_id,
+  );
+}
+
+function dictionaryBookmarkKeyFromRecord(record) {
+  if (!record) {
+    return "";
+  }
+  return buildDictionaryBookmarkKeyFromParts(
+    record.source_id,
+    record.video_id,
+    record.track,
+    record.cue_start_ms,
+    record.cue_end_ms,
+    record.dict_entry_id,
+  );
+}
+
+function updateDictionaryBookmarkButtonState(buttonEl, saved, pending = false) {
+  if (!(buttonEl instanceof HTMLButtonElement)) {
+    return;
+  }
+  buttonEl.classList.toggle("saved", Boolean(saved));
+  buttonEl.classList.toggle("pending", Boolean(pending));
+  buttonEl.textContent = pending ? "..." : (saved ? "★" : "☆");
+  buttonEl.setAttribute(
+    "aria-label",
+    pending
+      ? "辞書ブックマーク処理中"
+      : (saved ? "辞書ブックマーク解除" : "辞書ブックマーク保存")
+  );
+}
+
+function syncDictionaryBookmarkButtonsForKey(bookmarkKey) {
+  if (!bookmarkKey) {
+    return;
+  }
+  const saved = state.dictBookmarks.has(bookmarkKey);
+  const buttons = document.querySelectorAll(".subtitle-dict-bookmark-btn");
+  for (const button of buttons) {
+    if (!(button instanceof HTMLButtonElement)) {
+      continue;
+    }
+    if (String(button.dataset.dictBookmarkKey || "") !== bookmarkKey) {
+      continue;
+    }
+    if (button.classList.contains("pending")) {
+      continue;
+    }
+    updateDictionaryBookmarkButtonState(button, saved, false);
+  }
+}
+
+function getDictionaryBookmarkContext() {
+  const video = currentVideo();
+  if (!video) {
+    return null;
+  }
+  let cueStartMs = Number(state.dictPopupCueStartMs);
+  let cueEndMs = Number(state.dictPopupCueEndMs);
+  let cueText = String(state.dictPopupCueText || "").trim();
+  if (!Number.isFinite(cueStartMs) || !Number.isFinite(cueEndMs) || cueEndMs <= cueStartMs) {
+    const cue = currentCueOrFallback();
+    cueStartMs = Math.max(0, Math.round(Number(cue.start_ms) || 0));
+    cueEndMs = Math.max(cueStartMs, Math.round(Number(cue.end_ms) || cueStartMs));
+    if (!cueText) {
+      cueText = String(cue.text || "").trim();
+    }
+  } else if (!cueText) {
+    cueStartMs = Math.max(0, Math.round(cueStartMs));
+    cueEndMs = Math.max(cueStartMs, Math.round(cueEndMs));
+    cueText = gatherRangeText(cueStartMs, cueEndMs);
+    if (!cueText) {
+      cueText = String(currentCueOrFallback().text || "").trim();
+    }
+  }
+  const track = normalizeDictionaryBookmarkTrackId(state.dictPopupTrackId || state.currentTrackId || "");
+  return {
+    source_id: video.source_id,
+    video_id: video.video_id,
+    track,
+    cue_start_ms: cueStartMs,
+    cue_end_ms: cueEndMs,
+    cue_text: cueText,
+  };
+}
+
+function buildDictionaryBookmarkPayload(entry, fallbackTerm = "") {
+  const context = getDictionaryBookmarkContext();
+  if (!context) {
+    return null;
+  }
+  const dictEntryId = Math.round(Number(entry?.dictEntryId) || 0);
+  const definition = String(entry?.definition || "").trim();
+  const term = String(entry?.term || fallbackTerm || "").trim();
+  const termNorm = normalizeDictionaryTerm(entry?.termNorm || term);
+  if (dictEntryId <= 0 || !definition || !term || !termNorm) {
+    return null;
+  }
+  return {
+    ...context,
+    dict_entry_id: dictEntryId,
+    dict_source_name: String(entry?.sourceName || "").trim(),
+    lookup_term: String(entry?.lookupTerm || "").trim(),
+    term,
+    term_norm: termNorm,
+    definition,
+  };
+}
+
+async function loadDictionaryBookmarks() {
+  const video = currentVideo();
+  if (!video) {
+    state.dictBookmarks = new Map();
+    return;
+  }
+  if (state.dictBookmarksApiAvailable === false) {
+    state.dictBookmarks = new Map();
+    return;
+  }
+  const params = new URLSearchParams({
+    source_id: video.source_id,
+    video_id: video.video_id,
+    limit: "2500",
+  });
+  try {
+    const payload = await apiRequest(`/api/dictionary-bookmarks?${params.toString()}`);
+    state.dictBookmarksApiAvailable = true;
+    const rows = Array.isArray(payload.bookmarks) ? payload.bookmarks : [];
+    const mapped = new Map();
+    for (const row of rows) {
+      const key = dictionaryBookmarkKeyFromRecord(row);
+      if (!key) {
+        continue;
+      }
+      mapped.set(key, row);
+    }
+    state.dictBookmarks = mapped;
+  } catch (error) {
+    const message = String(error?.message || "");
+    if (message.includes("Not found") || message.includes("404")) {
+      state.dictBookmarksApiAvailable = false;
+      state.dictBookmarks = new Map();
+      return;
+    }
+    throw error;
+  }
+}
+
+async function toggleDictionaryBookmark(payload) {
+  if (!payload) {
+    return { status: "invalid", bookmark: null };
+  }
+  if (state.dictBookmarksApiAvailable === false) {
+    throw new Error("辞書ブックマークAPIが未対応です。サーバーを再起動してください。");
+  }
+  const response = await apiRequest("/api/dictionary-bookmarks/toggle", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.dictBookmarksApiAvailable = true;
+  const status = String(response?.status || "");
+  const bookmark = response?.bookmark || null;
+  const key = dictionaryBookmarkKeyFromPayload(payload);
+  if (status === "saved" && bookmark) {
+    state.dictBookmarks.set(key, bookmark);
+  } else if (status === "removed") {
+    state.dictBookmarks.delete(key);
+  }
+  syncDictionaryBookmarkButtonsForKey(key);
+  return {
+    status,
+    bookmark,
+    key,
+  };
+}
+
+function isDictionaryBookmarkSaved(payload) {
+  const key = dictionaryBookmarkKeyFromPayload(payload);
+  return Boolean(key && state.dictBookmarks.has(key));
+}
+
 function updateDictionaryPopupCueRange(wordEl = null) {
+  const explicitTrack = normalizeDictionaryBookmarkTrackId(
+    wordEl instanceof HTMLElement ? wordEl.dataset.dictTrackId : ""
+  );
+  state.dictPopupTrackId = explicitTrack || normalizeDictionaryBookmarkTrackId(state.currentTrackId || "");
+  const explicitCueText = String(
+    wordEl instanceof HTMLElement ? (wordEl.dataset.dictCueText || "") : ""
+  ).trim();
   const explicitRange = extractDictionaryCueRangeFromElement(wordEl);
   if (explicitRange) {
     state.dictPopupCueStartMs = explicitRange.startMs;
@@ -2053,6 +2290,7 @@ function updateDictionaryPopupCueRange(wordEl = null) {
       explicitRange.startMs + DICT_HOVER_LOOP_MIN_MS,
       explicitRange.endMs
     );
+    state.dictPopupCueText = explicitCueText;
     return;
   }
   const cue = currentCueOrFallback();
@@ -2061,12 +2299,14 @@ function updateDictionaryPopupCueRange(wordEl = null) {
   if (!Number.isFinite(cueStartMs) || !Number.isFinite(cueEndMs)) {
     state.dictPopupCueStartMs = null;
     state.dictPopupCueEndMs = null;
+    state.dictPopupCueText = explicitCueText;
     return;
   }
   const startMs = Math.max(0, Math.round(cueStartMs));
   const endMs = Math.max(startMs + DICT_HOVER_LOOP_MIN_MS, Math.round(cueEndMs));
   state.dictPopupCueStartMs = startMs;
   state.dictPopupCueEndMs = endMs;
+  state.dictPopupCueText = explicitCueText || String(cue.text || "").trim();
 }
 
 function stopDictionaryHoverLoop() {
@@ -2136,6 +2376,8 @@ function hideSubtitleDictionaryPopup() {
   state.dictPopupContextRootEl = null;
   state.dictPopupCueStartMs = null;
   state.dictPopupCueEndMs = null;
+  state.dictPopupCueText = "";
+  state.dictPopupTrackId = "";
   if (elements.subtitleDictBridge) {
     elements.subtitleDictBridge.classList.add("hidden");
     elements.subtitleDictBridge.setAttribute("aria-hidden", "true");
@@ -3357,12 +3599,22 @@ function groupDictionaryRows(rows) {
 
     const lookupTerm = String(row?.lookup_term || "").trim();
     const definition = String(row?.definition || "").trim();
-    const entryKey = `${normalizeDictionaryTerm(lookupTerm)}\u0000${definition}`;
+    const dictEntryId = Math.round(Number(row?.id) || 0);
+    const sourceName = String(row?.source_name || "").trim();
+    const rowTerm = String(row?.term || group.term || "").trim();
+    const normalizedRowTerm = normalizeDictionaryTerm(row?.term_norm || rowTerm);
+    const entryKey = dictEntryId > 0
+      ? `id:${dictEntryId}`
+      : `${normalizeDictionaryTerm(lookupTerm)}\u0000${normalizedRowTerm}\u0000${definition}`;
     if (group.entryKeys.has(entryKey)) {
       continue;
     }
     group.entryKeys.add(entryKey);
     group.entries.push({
+      dictEntryId: dictEntryId > 0 ? dictEntryId : null,
+      sourceName,
+      term: rowTerm || group.term || "",
+      termNorm: normalizedRowTerm || group.rowTermNorm || "",
       lookupTerm,
       definition,
     });
@@ -3404,6 +3656,8 @@ function renderDictionaryDefinitionWordsIntoElement(element, text, nodeId = null
 
   const cueStartMs = Number(state.dictPopupCueStartMs);
   const cueEndMs = Number(state.dictPopupCueEndMs);
+  const cueText = String(state.dictPopupCueText || "").trim();
+  const trackId = normalizeDictionaryBookmarkTrackId(state.dictPopupTrackId || state.currentTrackId || "");
   const hasCueRange = Number.isFinite(cueStartMs) && Number.isFinite(cueEndMs) && cueEndMs > cueStartMs;
   const fragment = document.createDocumentFragment();
   SUBTITLE_WORD_PATTERN.lastIndex = 0;
@@ -3428,6 +3682,12 @@ function renderDictionaryDefinitionWordsIntoElement(element, text, nodeId = null
     if (hasCueRange) {
       wordSpan.dataset.dictCueStartMs = String(Math.max(0, Math.round(cueStartMs)));
       wordSpan.dataset.dictCueEndMs = String(Math.round(cueEndMs));
+    }
+    if (cueText) {
+      wordSpan.dataset.dictCueText = cueText;
+    }
+    if (trackId) {
+      wordSpan.dataset.dictTrackId = trackId;
     }
     wordSpan.textContent = word;
     fragment.appendChild(wordSpan);
@@ -3509,6 +3769,48 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
       for (const entry of group.entries) {
         const defItem = document.createElement("li");
         defItem.className = "subtitle-dict-def-item";
+
+        const bookmarkPayload = buildDictionaryBookmarkPayload(entry, group.term || term);
+        if (bookmarkPayload) {
+          const bookmarkBtn = document.createElement("button");
+          bookmarkBtn.type = "button";
+          bookmarkBtn.className = "subtitle-dict-bookmark-btn";
+          const bookmarkKey = dictionaryBookmarkKeyFromPayload(bookmarkPayload);
+          if (bookmarkKey) {
+            bookmarkBtn.dataset.dictBookmarkKey = bookmarkKey;
+          }
+          updateDictionaryBookmarkButtonState(bookmarkBtn, isDictionaryBookmarkSaved(bookmarkPayload), false);
+          bookmarkBtn.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            bookmarkBtn.disabled = true;
+            updateDictionaryBookmarkButtonState(bookmarkBtn, false, true);
+            toggleDictionaryBookmark(bookmarkPayload)
+              .then((result) => {
+                const saved = result?.status === "saved";
+                updateDictionaryBookmarkButtonState(bookmarkBtn, saved, false);
+                setStatus(saved ? "辞書ブックマークを保存しました。" : "辞書ブックマークを解除しました。", "ok");
+              })
+              .catch((error) => {
+                updateDictionaryBookmarkButtonState(
+                  bookmarkBtn,
+                  isDictionaryBookmarkSaved(bookmarkPayload),
+                  false
+                );
+                const message = String(error?.message || "");
+                if (message.includes("Not found") || message.includes("404")) {
+                  state.dictBookmarksApiAvailable = false;
+                  setStatus("辞書ブックマークAPIが未対応です。サーバー再起動後に利用できます。", "error");
+                  return;
+                }
+                setStatus(message || "辞書ブックマーク更新に失敗しました。", "error");
+              })
+              .finally(() => {
+                bookmarkBtn.disabled = false;
+              });
+          });
+          defItem.appendChild(bookmarkBtn);
+        }
 
         const detail = document.createElement("span");
         detail.className = "subtitle-dict-def-text";
@@ -4332,6 +4634,8 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
   );
   const cueStartMs = hasCueRange ? Math.max(0, Math.round(cueStartMsRaw)) : null;
   const cueEndMs = hasCueRange ? Math.round(cueEndMsRaw) : null;
+  const cueText = String(options.cueText || "").trim();
+  const trackId = normalizeDictionaryBookmarkTrackId(options.trackId || "");
 
   SUBTITLE_WORD_PATTERN.lastIndex = 0;
   const fragment = document.createDocumentFragment();
@@ -4355,6 +4659,12 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
     if (hasCueRange && cueStartMs !== null && cueEndMs !== null) {
       span.dataset.dictCueStartMs = String(cueStartMs);
       span.dataset.dictCueEndMs = String(cueEndMs);
+    }
+    if (cueText) {
+      span.dataset.dictCueText = cueText;
+    }
+    if (trackId) {
+      span.dataset.dictTrackId = trackId;
     }
     span.textContent = word;
     fragment.appendChild(span);
@@ -4515,7 +4825,11 @@ function renderSubtitleOverlayText(text) {
   if (popupAnchorInOverlay) {
     hideSubtitleDictionaryPopup();
   }
-  renderDictionaryWordsIntoElement(elements.subtitleOverlay, text, { source: "overlay" });
+  renderDictionaryWordsIntoElement(elements.subtitleOverlay, text, {
+    source: "overlay",
+    cueText: text,
+    trackId: state.currentTrackId,
+  });
 }
 
 function clearSubtitleOverlay(message = "字幕がありません") {
@@ -4848,7 +5162,9 @@ function renderSubtitlePanelReel() {
       renderDictionaryWordsIntoElement(enLine, row.en_text, {
         cueStartMs: row.start_ms,
         cueEndMs: row.end_ms,
+        cueText: row.en_text,
         source: "reel",
+        trackId: state.subtitlePanelPrimaryTrackId || state.currentTrackId,
       });
     } else {
       enLine.classList.add("missing");
@@ -5496,7 +5812,9 @@ function renderBookmarkList() {
       renderDictionaryWordsIntoElement(text, bookmark.text, {
         cueStartMs: bookmark.start_ms,
         cueEndMs: bookmark.end_ms,
+        cueText: bookmark.text,
         source: "bookmark",
+        trackId: bookmark.track || state.currentTrackId,
       });
     } else {
       text.textContent = "(字幕テキストなし)";
@@ -5580,6 +5898,11 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
 
   await loadTrackCues();
   await loadBookmarks();
+  try {
+    await loadDictionaryBookmarks();
+  } catch (error) {
+    setStatus(`辞書ブックマーク読み込みに失敗しました: ${error.message}`, "error");
+  }
   applyOutputVolume();
   await initialSeekPromise;
   syncUrlPlaybackPosition(true);
@@ -5664,6 +5987,7 @@ async function loadFeed(
     clearSubtitleOverlay("動画がありません");
     setVideoMetaFallback("動画が見つかりません", "0 / 0");
     state.bookmarks = [];
+    state.dictBookmarks = new Map();
     state.subtitlePanelRows = [];
     state.subtitlePanelPrimaryCues = [];
     state.subtitlePanelJaCues = [];
@@ -5805,7 +6129,7 @@ function gatherRangeText(startMs, endMs) {
   const parts = [];
   const seen = new Set();
   for (const cue of state.cues) {
-    if (cue.end_ms < startMs || cue.start_ms > endMs) {
+    if (cue.end_ms <= startMs || cue.start_ms >= endMs) {
       continue;
     }
     const value = String(cue.text || "").trim();
