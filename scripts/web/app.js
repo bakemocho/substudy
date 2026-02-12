@@ -2155,6 +2155,10 @@ function rebuildDictionaryBookmarkedTermNorms() {
       continue;
     }
     next.add(normalized);
+    const normalizedLookup = normalizeDictionaryTerm(bookmark?.lookup_term || "");
+    if (normalizedLookup) {
+      next.add(normalizedLookup);
+    }
   }
   state.dictBookmarkedTermNorms = next;
 }
