@@ -1506,7 +1506,6 @@ function bindDictionaryPopupElementEvents(popupEl) {
     }
     updateDictionaryPopupStacking();
     clearDictionaryPopupHideTimer();
-    startDictionaryHoverLoop();
   });
   popupEl.addEventListener("pointerleave", (event) => {
     const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
@@ -2082,7 +2081,8 @@ function stopDictionaryHoverLoop() {
   }
 }
 
-function startDictionaryHoverLoop() {
+function startDictionaryHoverLoop(options = {}) {
+  const { forceSeekStart = false } = options;
   if (!state.dictHoverLoopEnabled || state.lyricReelActive || !elements.videoPlayer.src) {
     return;
   }
@@ -2097,7 +2097,7 @@ function startDictionaryHoverLoop() {
   state.dictHoverLoopActive = true;
   const shouldAutoPlay = !state.dictHoverLoopPauseOnStop;
   const nowMs = Math.round((elements.videoPlayer.currentTime || 0) * 1000);
-  if (nowMs < startMs || nowMs > endMs) {
+  if (forceSeekStart || nowMs < startMs || nowMs > endMs) {
     elements.videoPlayer.currentTime = startMs / 1000;
   }
   if (shouldAutoPlay && elements.videoPlayer.paused) {
@@ -4458,7 +4458,11 @@ function pinSubtitleDictionaryWord(wordEl) {
   if (!(wordEl instanceof HTMLElement)) {
     return;
   }
-  showSubtitleDictionaryForWord(wordEl, { pin: true }).catch((error) => setStatus(error.message, "error"));
+  showSubtitleDictionaryForWord(wordEl, { pin: true })
+    .then(() => {
+      startDictionaryHoverLoop({ forceSeekStart: true });
+    })
+    .catch((error) => setStatus(error.message, "error"));
 }
 
 function isDictionaryHoverSafeTarget(nextElement) {
@@ -6258,7 +6262,6 @@ function bindEvents() {
   if (elements.subtitleDictBridge) {
     elements.subtitleDictBridge.addEventListener("pointerenter", () => {
       clearDictionaryPopupHideTimer();
-      startDictionaryHoverLoop();
     });
     elements.subtitleDictBridge.addEventListener("pointerleave", (event) => {
       const nextElement = event.relatedTarget instanceof Element ? event.relatedTarget : null;
