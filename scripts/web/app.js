@@ -5352,6 +5352,15 @@ function clearCountdown() {
   elements.countdownPanel.classList.add("hidden");
 }
 
+function cancelAutoAdvanceCountdown() {
+  if (state.countdownTimer === null) {
+    return false;
+  }
+  clearCountdown();
+  setStatus("自動遷移をキャンセルしました。", "ok");
+  return true;
+}
+
 function startCountdown() {
   clearCountdown();
   startCountdownPrefetch();
@@ -5987,6 +5996,10 @@ function handleKeydown(event) {
   ) {
     return;
   }
+  if (event.key === "Escape" && cancelAutoAdvanceCountdown()) {
+    event.preventDefault();
+    return;
+  }
   if (state.lyricReelActive) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -6192,6 +6205,9 @@ function bindEvents() {
     }
     if (state.lyricReelActive) {
       closeLyricReel({ resumePlayback: true });
+      return;
+    }
+    if (cancelAutoAdvanceCountdown()) {
       return;
     }
     togglePlayPause();
@@ -6531,8 +6547,7 @@ function bindEvents() {
   });
 
   elements.cancelCountdownBtn.addEventListener("click", () => {
-    clearCountdown();
-    setStatus("自動遷移をキャンセルしました。", "ok");
+    cancelAutoAdvanceCountdown();
     resetControlsToggleFade();
   });
 
