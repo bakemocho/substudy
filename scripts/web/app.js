@@ -166,6 +166,7 @@ const state = {
     }
     return "all";
   })(),
+  urlPlaybackTimeSecond: -1,
 };
 
 const elements = {
@@ -719,6 +720,12 @@ function parseInitialVideoSelectionFromUrl() {
     const params = new URLSearchParams(window.location.search);
     const sourceId = String(params.get("source_id") || "").trim();
     const videoId = String(params.get("video_id") || "").trim();
+    const rawPlaybackTimeSec = Number(params.get("t"));
+    const playbackTimeSec = (
+      Number.isFinite(rawPlaybackTimeSec) && rawPlaybackTimeSec >= 0
+        ? rawPlaybackTimeSec
+        : null
+    );
     const hasTranslationFilter = params.has("translation_filter");
     const translationFilter = normalizeTranslationFilter(
       params.get("translation_filter"),
@@ -727,6 +734,7 @@ function parseInitialVideoSelectionFromUrl() {
     return {
       sourceId,
       videoId,
+      playbackTimeSec,
       translationFilter,
       hasTranslationFilter,
     };
@@ -734,13 +742,19 @@ function parseInitialVideoSelectionFromUrl() {
     return {
       sourceId: "",
       videoId: "",
+      playbackTimeSec: null,
       translationFilter: state.translationFilter,
       hasTranslationFilter: false,
     };
   }
 }
 
-function updateUrlVideoSelection(sourceId = "", videoId = "", translationFilter = state.translationFilter) {
+function updateUrlVideoSelection(
+  sourceId = "",
+  videoId = "",
+  translationFilter = state.translationFilter,
+  playbackTimeSec = null
+) {
   try {
     const url = new URL(window.location.href);
     if (sourceId) {
@@ -759,12 +773,75 @@ function updateUrlVideoSelection(sourceId = "", videoId = "", translationFilter 
     } else {
       url.searchParams.delete("translation_filter");
     }
+    const safePlaybackTimeSec = Number(playbackTimeSec);
+    if (Number.isFinite(safePlaybackTimeSec) && safePlaybackTimeSec > 0) {
+      url.searchParams.set("t", String(Math.max(0, Math.round(safePlaybackTimeSec))));
+    } else {
+      url.searchParams.delete("t");
+    }
     const search = url.searchParams.toString();
     const nextRelativeUrl = `${url.pathname}${search ? `?${search}` : ""}${url.hash || ""}`;
     window.history.replaceState({}, "", nextRelativeUrl);
   } catch (_error) {
     return;
   }
+}
+
+function syncUrlPlaybackPosition(force = false) {
+  const video = currentVideo();
+  if (!video || !elements.videoPlayer.src) {
+    return;
+  }
+  const currentTime = Number(elements.videoPlayer.currentTime);
+  if (!Number.isFinite(currentTime) || currentTime < 0) {
+    return;
+  }
+  const second = Math.max(0, Math.round(currentTime));
+  if (!force && second === state.urlPlaybackTimeSecond) {
+    return;
+  }
+  state.urlPlaybackTimeSecond = second;
+  updateUrlVideoSelection(video.source_id, video.video_id, state.translationFilter, second);
+}
+
+function applyInitialPlaybackTime(playbackTimeSec) {
+  const requested = Number(playbackTimeSec);
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return Promise.resolve(false);
+  }
+  const targetTimeSec = Math.max(0, requested);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (applied) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(Boolean(applied));
+    };
+    const seekNow = () => {
+      let nextTimeSec = targetTimeSec;
+      const duration = Number(elements.videoPlayer.duration);
+      if (Number.isFinite(duration) && duration > 0) {
+        nextTimeSec = Math.min(nextTimeSec, Math.max(0, duration - 0.05));
+      }
+      try {
+        elements.videoPlayer.currentTime = nextTimeSec;
+        settle(true);
+      } catch (_error) {
+        settle(false);
+      }
+    };
+    if (elements.videoPlayer.readyState >= 1) {
+      seekNow();
+      return;
+    }
+    const onLoadedMetadata = () => {
+      seekNow();
+    };
+    elements.videoPlayer.addEventListener("loadedmetadata", onLoadedMetadata, { once: true });
+    window.setTimeout(() => settle(false), 1500);
+  });
 }
 
 function isJumpModalOpen() {
@@ -5448,7 +5525,7 @@ async function removeBookmark(bookmarkId) {
   setStatus("ブックマークを削除しました。", "ok");
 }
 
-async function openVideo(index, autoplay = true, historyMode = "push") {
+async function openVideo(index, autoplay = true, historyMode = "push", startTimeSec = null) {
   if (!state.videos.length) {
     return;
   }
@@ -5463,8 +5540,10 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   const video = currentVideo();
   elements.videoPlayer.src = video.media_url;
   elements.videoPlayer.load();
+  const initialSeekPromise = applyInitialPlaybackTime(startTimeSec);
   updateVideoProgressTimer();
-  updateUrlVideoSelection(video.source_id, video.video_id);
+  state.urlPlaybackTimeSecond = -1;
+  updateUrlVideoSelection(video.source_id, video.video_id, state.translationFilter, null);
 
   renderVideoMeta(video);
   updateFavoriteButton();
@@ -5474,6 +5553,8 @@ async function openVideo(index, autoplay = true, historyMode = "push") {
   await loadTrackCues();
   await loadBookmarks();
   applyOutputVolume();
+  await initialSeekPromise;
+  syncUrlPlaybackPosition(true);
 
   if (autoplay) {
     try {
@@ -5493,7 +5574,8 @@ async function loadFeed(
   sourceId = "",
   startRandom = false,
   preferredVideoId = "",
-  translationFilter = state.translationFilter
+  translationFilter = state.translationFilter,
+  preferredPlaybackTimeSec = null
 ) {
   closeJumpModal();
   closeLyricReel();
@@ -5567,8 +5649,10 @@ async function loadFeed(
   }
 
   let initialIndex = -1;
+  let usedPreferredVideo = false;
   if (preferredVideoId) {
     initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoId);
+    usedPreferredVideo = initialIndex >= 0;
   }
   if (initialIndex < 0) {
     initialIndex = startRandom
@@ -5576,7 +5660,8 @@ async function loadFeed(
       : 0;
   }
   resetPlaybackTracking(initialIndex);
-  await openVideo(initialIndex, true, "keep");
+  const initialPlaybackTimeSec = usedPreferredVideo ? preferredPlaybackTimeSec : null;
+  await openVideo(initialIndex, true, "keep", initialPlaybackTimeSec);
   if (serverFilterMismatch) {
     setStatus(
       `${state.videos.length}件の動画を読み込みました。和訳フィルタはローカル適用です（Webサーバー再起動推奨）。`,
@@ -6453,6 +6538,7 @@ function bindEvents() {
 
   elements.videoPlayer.addEventListener("timeupdate", () => {
     updateVideoProgressTimer();
+    syncUrlPlaybackPosition(false);
     enforceDictionaryHoverLoop();
     updateSubtitleFromPlayback();
   });
@@ -6464,6 +6550,7 @@ function bindEvents() {
   elements.videoPlayer.addEventListener("pause", () => {
     stopDictionaryHoverLoop();
     updateVideoProgressTimer();
+    syncUrlPlaybackPosition(true);
     updatePlayPauseButton();
   });
   elements.videoPlayer.addEventListener("loadedmetadata", () => {
@@ -6474,6 +6561,7 @@ function bindEvents() {
   });
   elements.videoPlayer.addEventListener("seeked", () => {
     updateVideoProgressTimer();
+    syncUrlPlaybackPosition(true);
   });
   elements.videoPlayer.addEventListener("volumechange", () => {
     updateMuteButtonLabel();
@@ -6518,6 +6606,9 @@ function bindEvents() {
     schedulePhoneShellSnapCheck();
   }, { passive: true });
   window.addEventListener("wheel", handleWindowWheelForPlayerSnap, { passive: false });
+  window.addEventListener("beforeunload", () => {
+    syncUrlPlaybackPosition(true);
+  });
 }
 
 async function initialize() {
@@ -6546,7 +6637,8 @@ async function initialize() {
       initialSelection.sourceId,
       false,
       initialSelection.videoId,
-      state.translationFilter
+      state.translationFilter,
+      initialSelection.playbackTimeSec
     );
     schedulePhoneShellSnapCheck();
     setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
