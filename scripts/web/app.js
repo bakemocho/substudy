@@ -153,6 +153,7 @@ const state = {
   dictHoverLoopActive: false,
   dictHoverLoopPauseOnStop: false,
   dictBookmarks: new Map(),
+  dictBookmarkedTermNorms: new Set(),
   dictBookmarksApiAvailable: null,
   dictWordGroupCounter: 0,
   dictBatchApiAvailable: null,
@@ -2126,6 +2127,41 @@ function updateDictionaryBookmarkButtonState(buttonEl, saved, pending = false) {
   );
 }
 
+function rebuildDictionaryBookmarkedTermNorms() {
+  const next = new Set();
+  for (const bookmark of state.dictBookmarks.values()) {
+    const normalized = normalizeDictionaryTerm(bookmark?.term_norm || bookmark?.term || "");
+    if (!normalized) {
+      continue;
+    }
+    next.add(normalized);
+  }
+  state.dictBookmarkedTermNorms = next;
+}
+
+function refreshSubtitleReelDictionaryBookmarkHighlights() {
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  const words = elements.subtitlePanelReel.querySelectorAll(".subtitle-word");
+  for (const wordEl of words) {
+    if (!(wordEl instanceof HTMLElement)) {
+      continue;
+    }
+    const source = String(wordEl.dataset.dictSource || "").trim().toLowerCase();
+    if (source !== "reel") {
+      wordEl.classList.remove("dict-bookmarked-term");
+      continue;
+    }
+    const term = String(wordEl.dataset.dictTerm || wordEl.textContent || "");
+    const normalized = normalizeDictionaryTerm(term);
+    wordEl.classList.toggle(
+      "dict-bookmarked-term",
+      Boolean(normalized && state.dictBookmarkedTermNorms.has(normalized))
+    );
+  }
+}
+
 function syncDictionaryBookmarkButtonsForKey(bookmarkKey) {
   if (!bookmarkKey) {
     return;
@@ -2207,10 +2243,14 @@ async function loadDictionaryBookmarks() {
   const video = currentVideo();
   if (!video) {
     state.dictBookmarks = new Map();
+    rebuildDictionaryBookmarkedTermNorms();
+    refreshSubtitleReelDictionaryBookmarkHighlights();
     return;
   }
   if (state.dictBookmarksApiAvailable === false) {
     state.dictBookmarks = new Map();
+    rebuildDictionaryBookmarkedTermNorms();
+    refreshSubtitleReelDictionaryBookmarkHighlights();
     return;
   }
   const params = new URLSearchParams({
@@ -2231,11 +2271,15 @@ async function loadDictionaryBookmarks() {
       mapped.set(key, row);
     }
     state.dictBookmarks = mapped;
+    rebuildDictionaryBookmarkedTermNorms();
+    refreshSubtitleReelDictionaryBookmarkHighlights();
   } catch (error) {
     const message = String(error?.message || "");
     if (message.includes("Not found") || message.includes("404")) {
       state.dictBookmarksApiAvailable = false;
       state.dictBookmarks = new Map();
+      rebuildDictionaryBookmarkedTermNorms();
+      refreshSubtitleReelDictionaryBookmarkHighlights();
       return;
     }
     throw error;
@@ -2262,6 +2306,8 @@ async function toggleDictionaryBookmark(payload) {
   } else if (status === "removed") {
     state.dictBookmarks.delete(key);
   }
+  rebuildDictionaryBookmarkedTermNorms();
+  refreshSubtitleReelDictionaryBookmarkHighlights();
   syncDictionaryBookmarkButtonsForKey(key);
   return {
     status,
@@ -4666,6 +4712,12 @@ function renderDictionaryWordsIntoElement(element, text, options = {}) {
     if (trackId) {
       span.dataset.dictTrackId = trackId;
     }
+    if (
+      source === "reel"
+      && state.dictBookmarkedTermNorms.has(normalizeDictionaryTerm(word))
+    ) {
+      span.classList.add("dict-bookmarked-term");
+    }
     span.textContent = word;
     fragment.appendChild(span);
     cursor = end;
@@ -5186,6 +5238,7 @@ function renderSubtitlePanelReel() {
     elements.subtitlePanelReel.appendChild(rowEl);
   }
   updateSubtitlePanelBookmarkStates();
+  refreshSubtitleReelDictionaryBookmarkHighlights();
 }
 
 function updateSubtitlePanelActiveFromPlayback(options = {}) {
@@ -5988,6 +6041,8 @@ async function loadFeed(
     setVideoMetaFallback("動画が見つかりません", "0 / 0");
     state.bookmarks = [];
     state.dictBookmarks = new Map();
+    rebuildDictionaryBookmarkedTermNorms();
+    refreshSubtitleReelDictionaryBookmarkHighlights();
     state.subtitlePanelRows = [];
     state.subtitlePanelPrimaryCues = [];
     state.subtitlePanelJaCues = [];

@@ -213,6 +213,13 @@ body {
   transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
+.subtitle-word.dict-bookmarked-term {
+  color: #ffe4a1;
+  border-bottom-color: rgba(255, 206, 98, 0.92);
+  background: rgba(159, 109, 24, 0.2);
+  border-radius: 4px;
+}
+
 .subtitle-word:hover,
 .subtitle-word.active {
   color: #f9fbff;
