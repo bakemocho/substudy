@@ -2240,7 +2240,52 @@ function getDictionaryBookmarkContext() {
   };
 }
 
-function buildDictionaryBookmarkPayload(entry, fallbackTerm = "") {
+function buildDictionaryLookupPathPayload(nodeOrNodeId = null) {
+  let node = null;
+  if (nodeOrNodeId && typeof nodeOrNodeId === "object" && Number.isInteger(nodeOrNodeId.id)) {
+    node = nodeOrNodeId;
+  } else {
+    const nodeId = Number(nodeOrNodeId);
+    node = getDictionaryTreeNode(nodeId);
+  }
+  if (!node) {
+    node = getDictionaryTreeNode(state.dictTreeCurrentNodeId);
+  }
+  if (!node) {
+    return { lookupPath: [], lookupPathLabel: "" };
+  }
+  const pathNodes = collectDictionaryTreePath(node.id);
+  if (!pathNodes.length) {
+    return { lookupPath: [], lookupPathLabel: "" };
+  }
+  const lookupPath = [];
+  for (let index = 0; index < pathNodes.length; index += 1) {
+    const pathNode = pathNodes[index];
+    const term = String(pathNode?.term || "").trim();
+    const termNorm = normalizeDictionaryTerm(pathNode?.normalizedTerm || term);
+    if (!term && !termNorm) {
+      continue;
+    }
+    lookupPath.push({
+      level: index + 1,
+      node_id: Number(pathNode?.id) || null,
+      parent_id: Number(pathNode?.parentId) || null,
+      source: String(pathNode?.source || "").trim(),
+      term: term || termNorm,
+      term_norm: termNorm,
+    });
+  }
+  const lookupPathLabel = lookupPath
+    .map((item) => String(item?.term || "").trim())
+    .filter(Boolean)
+    .join(" > ");
+  return {
+    lookupPath,
+    lookupPathLabel,
+  };
+}
+
+function buildDictionaryBookmarkPayload(entry, fallbackTerm = "", options = {}) {
   const context = getDictionaryBookmarkContext();
   if (!context) {
     return null;
@@ -2252,6 +2297,7 @@ function buildDictionaryBookmarkPayload(entry, fallbackTerm = "") {
   if (dictEntryId <= 0 || !definition || !term || !termNorm) {
     return null;
   }
+  const { lookupPath, lookupPathLabel } = buildDictionaryLookupPathPayload(options.node || null);
   return {
     ...context,
     dict_entry_id: dictEntryId,
@@ -2261,10 +2307,12 @@ function buildDictionaryBookmarkPayload(entry, fallbackTerm = "") {
     term_norm: termNorm,
     definition,
     missing_entry: false,
+    lookup_path: lookupPath,
+    lookup_path_label: lookupPathLabel,
   };
 }
 
-function buildMissingDictionaryBookmarkPayload(term) {
+function buildMissingDictionaryBookmarkPayload(term, options = {}) {
   const context = getDictionaryBookmarkContext();
   if (!context) {
     return null;
@@ -2274,6 +2322,7 @@ function buildMissingDictionaryBookmarkPayload(term) {
   if (!safeTerm || !termNorm) {
     return null;
   }
+  const { lookupPath, lookupPathLabel } = buildDictionaryLookupPathPayload(options.node || null);
   return {
     ...context,
     dict_entry_id: 0,
@@ -2283,6 +2332,8 @@ function buildMissingDictionaryBookmarkPayload(term) {
     term_norm: termNorm,
     definition: "辞書エントリが見つかりません。",
     missing_entry: true,
+    lookup_path: lookupPath,
+    lookup_path_label: lookupPathLabel,
   };
 }
 
@@ -3842,7 +3893,7 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
     empty.className = "subtitle-dict-empty";
     empty.textContent = "辞書エントリが見つかりません。";
     popupEl.appendChild(empty);
-    const missingBookmarkPayload = buildMissingDictionaryBookmarkPayload(term);
+    const missingBookmarkPayload = buildMissingDictionaryBookmarkPayload(term, { node });
     if (missingBookmarkPayload) {
       const actions = document.createElement("div");
       actions.className = "subtitle-dict-empty-actions";
@@ -3923,7 +3974,7 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
         const defItem = document.createElement("li");
         defItem.className = "subtitle-dict-def-item";
 
-        const bookmarkPayload = buildDictionaryBookmarkPayload(entry, group.term || term);
+        const bookmarkPayload = buildDictionaryBookmarkPayload(entry, group.term || term, { node });
         if (bookmarkPayload) {
           const bookmarkBtn = document.createElement("button");
           bookmarkBtn.type = "button";

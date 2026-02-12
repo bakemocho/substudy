@@ -1586,6 +1586,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             term_norm TEXT NOT NULL,
             definition TEXT NOT NULL,
             missing_entry INTEGER NOT NULL DEFAULT 0,
+            lookup_path_json TEXT NOT NULL DEFAULT '',
+            lookup_path_label TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (source_id, video_id, track, cue_start_ms, cue_end_ms, dict_entry_id),
@@ -1703,12 +1705,93 @@ def ensure_dictionary_bookmarks_schema(connection: sqlite3.Connection) -> None:
             ADD COLUMN missing_entry INTEGER NOT NULL DEFAULT 0
             """
         )
+    if "lookup_path_json" not in existing_columns:
+        connection.execute(
+            """
+            ALTER TABLE dictionary_bookmarks
+            ADD COLUMN lookup_path_json TEXT NOT NULL DEFAULT ''
+            """
+        )
+    if "lookup_path_label" not in existing_columns:
+        connection.execute(
+            """
+            ALTER TABLE dictionary_bookmarks
+            ADD COLUMN lookup_path_label TEXT NOT NULL DEFAULT ''
+            """
+        )
 
 
 def make_missing_dict_entry_id(term_norm: str) -> int:
     normalized = normalize_dictionary_term(term_norm)
     digest = zlib.crc32(normalized.encode("utf-8")) & 0xFFFFFFFF
     return MISSING_DICT_ENTRY_ID_BASE + int(digest)
+
+
+def normalize_dictionary_lookup_path(raw_value: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw_item in raw_value:
+        term = ""
+        term_norm = ""
+        source = ""
+        node_id: int | None = None
+        parent_id: int | None = None
+        level: int | None = None
+        if isinstance(raw_item, dict):
+            term = str(raw_item.get("term") or "").strip()
+            term_norm = normalize_dictionary_term(raw_item.get("term_norm") or term)
+            source = str(raw_item.get("source") or "").strip()
+            try:
+                parsed_node_id = int(raw_item.get("node_id"))
+            except (TypeError, ValueError):
+                parsed_node_id = 0
+            if parsed_node_id > 0:
+                node_id = parsed_node_id
+            try:
+                parsed_parent_id = int(raw_item.get("parent_id"))
+            except (TypeError, ValueError):
+                parsed_parent_id = 0
+            if parsed_parent_id > 0:
+                parent_id = parsed_parent_id
+            try:
+                parsed_level = int(raw_item.get("level"))
+            except (TypeError, ValueError):
+                parsed_level = 0
+            if parsed_level > 0:
+                level = parsed_level
+        elif raw_item not in (None, ""):
+            term = str(raw_item).strip()
+            term_norm = normalize_dictionary_term(term)
+        if not term and term_norm:
+            term = term_norm
+        if not term and not term_norm:
+            continue
+        entry: dict[str, Any] = {
+            "level": level if level and level > 0 else len(normalized) + 1,
+            "term": term,
+            "term_norm": term_norm,
+            "source": source,
+        }
+        if node_id is not None:
+            entry["node_id"] = node_id
+        if parent_id is not None:
+            entry["parent_id"] = parent_id
+        normalized.append(entry)
+        if len(normalized) >= 24:
+            break
+    return normalized
+
+
+def build_dictionary_lookup_path_label(path: list[dict[str, Any]]) -> str:
+    labels: list[str] = []
+    for item in path:
+        if not isinstance(item, dict):
+            continue
+        term = str(item.get("term") or "").strip()
+        if term:
+            labels.append(term)
+    return " > ".join(labels)
 
 
 def rebuild_dictionary_fts(connection: sqlite3.Connection) -> bool:
@@ -4066,6 +4149,8 @@ def serialize_dictionary_bookmark_row(
         term_norm = str(row["term_norm"])
         definition = str(row["definition"])
         missing_entry = int(row["missing_entry"])
+        lookup_path_json = row["lookup_path_json"]
+        lookup_path_label = row["lookup_path_label"]
         created_at = str(row["created_at"])
         updated_at = str(row["updated_at"])
     else:
@@ -4084,9 +4169,24 @@ def serialize_dictionary_bookmark_row(
             term_norm,
             definition,
             missing_entry,
+            lookup_path_json,
+            lookup_path_label,
             created_at,
             updated_at,
         ) = row
+
+    path_text = "" if lookup_path_json in (None, "") else str(lookup_path_json)
+    lookup_path: list[dict[str, Any]] = []
+    if path_text:
+        try:
+            parsed_path = json.loads(path_text)
+        except json.JSONDecodeError:
+            parsed_path = []
+        if isinstance(parsed_path, list):
+            lookup_path = normalize_dictionary_lookup_path(parsed_path)
+    path_label = "" if lookup_path_label in (None, "") else str(lookup_path_label)
+    if not path_label and lookup_path:
+        path_label = build_dictionary_lookup_path_label(lookup_path)
 
     return {
         "id": int(bookmark_id),
@@ -4103,6 +4203,8 @@ def serialize_dictionary_bookmark_row(
         "term_norm": str(term_norm),
         "definition": str(definition),
         "missing_entry": bool(int(missing_entry)),
+        "lookup_path": lookup_path,
+        "lookup_path_label": path_label,
         "created_at": str(created_at),
         "updated_at": str(updated_at),
     }
@@ -4323,6 +4425,8 @@ def build_web_handler(
                     term_norm,
                     definition,
                     missing_entry,
+                    lookup_path_json,
+                    lookup_path_label,
                     created_at,
                     updated_at
                 FROM dictionary_bookmarks
@@ -4722,6 +4826,8 @@ def build_web_handler(
                         term_norm,
                         definition,
                         missing_entry,
+                        lookup_path_json,
+                        lookup_path_label,
                         created_at,
                         updated_at
                     FROM dictionary_bookmarks
@@ -4759,6 +4865,10 @@ def build_web_handler(
             definition = "" if payload.get("definition") in (None, "") else str(payload.get("definition")).strip()
             dict_source_name = (
                 "" if payload.get("dict_source_name") in (None, "") else str(payload.get("dict_source_name")).strip()
+            )
+            lookup_path = normalize_dictionary_lookup_path(payload.get("lookup_path"))
+            lookup_path_label = (
+                "" if payload.get("lookup_path_label") in (None, "") else str(payload.get("lookup_path_label")).strip()
             )
             missing_entry_raw = payload.get("missing_entry")
             if isinstance(missing_entry_raw, str):
@@ -4812,6 +4922,27 @@ def build_web_handler(
                 cue_start_ms, cue_end_ms = cue_end_ms, cue_start_ms
             cue_start_ms = max(0, cue_start_ms)
             cue_end_ms = max(cue_start_ms, cue_end_ms)
+            if not lookup_path:
+                base_term = lookup_term or term
+                base_norm = normalize_dictionary_term(base_term)
+                if base_term or base_norm:
+                    lookup_path = [
+                        {
+                            "level": 1,
+                            "term": base_term or base_norm,
+                            "term_norm": base_norm,
+                            "source": "dictionary",
+                        }
+                    ]
+            if not lookup_path_label:
+                lookup_path_label = build_dictionary_lookup_path_label(lookup_path)
+            lookup_path_json = ""
+            if lookup_path:
+                lookup_path_json = json.dumps(
+                    lookup_path,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
 
             with self._open_connection() as connection:
                 if not self._validate_video_exists(connection, source_id, video_id):
@@ -4850,9 +4981,11 @@ def build_web_handler(
                             term_norm,
                             definition,
                             missing_entry,
+                            lookup_path_json,
+                            lookup_path_label,
                             created_at,
                             updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             source_id,
@@ -4868,6 +5001,8 @@ def build_web_handler(
                             term_norm,
                             definition,
                             int(missing_entry),
+                            lookup_path_json,
+                            lookup_path_label,
                             now_iso,
                             now_iso,
                         ),
@@ -4894,6 +5029,8 @@ def build_web_handler(
                             term_norm,
                             definition,
                             missing_entry,
+                            lookup_path_json,
+                            lookup_path_label,
                             created_at,
                             updated_at
                         FROM dictionary_bookmarks

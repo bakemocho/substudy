@@ -128,15 +128,17 @@ Acceptance:
 - For typical tracks, most cues align without visible mismatch.
 - No crash/blank panel when one language track is missing.
 
-## 4) Next: hover dictionary expansion (bookmark + recursive tree graph)
+## 4) In progress: hover dictionary recursive tree graph
 
 Goal: make hover dictionary a reusable learning surface.
 
-TODO:
+Status:
 
-- [ ] Hover辞書にブックマーク機能を追加する（保存/解除トグル）
-- [ ] ブックマーク保存時に term/definition/context を `dictionary_bookmarks` へ永続化する
-- [ ] 保存済み状態をポップアップ内で即時反映し、リロード後も維持する
+- [x] Hover辞書にブックマーク機能を追加する（保存/解除トグル）
+- [x] ブックマーク保存時に term/definition/context を `dictionary_bookmarks` へ永続化する
+- [x] 保存済み状態をポップアップ内で即時反映し、リロード後も維持する
+- [x] 辞書エントリ未登録語（`辞書エントリが見つかりません。`）でもブックマーク保存/解除できる
+- [ ] 再帰ホバー辞書ノードの重なり回避・安定再配置を継続改善する
 
 - Add dictionary bookmark action in hover popup.
   - bookmark unit: term/definition + video context (source/video/track/time/cue text)
@@ -167,6 +169,30 @@ Acceptance:
 - Hovered node freeze + surrounding-node re-layout behavior is visually stable.
 - click-pin / outside-click / `Esc` clear behavior is deterministic.
 - Existing subtitle hover behavior remains intact.
+
+## 4.5) Next: dictionary bookmark knowledge pipeline (LLM参照・知識集積・教材化)
+
+Goal: save-to-learn で終わらせず、辞書ブックマークを継続的に学習資産化する。
+
+- Add export/query workflow for bookmark reuse:
+  - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）
+  - LLM投入用の安定フォーマット（JSONL or CSV）を用意
+- Add LLM-assisted enrichment pipeline:
+  - 未登録語に対する定義・訳語・用例候補の追記フロー
+  - 既存エントリとの重複判定とマージポリシー
+- Add knowledge accumulation model:
+  - term単位の履歴（初回保存時刻、出現動画数、再遭遇回数）
+  - cue文脈の再利用（例文カード化、復習優先度付け）
+- Add materialization outputs:
+  - 復習カード（EN/JA + cue + timestamp link）
+  - 「未登録語レビュー」バッチ
+  - 学習セッション用の curated list（難語/頻出/最近保存）
+
+Acceptance:
+
+- ブックマークDBからLLM入力用データを再現可能に抽出できる。
+- 未登録語の補完結果を再投入しても重複/破壊が起きない。
+- 学習カード出力がワンクリック相当で再生成できる。
 
 ## 5) Next: similar-scene suggestion via cue embeddings
 
