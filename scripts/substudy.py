@@ -593,36 +593,169 @@ def sync_source(
 
         media_after_ids = set(read_archive_ids(source.media_archive))
         new_media_ids = sorted(media_after_ids - media_before_ids)
+        media_audio_fallback_failures: dict[str, str] = {}
+        media_audio_fallback_repaired = 0
+        ffprobe_bin = shutil.which("ffprobe")
+        if (
+            not dry_run
+            and media_exit_code == 0
+            and new_media_ids
+            and ffprobe_bin is not None
+        ):
+            for video_id in new_media_ids:
+                media_path = find_media_file_for_video(source, video_id)
+                if media_path is None or not media_path.exists():
+                    media_audio_fallback_failures[video_id] = "media file missing after download"
+                    continue
+
+                has_audio_stream, probe_error = detect_audio_stream(
+                    media_path=media_path,
+                    ffprobe_bin=ffprobe_bin,
+                )
+                if has_audio_stream is True:
+                    continue
+                if has_audio_stream is None:
+                    print(
+                        f"[media] {source.id}/{video_id}: ffprobe warning ({probe_error}); "
+                        "skip audio fallback",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                video_url = safe_video_url(video_id)
+                if video_url is None:
+                    media_audio_fallback_failures[video_id] = "cannot build video URL for fallback"
+                    continue
+
+                fallback_command = [
+                    source.ytdlp_bin,
+                    *cookie_flags,
+                    "--continue",
+                    "--force-overwrites",
+                    *retry_flags,
+                    "-f",
+                    "download",
+                    "-o",
+                    str(media_path),
+                    "--no-playlist",
+                    video_url,
+                ]
+                fallback_exit_code = run_command(
+                    fallback_command,
+                    dry_run=False,
+                    raise_on_error=False,
+                )
+                if fallback_exit_code != 0:
+                    media_audio_fallback_failures[video_id] = (
+                        f"audio fallback command exit code {fallback_exit_code}"
+                    )
+                    print(
+                        f"[media] {source.id}/{video_id}: audio fallback failed "
+                        f"({fallback_exit_code})",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                has_audio_after, probe_error_after = detect_audio_stream(
+                    media_path=media_path,
+                    ffprobe_bin=ffprobe_bin,
+                )
+                if has_audio_after is True:
+                    media_audio_fallback_repaired += 1
+                    print(
+                        f"[media] {source.id}/{video_id}: recovered audio stream "
+                        "(format=download)"
+                    )
+                    continue
+
+                if has_audio_after is False:
+                    media_audio_fallback_failures[video_id] = (
+                        "audio fallback still has no audio stream"
+                    )
+                else:
+                    media_audio_fallback_failures[video_id] = (
+                        f"audio fallback ffprobe warning: {probe_error_after or 'unknown'}"
+                    )
+                print(
+                    f"[media] {source.id}/{video_id}: audio fallback did not produce audio",
+                    file=sys.stderr,
+                )
+        elif (
+            not dry_run
+            and media_exit_code == 0
+            and new_media_ids
+            and ffprobe_bin is None
+        ):
+            print(
+                "[media] ffprobe not found; skipping audio-stream validation for new media",
+                file=sys.stderr,
+            )
+
         if connection is not None and not dry_run:
             for video_id in new_media_ids:
+                fallback_error = media_audio_fallback_failures.get(video_id)
                 upsert_download_state(
                     connection=connection,
                     source_id=source.id,
                     stage="media",
                     video_id=video_id,
-                    status="success",
+                    status="success" if fallback_error is None else "error",
                     run_id=media_run_id,
                     attempt_at=media_started_at,
                     url=safe_video_url(video_id),
-                    last_error=None,
-                    retry_count=0,
-                    next_retry_at=None,
+                    last_error=fallback_error,
+                    retry_count=0 if fallback_error is None else 1,
+                    next_retry_at=(
+                        None
+                        if fallback_error is None
+                        else schedule_next_retry_iso(1)
+                    ),
                 )
 
+            media_failed_count = len(media_audio_fallback_failures)
+            media_success_count = len(new_media_ids) - media_failed_count
+            media_stage_error = (
+                media_error
+                or (
+                    None
+                    if media_exit_code == 0 and media_failed_count == 0
+                    else (
+                        f"command exit code {media_exit_code}"
+                        if media_exit_code != 0
+                        else "some media files have no audio after fallback"
+                    )
+                )
+            )
             finish_download_run(
                 connection=connection,
                 run_id=media_run_id if media_run_id is not None else -1,
-                status="success" if media_exit_code == 0 else "error",
+                status=(
+                    "success"
+                    if media_exit_code == 0 and media_failed_count == 0
+                    else "error"
+                ),
                 finished_at=now_utc_iso(),
                 exit_code=media_exit_code,
-                success_count=len(new_media_ids),
-                failure_count=None if media_exit_code != 0 else 0,
-                error_message=media_error or (
-                    None if media_exit_code == 0 else f"command exit code {media_exit_code}"
+                success_count=media_success_count if media_exit_code == 0 else len(new_media_ids),
+                failure_count=(
+                    media_failed_count
+                    if media_exit_code == 0
+                    else None
                 ),
+                error_message=media_stage_error,
             )
             connection.commit()
 
+        if media_audio_fallback_repaired > 0:
+            print(
+                f"[media] {source.id}: audio fallback repaired="
+                f"{media_audio_fallback_repaired}"
+            )
+        if media_audio_fallback_failures:
+            print(
+                f"[media] {source.id}: audio fallback failed={len(media_audio_fallback_failures)}",
+                file=sys.stderr,
+            )
         print(f"media new IDs: {len(new_media_ids)}")
     else:
         print("skip media")

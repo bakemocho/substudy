@@ -1143,6 +1143,47 @@ function isEnglishTrack(track) {
   );
 }
 
+function isEnglishSubtitleTrack(track) {
+  const label = normalizedTrackLabel(track);
+  return (
+    normalizedTrackKind(track) === "subtitle"
+    && (
+      label === "en"
+      || label.startsWith("en-")
+      || label.includes("english")
+    )
+  );
+}
+
+function findFallbackTrackIdForEmptyAsr(video, currentTrackId) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  if (!tracks.length || !currentTrackId) {
+    return null;
+  }
+  const currentTrack = tracks.find((track) => String(track?.track_id || "") === String(currentTrackId)) || null;
+  if (!currentTrack || normalizedTrackKind(currentTrack) !== "asr") {
+    return null;
+  }
+
+  const englishSubtitleTrack = tracks.find((track) => isEnglishSubtitleTrack(track)) || null;
+  if (englishSubtitleTrack && englishSubtitleTrack.track_id) {
+    return String(englishSubtitleTrack.track_id);
+  }
+
+  const nonJapaneseSubtitleTrack = tracks.find((track) => (
+    normalizedTrackKind(track) === "subtitle" && !isJapaneseTrack(track)
+  )) || null;
+  if (nonJapaneseSubtitleTrack && nonJapaneseSubtitleTrack.track_id) {
+    return String(nonJapaneseSubtitleTrack.track_id);
+  }
+
+  const anySubtitleTrack = tracks.find((track) => normalizedTrackKind(track) === "subtitle") || null;
+  if (anySubtitleTrack && anySubtitleTrack.track_id) {
+    return String(anySubtitleTrack.track_id);
+  }
+  return null;
+}
+
 function resolveSubtitlePanelTrackIds(video) {
   const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
   if (!tracks.length) {
@@ -5284,6 +5325,15 @@ async function loadTrackCues() {
   state.lyricReelIndex = -1;
 
   if (!state.cues.length) {
+    const fallbackTrackId = findFallbackTrackIdForEmptyAsr(video, state.currentTrackId);
+    if (fallbackTrackId && fallbackTrackId !== state.currentTrackId) {
+      state.currentTrackId = fallbackTrackId;
+      if (elements.trackSelect) {
+        elements.trackSelect.value = fallbackTrackId;
+      }
+      await loadTrackCues();
+      return;
+    }
     clearSubtitleOverlay("字幕が見つかりません");
     await loadSubtitlePanelReel(video);
     return;
