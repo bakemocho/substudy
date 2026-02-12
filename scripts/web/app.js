@@ -5928,11 +5928,7 @@ function handleKeydown(event) {
   const activeElement = document.activeElement;
   const activeTag = activeElement ? activeElement.tagName : "";
   if (activeTag === "SELECT") {
-    const isTrackSelectFocused = activeElement === elements.trackSelect;
-    if (!isTrackSelectFocused) {
-      return;
-    }
-    const isTrackSelectHotkey = (
+    const isSelectNavigationHotkey = (
       event.key === "ArrowDown"
       || event.key === "ArrowUp"
       || event.key === "ArrowLeft"
@@ -5940,10 +5936,12 @@ function handleKeydown(event) {
       || key === "j"
       || key === "k"
     );
-    if (!isTrackSelectHotkey) {
+    if (!isSelectNavigationHotkey) {
       return;
     }
-    elements.trackSelect.blur();
+    if (activeElement instanceof HTMLElement) {
+      activeElement.blur();
+    }
   }
   const isTyping = ["INPUT", "TEXTAREA"].includes(activeTag);
   if (isTyping) {
@@ -6315,6 +6313,7 @@ function bindEvents() {
     loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
       setStatus(error.message, "error");
     });
+    elements.sourceSelect.blur();
     resetControlsToggleFade();
   });
   if (elements.translationFilterSelect) {
@@ -6325,6 +6324,7 @@ function bindEvents() {
       loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
         setStatus(error.message, "error");
       });
+      elements.translationFilterSelect.blur();
       resetControlsToggleFade();
     });
   }
