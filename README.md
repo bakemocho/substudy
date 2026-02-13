@@ -54,6 +54,7 @@ Open `http://127.0.0.1:8876`.
 - `python3 scripts/substudy.py asr`
 - `python3 scripts/substudy.py loudness`
 - `python3 scripts/substudy.py dict-index --dictionary-path data/eijiro-1449.utf8.txt`
+- `python3 scripts/substudy.py dict-bookmarks-export --entry-status missing --format jsonl`
 - `python3 scripts/substudy.py downloads --since-hours 24`
 - `python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`
 

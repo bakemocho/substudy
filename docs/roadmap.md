@@ -128,11 +128,13 @@ Acceptance:
 - For typical tracks, most cues align without visible mismatch.
 - No crash/blank panel when one language track is missing.
 
-## 4) In progress: hover dictionary recursive tree graph
+## 4) Maintained baseline: hover dictionary recursive tree graph
 
 Goal: make hover dictionary a reusable learning surface.
 
 Status:
+
+- [x] 現在の使用感を baseline として凍結し、致命バグ以外は 4.5 以降の進行を優先する
 
 - [x] Hover辞書にブックマーク機能を追加する（保存/解除トグル）
 - [x] ブックマーク保存時に term/definition/context を `dictionary_bookmarks` へ永続化する
@@ -140,7 +142,7 @@ Status:
 - [x] 辞書エントリ未登録語（`辞書エントリが見つかりません。`）でもブックマーク保存/解除できる
 - [x] `lv.0`（字幕リール行）/`lv.1+`（辞書ノード）の前面制御ルールを共通化（ブラウズ中ノード最前面、候補2番手、親3番手）
 - [x] `lv.0` は root 行ホバー時のみ前面昇格し、`lv.2+` ブラウズ中の常時最前面化を解消
-- [ ] 再帰ホバー辞書ノードの重なり回避・安定再配置を継続改善する
+- [ ] 再帰ホバー辞書ノードの重なり回避・安定再配置（継続改善・必要時のみ）
 
 - Add dictionary bookmark action in hover popup.
   - bookmark unit: term/definition + video context (source/video/track/time/cue text)
@@ -172,9 +174,15 @@ Acceptance:
 - click-pin / outside-click / `Esc` clear behavior is deterministic.
 - Existing subtitle hover behavior remains intact.
 
-## 4.5) Next: dictionary bookmark knowledge pipeline (LLM参照・知識集積・教材化)
+## 4.5) In progress: dictionary bookmark knowledge pipeline (LLM参照・知識集積・教材化)
 
 Goal: save-to-learn で終わらせず、辞書ブックマークを継続的に学習資産化する。
+
+Status (current sprint):
+
+- [ ] `dictionary_bookmarks` エクスポートCLI（JSONL/CSV）を追加する
+- [ ] 未登録語レビュー向けの抽出条件（`missing_entry=1`）を CLI で指定可能にする
+- [ ] LLM補完の再投入フォーマットを固定し、重複回避ポリシーを実装する
 
 - Add export/query workflow for bookmark reuse:
   - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）

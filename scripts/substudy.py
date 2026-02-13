@@ -49,6 +49,7 @@ DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8876
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
 MISSING_DICT_ENTRY_ID_BASE = 3_000_000_000
+DEFAULT_DICT_BOOKMARK_EXPORT_DIR = Path("exports")
 
 
 @dataclass
@@ -4061,6 +4062,148 @@ def show_download_report(
     connection.close()
 
 
+def run_dict_bookmarks_export(
+    db_path: Path,
+    source_ids: list[str],
+    output_path: Path,
+    output_format: str,
+    entry_status: str,
+    limit: int,
+    video_ids: list[str] | None = None,
+) -> None:
+    if output_format not in {"jsonl", "csv"}:
+        raise ValueError("output_format must be jsonl or csv")
+    if entry_status not in {"all", "missing", "known"}:
+        raise ValueError("entry_status must be all/missing/known")
+    safe_limit = max(0, int(limit))
+    normalized_video_ids = [
+        str(video_id).strip()
+        for video_id in (video_ids or [])
+        if str(video_id).strip()
+    ]
+
+    connection = sqlite3.connect(str(db_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            where_clauses.append(f"source_id IN ({placeholders})")
+            params.extend(source_ids)
+        if normalized_video_ids:
+            placeholders = ",".join("?" for _ in normalized_video_ids)
+            where_clauses.append(f"video_id IN ({placeholders})")
+            params.extend(normalized_video_ids)
+        if entry_status == "missing":
+            where_clauses.append("missing_entry = 1")
+        elif entry_status == "known":
+            where_clauses.append("missing_entry = 0")
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+        limit_sql = ""
+        if safe_limit > 0:
+            limit_sql = "LIMIT ?"
+            params.append(safe_limit)
+
+        rows = connection.execute(
+            f"""
+            SELECT
+                id,
+                source_id,
+                video_id,
+                track,
+                cue_start_ms,
+                cue_end_ms,
+                cue_text,
+                dict_entry_id,
+                dict_source_name,
+                lookup_term,
+                term,
+                term_norm,
+                definition,
+                missing_entry,
+                lookup_path_json,
+                lookup_path_label,
+                created_at,
+                updated_at
+            FROM dictionary_bookmarks
+            {where_sql}
+            ORDER BY updated_at DESC, id DESC
+            {limit_sql}
+            """,
+            tuple(params),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    records = [serialize_dictionary_bookmark_row(row) for row in rows]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_format == "jsonl":
+        with output_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
+    else:
+        fieldnames = [
+            "id",
+            "source_id",
+            "video_id",
+            "track",
+            "cue_start_ms",
+            "cue_end_ms",
+            "cue_text",
+            "dict_entry_id",
+            "dict_source_name",
+            "lookup_term",
+            "term",
+            "term_norm",
+            "definition",
+            "missing_entry",
+            "lookup_path_json",
+            "lookup_path_label",
+            "created_at",
+            "updated_at",
+        ]
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in records:
+                writer.writerow(
+                    {
+                        "id": record["id"],
+                        "source_id": record["source_id"],
+                        "video_id": record["video_id"],
+                        "track": record["track"],
+                        "cue_start_ms": record["cue_start_ms"],
+                        "cue_end_ms": record["cue_end_ms"],
+                        "cue_text": record["cue_text"],
+                        "dict_entry_id": record["dict_entry_id"],
+                        "dict_source_name": record["dict_source_name"],
+                        "lookup_term": record["lookup_term"],
+                        "term": record["term"],
+                        "term_norm": record["term_norm"],
+                        "definition": record["definition"],
+                        "missing_entry": 1 if record["missing_entry"] else 0,
+                        "lookup_path_json": json.dumps(record["lookup_path"], ensure_ascii=False),
+                        "lookup_path_label": record["lookup_path_label"],
+                        "created_at": record["created_at"],
+                        "updated_at": record["updated_at"],
+                    }
+                )
+
+    missing_count = sum(1 for record in records if record["missing_entry"])
+    known_count = len(records) - missing_count
+    print(
+        "[dict-bookmarks-export] "
+        f"rows={len(records)} missing={missing_count} known={known_count} "
+        f"format={output_format} output={output_path}"
+    )
+
+
 def resolve_output_path(path_value: Path | None, default_path: Path) -> Path:
     if path_value is None:
         return default_path
@@ -5846,6 +5989,43 @@ def parse_args() -> argparse.Namespace:
         help="Optional line cap for quick trial runs (0 = no cap).",
     )
 
+    dict_bookmarks_export_parser = subparsers.add_parser(
+        "dict-bookmarks-export",
+        help="Export dictionary bookmarks for LLM/review workflows",
+    )
+    dict_bookmarks_export_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    dict_bookmarks_export_parser.add_argument("--source", action="append", dest="sources")
+    dict_bookmarks_export_parser.add_argument("--ledger-db", type=Path)
+    dict_bookmarks_export_parser.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="Export format (default: jsonl)",
+    )
+    dict_bookmarks_export_parser.add_argument(
+        "--entry-status",
+        choices=["all", "missing", "known"],
+        default="all",
+        help="Filter by dictionary entry status (default: all)",
+    )
+    dict_bookmarks_export_parser.add_argument(
+        "--video-id",
+        action="append",
+        dest="video_ids",
+        help="Optional video_id filter (repeatable).",
+    )
+    dict_bookmarks_export_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional row cap (0 = no limit).",
+    )
+    dict_bookmarks_export_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output file path. Defaults to exports/dictionary_bookmarks_<status>_<utc>.<format>",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -5980,6 +6160,25 @@ def main() -> int:
             encoding=str(args.encoding),
             clear_existing=not bool(args.no_clear),
             max_lines=None if int(args.max_lines) <= 0 else int(args.max_lines),
+        )
+        return 0
+
+    if args.command == "dict-bookmarks-export":
+        export_format = str(args.format).strip().lower()
+        entry_status = str(args.entry_status).strip().lower()
+        timestamp_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        default_output = DEFAULT_DICT_BOOKMARK_EXPORT_DIR / (
+            f"dictionary_bookmarks_{entry_status}_{timestamp_utc}.{export_format}"
+        )
+        output_path = resolve_output_path(args.output, default_output)
+        run_dict_bookmarks_export(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            output_path=output_path,
+            output_format=export_format,
+            entry_status=entry_status,
+            limit=max(0, int(args.limit)),
+            video_ids=args.video_ids,
         )
         return 0
 
