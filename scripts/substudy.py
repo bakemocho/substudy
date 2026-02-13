@@ -595,20 +595,94 @@ def sync_source(
 
         media_after_ids = set(read_archive_ids(source.media_archive))
         new_media_ids = sorted(media_after_ids - media_before_ids)
+
+        retry_media_ids: list[str] = []
+        bootstrap_no_audio_media_ids: list[str] = []
+        if connection is not None and not dry_run:
+            retry_media_ids = get_due_retry_ids(connection, source.id, "media")
+            bootstrap_no_audio_media_ids = get_media_no_audio_bootstrap_ids(
+                connection=connection,
+                source_id=source.id,
+            )
+
+        media_audio_target_ids: list[str] = []
+        seen_media_targets: set[str] = set()
+        for video_id in [*new_media_ids, *retry_media_ids, *bootstrap_no_audio_media_ids]:
+            if video_id in seen_media_targets:
+                continue
+            seen_media_targets.add(video_id)
+            media_audio_target_ids.append(video_id)
+
         media_audio_fallback_failures: dict[str, str] = {}
         media_audio_fallback_repaired = 0
+        repaired_media_ids: set[str] = set()
+        evaluated_media_ids: list[str] = []
+        seen_evaluated_media_ids: set[str] = set()
+        for video_id in new_media_ids:
+            seen_evaluated_media_ids.add(video_id)
+            evaluated_media_ids.append(video_id)
+
         ffprobe_bin = shutil.which("ffprobe")
-        if (
-            not dry_run
-            and media_exit_code == 0
-            and new_media_ids
-            and ffprobe_bin is not None
-        ):
-            for video_id in new_media_ids:
+
+        def run_media_fallback_download(
+            video_id: str,
+            output_path: Path | None,
+        ) -> tuple[Path | None, str | None]:
+            video_url = safe_video_url(video_id)
+            if video_url is None:
+                return None, "cannot build video URL for fallback"
+
+            fallback_command = [
+                source.ytdlp_bin,
+                *cookie_flags,
+                "--continue",
+                "--force-overwrites",
+                *retry_flags,
+                "-f",
+                "download",
+                "-o",
+                (
+                    str(output_path)
+                    if output_path is not None
+                    else str(source.media_dir / source.media_output_template)
+                ),
+                "--no-playlist",
+                video_url,
+            ]
+            try:
+                fallback_exit_code = run_command(
+                    fallback_command,
+                    dry_run=False,
+                    raise_on_error=False,
+                )
+            except Exception as exc:
+                return None, f"audio fallback command exception: {exc}"
+
+            if fallback_exit_code != 0:
+                return None, f"audio fallback command exit code {fallback_exit_code}"
+
+            refreshed_media_path = find_media_file_for_video(source, video_id)
+            if refreshed_media_path is None or not refreshed_media_path.exists():
+                return None, "media file missing after fallback download"
+            return refreshed_media_path, None
+
+        if not dry_run and media_audio_target_ids and ffprobe_bin is not None:
+            for video_id in media_audio_target_ids:
+                if video_id not in seen_evaluated_media_ids:
+                    seen_evaluated_media_ids.add(video_id)
+                    evaluated_media_ids.append(video_id)
+
                 media_path = find_media_file_for_video(source, video_id)
                 if media_path is None or not media_path.exists():
-                    media_audio_fallback_failures[video_id] = "media file missing after download"
-                    continue
+                    media_path, fallback_error = run_media_fallback_download(video_id, None)
+                    if fallback_error is not None:
+                        media_audio_fallback_failures[video_id] = fallback_error
+                        print(
+                            f"[media] {source.id}/{video_id}: audio fallback failed "
+                            f"({fallback_error})",
+                            file=sys.stderr,
+                        )
+                        continue
 
                 has_audio_stream, probe_error = detect_audio_stream(
                     media_path=media_path,
@@ -624,46 +698,23 @@ def sync_source(
                     )
                     continue
 
-                video_url = safe_video_url(video_id)
-                if video_url is None:
-                    media_audio_fallback_failures[video_id] = "cannot build video URL for fallback"
-                    continue
-
-                fallback_command = [
-                    source.ytdlp_bin,
-                    *cookie_flags,
-                    "--continue",
-                    "--force-overwrites",
-                    *retry_flags,
-                    "-f",
-                    "download",
-                    "-o",
-                    str(media_path),
-                    "--no-playlist",
-                    video_url,
-                ]
-                fallback_exit_code = run_command(
-                    fallback_command,
-                    dry_run=False,
-                    raise_on_error=False,
-                )
-                if fallback_exit_code != 0:
-                    media_audio_fallback_failures[video_id] = (
-                        f"audio fallback command exit code {fallback_exit_code}"
-                    )
+                media_path_after, fallback_error = run_media_fallback_download(video_id, media_path)
+                if fallback_error is not None:
+                    media_audio_fallback_failures[video_id] = fallback_error
                     print(
                         f"[media] {source.id}/{video_id}: audio fallback failed "
-                        f"({fallback_exit_code})",
+                        f"({fallback_error})",
                         file=sys.stderr,
                     )
                     continue
 
                 has_audio_after, probe_error_after = detect_audio_stream(
-                    media_path=media_path,
+                    media_path=media_path_after,
                     ffprobe_bin=ffprobe_bin,
                 )
                 if has_audio_after is True:
                     media_audio_fallback_repaired += 1
+                    repaired_media_ids.add(video_id)
                     print(
                         f"[media] {source.id}/{video_id}: recovered audio stream "
                         "(format=download)"
@@ -682,40 +733,76 @@ def sync_source(
                     f"[media] {source.id}/{video_id}: audio fallback did not produce audio",
                     file=sys.stderr,
                 )
-        elif (
-            not dry_run
-            and media_exit_code == 0
-            and new_media_ids
-            and ffprobe_bin is None
-        ):
+        elif not dry_run and media_audio_target_ids and ffprobe_bin is None:
             print(
-                "[media] ffprobe not found; skipping audio-stream validation for new media",
+                "[media] ffprobe not found; skipping audio-stream validation for media retries",
                 file=sys.stderr,
             )
 
         if connection is not None and not dry_run:
-            for video_id in new_media_ids:
+            for video_id in evaluated_media_ids:
                 fallback_error = media_audio_fallback_failures.get(video_id)
+                if fallback_error is None:
+                    upsert_download_state(
+                        connection=connection,
+                        source_id=source.id,
+                        stage="media",
+                        video_id=video_id,
+                        status="success",
+                        run_id=media_run_id,
+                        attempt_at=media_started_at,
+                        url=safe_video_url(video_id),
+                        last_error=None,
+                        retry_count=0,
+                        next_retry_at=None,
+                    )
+                    continue
+
+                current = connection.execute(
+                    """
+                    SELECT retry_count
+                    FROM download_state
+                    WHERE source_id = ? AND stage = ? AND video_id = ?
+                    """,
+                    (source.id, "media", video_id),
+                ).fetchone()
+                next_retry_count = (int(current[0]) if current else 0) + 1
                 upsert_download_state(
                     connection=connection,
                     source_id=source.id,
                     stage="media",
                     video_id=video_id,
-                    status="success" if fallback_error is None else "error",
+                    status="error",
                     run_id=media_run_id,
                     attempt_at=media_started_at,
                     url=safe_video_url(video_id),
                     last_error=fallback_error,
-                    retry_count=0 if fallback_error is None else 1,
-                    next_retry_at=(
-                        None
-                        if fallback_error is None
-                        else schedule_next_retry_iso(1)
-                    ),
+                    retry_count=next_retry_count,
+                    next_retry_at=schedule_next_retry_iso(next_retry_count),
                 )
 
-            media_failed_count = len(media_audio_fallback_failures)
-            media_success_count = len(new_media_ids) - media_failed_count
+            if repaired_media_ids:
+                repaired_at = now_utc_iso()
+                for video_id in repaired_media_ids:
+                    connection.execute(
+                        """
+                        UPDATE videos
+                        SET audio_lufs = NULL,
+                            audio_gain_db = NULL,
+                            audio_loudness_analyzed_at = NULL,
+                            audio_loudness_error = NULL,
+                            synced_at = ?
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        """,
+                        (repaired_at, source.id, video_id),
+                    )
+
+            media_failed_count = sum(
+                1 for video_id in evaluated_media_ids
+                if video_id in media_audio_fallback_failures
+            )
+            media_success_count = len(evaluated_media_ids) - media_failed_count
             media_stage_error = (
                 media_error
                 or (
@@ -738,12 +825,8 @@ def sync_source(
                 ),
                 finished_at=now_utc_iso(),
                 exit_code=media_exit_code,
-                success_count=media_success_count if media_exit_code == 0 else len(new_media_ids),
-                failure_count=(
-                    media_failed_count
-                    if media_exit_code == 0
-                    else None
-                ),
+                success_count=media_success_count,
+                failure_count=media_failed_count,
                 error_message=media_stage_error,
             )
             connection.commit()
@@ -758,7 +841,10 @@ def sync_source(
                 f"[media] {source.id}: audio fallback failed={len(media_audio_fallback_failures)}",
                 file=sys.stderr,
             )
-        print(f"media new IDs: {len(new_media_ids)}")
+        print(
+            f"media new IDs: {len(new_media_ids)} "
+            f"(retry={len(retry_media_ids)}, bootstrap={len(bootstrap_no_audio_media_ids)})"
+        )
     else:
         print("skip media")
 
@@ -2604,6 +2690,64 @@ def upsert_download_state(
     )
 
 
+def mark_media_retry_state(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    video_id: str,
+    reason: str,
+    run_id: int | None = None,
+    attempt_at: str | None = None,
+) -> tuple[int, str]:
+    attempt_value = attempt_at or now_utc_iso()
+    current = connection.execute(
+        """
+        SELECT status, retry_count, next_retry_at
+        FROM download_state
+        WHERE source_id = ? AND stage = 'media' AND video_id = ?
+        """,
+        (source.id, video_id),
+    ).fetchone()
+    current_status = str(current[0]) if current else ""
+    current_retry_count = int(current[1]) if current else 0
+    current_next_retry = (
+        str(current[2])
+        if current is not None and current[2] not in (None, "")
+        else None
+    )
+
+    if (
+        current_status == "error"
+        and current_next_retry is not None
+        and current_next_retry > attempt_value
+    ):
+        next_retry_count = current_retry_count
+        next_retry_at = current_next_retry
+    else:
+        next_retry_count = current_retry_count + 1
+        next_retry_at = schedule_next_retry_iso(next_retry_count)
+
+    video_url: str | None = None
+    try:
+        video_url = build_video_url(source, video_id)
+    except ValueError:
+        video_url = None
+
+    upsert_download_state(
+        connection=connection,
+        source_id=source.id,
+        stage="media",
+        video_id=video_id,
+        status="error",
+        run_id=run_id,
+        attempt_at=attempt_value,
+        url=video_url,
+        last_error=reason,
+        retry_count=next_retry_count,
+        next_retry_at=next_retry_at,
+    )
+    return next_retry_count, next_retry_at
+
+
 def split_retryable_ids(
     connection: sqlite3.Connection,
     source_id: str,
@@ -2663,6 +2807,35 @@ def get_due_retry_ids(
         LIMIT ?
         """,
         (source_id, stage, now_iso, limit),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def get_media_no_audio_bootstrap_ids(
+    connection: sqlite3.Connection,
+    source_id: str,
+    limit: int = 200,
+) -> list[str]:
+    rows = connection.execute(
+        """
+        SELECT v.video_id
+        FROM videos v
+        LEFT JOIN download_state d
+          ON d.source_id = v.source_id
+         AND d.stage = 'media'
+         AND d.video_id = v.video_id
+        WHERE v.source_id = ?
+          AND v.has_media = 1
+          AND COALESCE(v.media_path, '') != ''
+          AND v.audio_lufs IS NULL
+          AND ABS(COALESCE(v.audio_gain_db, 0.0)) < 0.000001
+          AND COALESCE(v.audio_loudness_analyzed_at, '') != ''
+          AND COALESCE(v.audio_loudness_error, '') = ''
+          AND COALESCE(d.status, '') != 'error'
+        ORDER BY COALESCE(v.audio_loudness_analyzed_at, '') DESC, v.video_id DESC
+        LIMIT ?
+        """,
+        (source_id, limit),
     ).fetchall()
     return [str(row[0]) for row in rows]
 
@@ -3074,6 +3247,13 @@ def run_asr(
                     final_output_path = final_dir / f"{video_id}.asr.srt"
                     write_empty_srt(final_output_path)
                     finished_at = now_utc_iso()
+                    retry_count, next_retry_at = mark_media_retry_state(
+                        connection=connection,
+                        source=source,
+                        video_id=video_id,
+                        reason="no audio stream detected during ASR",
+                        attempt_at=finished_at,
+                    )
                     upsert_asr_run(
                         connection=connection,
                         source_id=source.id,
@@ -3090,7 +3270,8 @@ def run_asr(
                     connection.commit()
                     print(
                         f"[asr] {source.id}/{video_id}: no audio stream "
-                        f"(wrote {final_output_path})"
+                        f"(wrote {final_output_path}; media_retry_count={retry_count} "
+                        f"next_retry_at={next_retry_at})"
                     )
                     continue
                 if has_audio_stream is None and probe_error:
@@ -3384,8 +3565,18 @@ def run_loudness(
                         """,
                         (analyzed_at, "media file missing", source.id, video_id),
                     )
+                    retry_count, next_retry_at = mark_media_retry_state(
+                        connection=connection,
+                        source=source,
+                        video_id=video_id,
+                        reason="media file missing during loudness analysis",
+                        attempt_at=analyzed_at,
+                    )
                     source_missing += 1
-                    print(f"[loudness] {source.id}/{video_id}: media file missing")
+                    print(
+                        f"[loudness] {source.id}/{video_id}: media file missing "
+                        f"(media_retry_count={retry_count} next_retry_at={next_retry_at})"
+                    )
                     connection.commit()
                     continue
 
@@ -3407,10 +3598,19 @@ def run_loudness(
                             """,
                             (analyzed_at, source.id, video_id),
                         )
+                        retry_count, next_retry_at = mark_media_retry_state(
+                            connection=connection,
+                            source=source,
+                            video_id=video_id,
+                            reason="no audio stream detected during loudness analysis",
+                            attempt_at=analyzed_at,
+                        )
                         source_success += 1
                         print(
                             f"[loudness] {source.id}/{video_id}: "
-                            "no audio stream (gain=+0.00dB)"
+                            "no audio stream (gain=+0.00dB; "
+                            f"media_retry_count={retry_count} "
+                            f"next_retry_at={next_retry_at})"
                         )
                         connection.commit()
                         continue
