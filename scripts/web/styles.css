@@ -725,6 +725,7 @@ textarea {
 .subtitle-reel-card {
   display: flex;
   flex-direction: column;
+  position: relative;
   height: min(760px, var(--phone-shell-height));
   min-height: 420px;
   overflow: hidden;
@@ -768,6 +769,8 @@ textarea {
 
 .subtitle-panel-row {
   display: grid;
+  position: relative;
+  z-index: 0;
   gap: 5px;
   padding: 10px;
   min-width: 0;
@@ -788,6 +791,10 @@ textarea {
   border-color: rgba(110, 228, 212, 0.84);
   background: rgba(16, 31, 50, 0.92);
   box-shadow: 0 0 0 1px rgba(110, 228, 212, 0.22) inset;
+}
+
+.subtitle-panel-row.dict-lv0-focus {
+  z-index: 120;
 }
 
 .subtitle-panel-row-head {

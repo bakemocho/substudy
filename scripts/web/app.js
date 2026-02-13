@@ -175,6 +175,7 @@ const state = {
 };
 
 const elements = {
+  appShell: document.querySelector(".app-shell"),
   sourceSelect: document.getElementById("sourceSelect"),
   translationFilterSelect: document.getElementById("translationFilterSelect"),
   jumpOpenBtn: document.getElementById("jumpOpenBtn"),
@@ -230,6 +231,26 @@ const elements = {
   jumpResults: document.getElementById("jumpResults"),
   statusBar: document.getElementById("statusBar"),
 };
+
+function mountDictionaryOverlayIntoAppShell() {
+  const host = elements.appShell instanceof HTMLElement ? elements.appShell : null;
+  if (!host) {
+    return;
+  }
+  const overlayNodes = [
+    elements.subtitleDictGraphEdges,
+    elements.subtitleDictBridge,
+    elements.subtitleDictPopup,
+  ];
+  for (const node of overlayNodes) {
+    if (!(node instanceof HTMLElement || node instanceof SVGElement)) {
+      continue;
+    }
+    if (node.parentElement !== host) {
+      host.appendChild(node);
+    }
+  }
+}
 
 function setStatus(message, tone = "info") {
   elements.statusBar.textContent = message;
@@ -1333,6 +1354,51 @@ function clearDictionaryPopupHideTimer() {
   }
 }
 
+function updateDictionaryLv0RowStacking(options = {}) {
+  const promote = options.promote === true;
+  if (!elements.subtitlePanelReel) {
+    return;
+  }
+  const focusedRows = elements.subtitlePanelReel.querySelectorAll(".subtitle-panel-row.dict-lv0-focus");
+  for (const focusedRow of focusedRows) {
+    focusedRow.classList.remove("dict-lv0-focus");
+  }
+  if (!isDictionaryPopupVisible()) {
+    return;
+  }
+  const rootNodeId = Number(state.dictTreeRootNodeId);
+  const rootNode = getDictionaryTreeNode(rootNodeId);
+  if (!rootNode || rootNode.source !== "reel") {
+    return;
+  }
+  if (!(state.dictPopupAnchorEl instanceof Element) || !document.body.contains(state.dictPopupAnchorEl)) {
+    return;
+  }
+  const rowEl = state.dictPopupAnchorEl.closest(".subtitle-panel-row");
+  if (!(rowEl instanceof HTMLElement)) {
+    return;
+  }
+  if (promote) {
+    rowEl.classList.add("dict-lv0-focus");
+  }
+}
+
+function isDictionaryRootReelRowHovered() {
+  const rootNodeId = Number(state.dictTreeRootNodeId);
+  const rootNode = getDictionaryTreeNode(rootNodeId);
+  if (!rootNode || rootNode.source !== "reel") {
+    return false;
+  }
+  if (!(state.dictPopupAnchorEl instanceof Element) || !document.body.contains(state.dictPopupAnchorEl)) {
+    return false;
+  }
+  const rowEl = state.dictPopupAnchorEl.closest(".subtitle-panel-row");
+  if (!(rowEl instanceof HTMLElement)) {
+    return false;
+  }
+  return rowEl.matches(":hover");
+}
+
 function clearDictionaryGraphTrack() {
   if (Number.isInteger(state.dictGraphTrackFrame)) {
     window.cancelAnimationFrame(state.dictGraphTrackFrame);
@@ -1454,6 +1520,15 @@ function updateDictionaryPopupStacking() {
     popup.popupEl.style.zIndex = String(zIndex);
     zIndex += 1;
   }
+  const hasPopupHover = Number.isInteger(hoveredNodeId) && hoveredNodeId > 0;
+  const shouldPromoteLv0 = (
+    (Number.isInteger(rootNodeId) && rootNodeId > 0 && hoveredNodeId === rootNodeId)
+    || (
+      isDictionaryRootReelRowHovered()
+      && (!hasPopupHover || hoveredNodeId === rootNodeId)
+    )
+  );
+  updateDictionaryLv0RowStacking({ promote: shouldPromoteLv0 });
 }
 
 function hideDictionaryPopupElement(popupEl) {
@@ -1532,6 +1607,11 @@ function bindDictionaryPopupElementEvents(popupEl) {
     if (target instanceof HTMLElement) {
       event.preventDefault();
       pinSubtitleDictionaryWord(target);
+    } else {
+      const popupNodeId = resolveDictionaryPopupNodeIdFromElement(popupEl);
+      if (pinDictionaryPopupNode(popupNodeId)) {
+        event.preventDefault();
+      }
     }
     event.stopPropagation();
   });
@@ -1576,7 +1656,8 @@ function ensureDictionaryPopupElementForNode(nodeId) {
   popupEl.className = "subtitle-dict-popup subtitle-dict-popup-child hidden";
   popupEl.setAttribute("aria-hidden", "true");
   popupEl.dataset.dictPopupNodeId = String(safeNodeId);
-  document.body.appendChild(popupEl);
+  const popupHost = elements.appShell instanceof HTMLElement ? elements.appShell : document.body;
+  popupHost.appendChild(popupEl);
   bindDictionaryPopupElementEvents(popupEl);
   state.dictPopupNodeElements.set(safeNodeId, popupEl);
   return popupEl;
@@ -1933,6 +2014,15 @@ function ensureDictionaryTreeNodeForWord(wordEl, term, options = {}) {
     && Number.isInteger(options.parentNode.id)
   ) ? options.parentNode : null;
   if (source !== "dict_popup") {
+    const existingRoot = getDictionaryTreeNode(state.dictTreeRootNodeId);
+    if (
+      existingRoot
+      && existingRoot.source === source
+      && existingRoot.normalizedTerm === normalizedTerm
+    ) {
+      state.dictTreeCurrentNodeId = existingRoot.id;
+      return { ok: true, node: existingRoot };
+    }
     resetDictionaryTreeState();
     const root = createDictionaryTreeNode({
       term,
@@ -2570,6 +2660,10 @@ function positionSubtitleDictionaryPopup(anchorEl) {
     return;
   }
   const anchorRect = anchorEl.getBoundingClientRect();
+  const rootNode = getDictionaryTreeNode(Number(state.dictTreeRootNodeId));
+  const reelRowEl = anchorEl.closest(".subtitle-panel-row");
+  const hasLv0ReelRow = Boolean(rootNode?.source === "reel" && reelRowEl instanceof HTMLElement);
+  const lv0Rect = hasLv0ReelRow ? reelRowEl.getBoundingClientRect() : anchorRect;
   const popupRect = elements.subtitleDictPopup.getBoundingClientRect();
   const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
   const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
@@ -2582,15 +2676,15 @@ function positionSubtitleDictionaryPopup(anchorEl) {
   const clampedCenterX = Math.max(minCenterX, Math.min(maxCenterX, centerX));
 
   const gap = 10;
-  const spaceAbove = anchorRect.top - gap;
-  const spaceBelow = viewportHeight - anchorRect.bottom - gap;
+  const spaceAbove = lv0Rect.top - gap;
+  const spaceBelow = viewportHeight - lv0Rect.bottom - gap;
   let placeBelow = spaceAbove < (popupRect.height + 16);
   if (spaceBelow < (popupRect.height + 16) && spaceAbove > spaceBelow) {
     placeBelow = false;
   }
   let top = placeBelow
-    ? anchorRect.bottom + gap
-    : anchorRect.top - gap;
+    ? lv0Rect.bottom + gap
+    : lv0Rect.top - gap;
   if (placeBelow) {
     const maxTop = viewportHeight - popupRect.height - 8;
     top = Math.max(8, Math.min(maxTop, top));
@@ -2609,9 +2703,10 @@ function positionSubtitleDictionaryPopup(anchorEl) {
     return;
   }
   const anchorCenterX = anchorRect.left + (anchorRect.width / 2);
+  const bridgeSourceRect = hasLv0ReelRow ? lv0Rect : anchorRect;
   const anchorEdgeY = placeBelow
-    ? anchorRect.bottom
-    : anchorRect.top;
+    ? bridgeSourceRect.bottom
+    : bridgeSourceRect.top;
   const popupEdgeY = top;
   const horizontalPadding = Math.max(20, Math.round(anchorRect.width * 0.6));
   const bridgeLeft = Math.max(6, Math.min(anchorCenterX, clampedCenterX) - horizontalPadding);
@@ -2742,16 +2837,45 @@ function getDictionaryPopupRectForNode(nodeId) {
 }
 
 function collectDictionaryHoverObstacleRects(excludeNodeId = null) {
+  const rects = [];
+  const rootNodeId = Number(state.dictTreeRootNodeId);
+  const rootNode = getDictionaryTreeNode(rootNodeId);
+  if (
+    rootNode
+    && rootNode.source === "reel"
+    && state.dictPopupAnchorEl instanceof Element
+    && document.body.contains(state.dictPopupAnchorEl)
+  ) {
+    const rowEl = state.dictPopupAnchorEl.closest(".subtitle-panel-row");
+    if (rowEl instanceof HTMLElement) {
+      const rowRect = rowEl.getBoundingClientRect();
+      if (rowRect.width > 0 && rowRect.height > 0) {
+        rects.push({
+          left: rowRect.left,
+          top: rowRect.top,
+          right: rowRect.right,
+          bottom: rowRect.bottom,
+          width: rowRect.width,
+          height: rowRect.height,
+          nodeId: 0,
+        });
+      }
+    }
+  }
+
   const safeExcludeId = Number(excludeNodeId);
   const hoveredNodeId = Number(state.dictHoveredNodeId);
   if (!Number.isInteger(hoveredNodeId) || hoveredNodeId <= 0) {
-    return [];
+    return rects;
   }
   if (Number.isInteger(safeExcludeId) && safeExcludeId > 0 && safeExcludeId === hoveredNodeId) {
-    return [];
+    return rects;
   }
   const hoveredRect = getDictionaryPopupRectForNode(hoveredNodeId);
-  return hoveredRect ? [hoveredRect] : [];
+  if (hoveredRect) {
+    rects.push(hoveredRect);
+  }
+  return rects;
 }
 
 function computeRectangleOverlapArea(a, b) {
@@ -4985,6 +5109,35 @@ function pinSubtitleDictionaryWord(wordEl) {
     .catch((error) => setStatus(error.message, "error"));
 }
 
+function pinDictionaryPopupNode(nodeId) {
+  const safeNodeId = Number(nodeId);
+  if (!Number.isInteger(safeNodeId) || safeNodeId <= 0) {
+    return false;
+  }
+  const node = getDictionaryTreeNode(safeNodeId);
+  if (!node) {
+    return false;
+  }
+  if (Number.isInteger(node.parentId) && node.parentId > 0) {
+    setPinnedDictionaryChild(node.parentId, node.id);
+  } else {
+    node.lockedByClick = true;
+    node.transient = false;
+  }
+  node.updatedAt = Date.now();
+  state.dictTreeCurrentNodeId = node.id;
+  state.dictPopupNodeId = node.id;
+  if (node.anchorEl instanceof HTMLElement) {
+    clearActiveDictionaryWord(node.anchorEl);
+    node.anchorEl.classList.add("active");
+  }
+  setDictionaryPopupPinned(true);
+  retainDictionaryPopupPath(node.id);
+  repositionActiveDictionaryPopup();
+  startDictionaryHoverLoop({ forceSeekStart: true });
+  return true;
+}
+
 function isDictionaryHoverSafeTarget(nextElement) {
   if (!(nextElement instanceof Element)) {
     return false;
@@ -7190,6 +7343,7 @@ function bindEvents() {
 }
 
 async function initialize() {
+  mountDictionaryOverlayIntoAppShell();
   updateMetaDrawerState();
   updateControlsDrawerState();
   scheduleControlsToggleIdleFade();
