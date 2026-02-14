@@ -183,6 +183,9 @@ Status (current sprint):
 - [x] `dictionary_bookmarks` エクスポートCLI（JSONL/CSV）を追加する
 - [x] 未登録語レビュー向けの抽出条件（`missing_entry=1`）を CLI で指定可能にする
 - [x] LLM補完の再投入フォーマットを固定し、重複回避ポリシー（`skip/upsert/error`）を実装する
+- [x] 用途別の curated 出力（`missing_review` / `frequent_terms` / `recent_saved`）をCLI化する
+- [ ] term履歴の集計指標（再遭遇回数・復習優先度）を明文化して curated 出力へ組み込む
+- [ ] EN/JA復習カード形式（timestamp link付き）の最終フォーマットを固定する
 
 - Add export/query workflow for bookmark reuse:
   - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）

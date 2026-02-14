@@ -4251,6 +4251,37 @@ def load_dict_bookmark_import_rows(input_path: Path, input_format: str) -> list[
     raise ValueError("input_format must be jsonl or csv")
 
 
+def write_records_as_jsonl_or_csv(
+    records: list[dict[str, Any]],
+    output_path: Path,
+    output_format: str,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_format == "jsonl":
+        with output_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
+        return
+
+    if output_format != "csv":
+        raise ValueError("output_format must be jsonl or csv")
+
+    fieldnames: list[str] = []
+    seen = set()
+    for record in records:
+        for key in record.keys():
+            if key in seen:
+                continue
+            seen.add(key)
+            fieldnames.append(key)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            writer.writerow(record)
+
+
 def normalize_dict_bookmark_import_row(
     raw_row: dict[str, Any],
     row_index: int,
@@ -4583,6 +4614,144 @@ def run_dict_bookmarks_import(
         "[dict-bookmarks-import] "
         f"rows={len(raw_rows)} inserted={inserted} updated={updated} skipped={skipped} "
         f"errors={errors} dry_run={str(dry_run).lower()} input={input_path}"
+    )
+
+
+def run_dict_bookmarks_curate(
+    db_path: Path,
+    source_ids: list[str],
+    preset: str,
+    output_path: Path,
+    output_format: str,
+    limit: int,
+    min_bookmarks: int,
+    min_videos: int,
+) -> None:
+    if output_format not in {"jsonl", "csv"}:
+        raise ValueError("output_format must be jsonl or csv")
+    if preset not in {"missing_review", "frequent_terms", "recent_saved"}:
+        raise ValueError("preset must be missing_review/frequent_terms/recent_saved")
+
+    safe_limit = max(1, int(limit))
+    safe_min_bookmarks = max(1, int(min_bookmarks))
+    safe_min_videos = max(1, int(min_videos))
+
+    connection = sqlite3.connect(str(db_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            where_clauses.append(f"source_id IN ({placeholders})")
+            params.extend(source_ids)
+        if preset == "missing_review":
+            where_clauses.append("missing_entry = 1")
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        records: list[dict[str, Any]] = []
+        if preset in {"missing_review", "recent_saved"}:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    cue_text,
+                    dict_entry_id,
+                    dict_source_name,
+                    lookup_term,
+                    term,
+                    term_norm,
+                    definition,
+                    missing_entry,
+                    lookup_path_json,
+                    lookup_path_label,
+                    created_at,
+                    updated_at
+                FROM dictionary_bookmarks
+                {where_sql}
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (*params, safe_limit),
+            ).fetchall()
+            for row in rows:
+                serialized = serialize_dictionary_bookmark_row(row)
+                records.append(
+                    {
+                        "id": serialized["id"],
+                        "source_id": serialized["source_id"],
+                        "video_id": serialized["video_id"],
+                        "track": serialized["track"],
+                        "cue_start_ms": serialized["cue_start_ms"],
+                        "cue_end_ms": serialized["cue_end_ms"],
+                        "cue_start_label": format_ms_to_clock(serialized["cue_start_ms"]),
+                        "cue_end_label": format_ms_to_clock(serialized["cue_end_ms"]),
+                        "cue_text": serialized["cue_text"],
+                        "lookup_term": serialized["lookup_term"],
+                        "term": serialized["term"],
+                        "term_norm": serialized["term_norm"],
+                        "definition": serialized["definition"],
+                        "missing_entry": 1 if serialized["missing_entry"] else 0,
+                        "lookup_path_label": serialized["lookup_path_label"],
+                        "updated_at": serialized["updated_at"],
+                        "created_at": serialized["created_at"],
+                    }
+                )
+        else:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    term_norm,
+                    MAX(CASE
+                        WHEN TRIM(COALESCE(term, '')) != '' THEN term
+                        ELSE term_norm
+                    END) AS term,
+                    COUNT(*) AS bookmark_count,
+                    COUNT(DISTINCT source_id || ':' || video_id) AS video_count,
+                    SUM(CASE WHEN missing_entry = 1 THEN 1 ELSE 0 END) AS missing_count,
+                    MIN(created_at) AS first_seen_at,
+                    MAX(updated_at) AS last_seen_at
+                FROM dictionary_bookmarks
+                {where_sql}
+                GROUP BY term_norm
+                HAVING COUNT(*) >= ?
+                   AND COUNT(DISTINCT source_id || ':' || video_id) >= ?
+                ORDER BY bookmark_count DESC, video_count DESC, last_seen_at DESC, term_norm ASC
+                LIMIT ?
+                """,
+                (*params, safe_min_bookmarks, safe_min_videos, safe_limit),
+            ).fetchall()
+            for row in rows:
+                bookmark_count = int(row["bookmark_count"])
+                video_count = int(row["video_count"])
+                records.append(
+                    {
+                        "term_norm": str(row["term_norm"] or ""),
+                        "term": str(row["term"] or row["term_norm"] or ""),
+                        "bookmark_count": bookmark_count,
+                        "video_count": video_count,
+                        "missing_count": int(row["missing_count"] or 0),
+                        "first_seen_at": str(row["first_seen_at"] or ""),
+                        "last_seen_at": str(row["last_seen_at"] or ""),
+                        "priority_score": (bookmark_count * 1000) + video_count,
+                    }
+                )
+
+    finally:
+        connection.close()
+
+    write_records_as_jsonl_or_csv(records, output_path, output_format)
+    print(
+        "[dict-bookmarks-curate] "
+        f"preset={preset} rows={len(records)} format={output_format} output={output_path}"
     )
 
 
@@ -6439,6 +6608,49 @@ def parse_args() -> argparse.Namespace:
         help="Validate and report without writing DB changes.",
     )
 
+    dict_bookmarks_curate_parser = subparsers.add_parser(
+        "dict-bookmarks-curate",
+        help="Materialize curated dictionary bookmark views for review/study",
+    )
+    dict_bookmarks_curate_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    dict_bookmarks_curate_parser.add_argument("--source", action="append", dest="sources")
+    dict_bookmarks_curate_parser.add_argument("--ledger-db", type=Path)
+    dict_bookmarks_curate_parser.add_argument(
+        "--preset",
+        choices=["missing_review", "frequent_terms", "recent_saved"],
+        required=True,
+        help="Curated view preset to materialize.",
+    )
+    dict_bookmarks_curate_parser.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="Output format (default: jsonl)",
+    )
+    dict_bookmarks_curate_parser.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Row cap for output (default: 200)",
+    )
+    dict_bookmarks_curate_parser.add_argument(
+        "--min-bookmarks",
+        type=int,
+        default=2,
+        help="Minimum bookmark count for frequent_terms (default: 2)",
+    )
+    dict_bookmarks_curate_parser.add_argument(
+        "--min-videos",
+        type=int,
+        default=1,
+        help="Minimum distinct videos for frequent_terms (default: 1)",
+    )
+    dict_bookmarks_curate_parser.add_argument(
+        "--output",
+        type=Path,
+        help="Output file path. Defaults to exports/dictionary_bookmarks_<preset>_<utc>.<format>",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -6604,6 +6816,26 @@ def main() -> int:
             input_format=str(args.format).strip().lower(),
             on_duplicate=str(args.on_duplicate).strip().lower(),
             dry_run=bool(args.dry_run),
+        )
+        return 0
+
+    if args.command == "dict-bookmarks-curate":
+        preset = str(args.preset).strip().lower()
+        output_format = str(args.format).strip().lower()
+        timestamp_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        default_output = DEFAULT_DICT_BOOKMARK_EXPORT_DIR / (
+            f"dictionary_bookmarks_{preset}_{timestamp_utc}.{output_format}"
+        )
+        output_path = resolve_output_path(args.output, default_output)
+        run_dict_bookmarks_curate(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            preset=preset,
+            output_path=output_path,
+            output_format=output_format,
+            limit=max(1, int(args.limit)),
+            min_bookmarks=max(1, int(args.min_bookmarks)),
+            min_videos=max(1, int(args.min_videos)),
         )
         return 0
 
