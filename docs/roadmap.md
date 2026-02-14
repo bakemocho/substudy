@@ -243,7 +243,22 @@ Status (minimum implementation):
 - [ ] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
 - [ ] import結果サマリ表示（inserted/updated/skipped/errors）
 - [ ] artifact行からの実操作（open/download）
+- [ ] `review_hints.jsonl` を復習カード表示へ接続（`card_id` joinで hint を表示）
+- [ ] `translation_qa.jsonl` を復習/missing表示へ接続（`qa_result=check` を警告表示）
+- [ ] artifact種別判定に `review_hints` / `translation_qa` を追加
 - [ ] 4.6向けの軽量回帰テスト追加
+
+Intermediate artifact connectivity audit (2026-02-15):
+
+| Artifact                             | Producer              | Current consumer            | Learning flow connection                         |
+| ------------------------------------ | --------------------- | --------------------------- | ------------------------------------------------ |
+| `exports/llm/missing_review.jsonl`   | A1 Missing Export     | A2 Missing Enrichment input | Indirectly connected (`A1 -> A2 -> A3 -> DB`)    |
+| `exports/llm/enriched_missing.jsonl` | A2 Missing Enrichment | A3 Missing Import input     | Indirectly connected (`DB`反映後にworkspace表示) |
+| `exports/llm/review_cards.jsonl`     | A4 pre-step export    | A4/A5 LLM input             | Intermediate only（UIはDB起点で直接は未使用）    |
+| `exports/llm/review_hints.jsonl`     | A4 Review Hints       | no runtime consumer         | Not connected                                    |
+| `exports/llm/translation_qa.jsonl`   | A5 Translation QA     | no runtime consumer         | Not connected                                    |
+| `exports/*/frequent_terms*`          | curate/export CLI     | no runtime consumer         | Not connected（artifact listのみ）               |
+| `exports/*/recent_saved*`            | curate/export CLI     | no runtime consumer         | Not connected（artifact listのみ）               |
 
 - Add review workspace panel/card in web UI:
   - queue from `review_cards` equivalent view
@@ -258,6 +273,7 @@ Status (minimum implementation):
 - Add saved output browser card:
   - recent curate/export artifacts (`missing_review`, `frequent_terms`, `review_cards`)
   - import結果の要約表示（inserted/updated/skipped/errors）
+  - `review_hints` / `translation_qa` のカード内容を学習画面に反映
 
 Acceptance:
 
@@ -265,6 +281,7 @@ Acceptance:
 - `4.5` 生成物をCLIなしで確認・ジャンプ・復習できる。
 - 補完待ち語（missing）をweb上で追跡できる。
 - ダウンロード失敗の存在をweb上で把握できる。
+- `review_hints` と `translation_qa(check)` を復習判断に直接使える。
 
 ## 5) Next: similar-scene suggestion via cue embeddings
 
