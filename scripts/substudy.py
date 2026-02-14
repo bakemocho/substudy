@@ -20,7 +20,7 @@ import zlib
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
@@ -56,6 +56,7 @@ DEFAULT_NOTIFY_WEB_URL_BASE = f"http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}"
 DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS = 24
 DEFAULT_NOTIFY_MACOS_LABEL = "com.substudy.notify"
 DEFAULT_NOTIFY_INTERVAL_MINUTES = 90
+DEFAULT_NOTIFY_COOLDOWN_MINUTES = 15
 
 
 @dataclass
@@ -5165,16 +5166,23 @@ def run_notify(
     kind: str,
     web_url_base: str,
     llm_lookback_hours: int,
+    cooldown_minutes: int,
     dry_run: bool,
 ) -> None:
     if kind not in {"review", "llm", "all"}:
         raise ValueError("kind must be review/llm/all")
 
     now_iso = now_utc_iso()
+    now_dt = parse_iso_datetime_utc(now_iso) or dt.datetime.now(dt.timezone.utc)
     lookback_hours = max(1, int(llm_lookback_hours))
     llm_state_key = "notify.llm.last_checked_at"
+    review_sent_key = "notify.review.last_sent_at"
+    review_item_key_state = "notify.review.last_item_key"
+    llm_sent_key = "notify.llm.last_sent_at"
+    llm_item_key_state = "notify.llm.last_item_key"
     sent_events: list[str] = []
 
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
     try:
@@ -5193,7 +5201,29 @@ def run_notify(
                     f"{term_display} | "
                     f"{review_item['cue_start_label']}-{review_item['cue_end_label']}"
                 )
-                if dry_run:
+                review_item_key = build_notification_item_key(
+                    "review",
+                    (
+                        review_item["source_id"],
+                        review_item["video_id"],
+                        str(int(review_item["cue_start_ms"])),
+                        review_item["lookup_term"] or review_item["term"] or "",
+                    ),
+                )
+                if is_notification_duplicate_within_cooldown(
+                    connection=connection,
+                    sent_at_state_key=review_sent_key,
+                    item_key_state_key=review_item_key_state,
+                    item_key=review_item_key,
+                    cooldown_minutes=cooldown_minutes,
+                    now_dt=now_dt,
+                    dry_run=dry_run,
+                ):
+                    print(
+                        "[notify] review skipped: duplicate within cooldown "
+                        f"({max(0, int(cooldown_minutes))}m)"
+                    )
+                elif dry_run:
                     print(
                         "[notify] dry-run review "
                         f"url={review_item['local_jump_url']} message={message}"
@@ -5210,6 +5240,13 @@ def run_notify(
                         f"[notify] review {status} backend={backend} "
                         f"url={review_item['local_jump_url']}"
                     )
+                    if ok:
+                        set_app_state_value(connection, review_sent_key, now_iso)
+                        set_app_state_value(
+                            connection,
+                            review_item_key_state,
+                            review_item_key,
+                        )
                 sent_events.append("review")
             else:
                 print("[notify] review skipped: no dictionary bookmarks.")
@@ -5230,7 +5267,30 @@ def run_notify(
             if llm_item:
                 title = "LLMが解説を追加しました"
                 message = f"未読があります（{llm_item['unread_count']}件）"
-                if dry_run:
+                llm_item_key = build_notification_item_key(
+                    "llm",
+                    (
+                        llm_item["source_id"],
+                        llm_item["video_id"],
+                        str(int(llm_item["cue_start_ms"])),
+                        str(int(llm_item["unread_count"])),
+                        llm_item["updated_at"],
+                    ),
+                )
+                if is_notification_duplicate_within_cooldown(
+                    connection=connection,
+                    sent_at_state_key=llm_sent_key,
+                    item_key_state_key=llm_item_key_state,
+                    item_key=llm_item_key,
+                    cooldown_minutes=cooldown_minutes,
+                    now_dt=now_dt,
+                    dry_run=dry_run,
+                ):
+                    print(
+                        "[notify] llm skipped: duplicate within cooldown "
+                        f"({max(0, int(cooldown_minutes))}m)"
+                    )
+                elif dry_run:
                     print(
                         "[notify] dry-run llm "
                         f"url={llm_item['local_jump_url']} count={llm_item['unread_count']}"
@@ -5247,6 +5307,13 @@ def run_notify(
                         f"[notify] llm {status} backend={backend} "
                         f"count={llm_item['unread_count']} url={llm_item['local_jump_url']}"
                     )
+                    if ok:
+                        set_app_state_value(connection, llm_sent_key, now_iso)
+                        set_app_state_value(
+                            connection,
+                            llm_item_key_state,
+                            llm_item_key,
+                        )
                 sent_events.append("llm")
             else:
                 print("[notify] llm skipped: no unread LLM-updated bookmarks.")
@@ -5273,11 +5340,12 @@ def run_notify_install_macos(
     python_bin: str,
     script_path: Path,
     config_path: Path,
-    ledger_db_path: Path | None,
+    ledger_db_path: Path,
     source_ids: list[str],
     kind: str,
     web_url_base: str,
     llm_lookback_hours: int,
+    cooldown_minutes: int,
     plist_path: Path | None,
     load_now: bool,
 ) -> None:
@@ -5306,9 +5374,11 @@ def run_notify_install_macos(
         web_url_base,
         "--llm-lookback-hours",
         str(max(1, int(llm_lookback_hours))),
+        "--cooldown-minutes",
+        str(max(0, int(cooldown_minutes))),
+        "--ledger-db",
+        str(ledger_db_path.resolve()),
     ]
-    if ledger_db_path is not None:
-        program_args.extend(["--ledger-db", str(ledger_db_path.resolve())])
     for source_id in source_ids:
         program_args.extend(["--source", source_id])
 
@@ -5494,6 +5564,14 @@ def run_macos_notification(
     clean_group = str(group or "").strip()
 
     notifier = shutil.which("terminal-notifier")
+    if not notifier:
+        for candidate in (
+            Path("/opt/homebrew/bin/terminal-notifier"),
+            Path("/usr/local/bin/terminal-notifier"),
+        ):
+            if candidate.exists() and candidate.is_file():
+                notifier = str(candidate)
+                break
     if notifier:
         command = [
             notifier,
@@ -5524,6 +5602,40 @@ def run_macos_notification(
         check=False,
     )
     return (completed.returncode == 0, "osascript")
+
+
+def build_notification_item_key(kind: str, parts: Iterable[str]) -> str:
+    normalized_parts = [str(part).strip() for part in parts]
+    return f"{kind}:{'|'.join(normalized_parts)}"
+
+
+def is_notification_duplicate_within_cooldown(
+    connection: sqlite3.Connection,
+    sent_at_state_key: str,
+    item_key_state_key: str,
+    item_key: str,
+    cooldown_minutes: int,
+    now_dt: dt.datetime,
+    dry_run: bool,
+) -> bool:
+    safe_minutes = max(0, int(cooldown_minutes))
+    if safe_minutes <= 0 or not item_key:
+        return False
+    last_item_key = get_app_state_value(connection, item_key_state_key, default="")
+    if last_item_key != item_key:
+        return False
+    last_sent_iso = get_app_state_value(connection, sent_at_state_key, default="")
+    if not last_sent_iso:
+        return False
+    last_sent_dt = parse_iso_datetime_utc(last_sent_iso)
+    if last_sent_dt is None:
+        return False
+    elapsed_seconds = (now_dt - last_sent_dt).total_seconds()
+    if elapsed_seconds >= safe_minutes * 60:
+        return False
+    if dry_run:
+        return False
+    return True
 
 
 def encode_path_token(path: Path) -> str:
@@ -7482,6 +7594,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS,
         help="Initial lookback for LLM update detection when no state exists (default: 24)",
     )
+    notify_parser.add_argument(
+        "--cooldown-minutes",
+        type=int,
+        default=DEFAULT_NOTIFY_COOLDOWN_MINUTES,
+        help=f"Suppress duplicate notifications within this window (default: {DEFAULT_NOTIFY_COOLDOWN_MINUTES})",
+    )
     notify_parser.add_argument("--dry-run", action="store_true")
 
     notify_install_parser = subparsers.add_parser(
@@ -7518,6 +7636,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS,
         help="Initial lookback for LLM update detection when state is empty",
+    )
+    notify_install_parser.add_argument(
+        "--cooldown-minutes",
+        type=int,
+        default=DEFAULT_NOTIFY_COOLDOWN_MINUTES,
+        help=f"Suppress duplicate notifications within this window (default: {DEFAULT_NOTIFY_COOLDOWN_MINUTES})",
     )
     notify_install_parser.add_argument(
         "--python-bin",
@@ -7777,7 +7901,7 @@ def main() -> int:
                 python_bin=str(args.python_bin),
                 script_path=resolve_output_path(args.script_path, Path(__file__).resolve()),
                 config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
-                ledger_db_path=ledger_db_path if getattr(args, "ledger_db", None) is not None else None,
+                ledger_db_path=resolve_output_path(getattr(args, "ledger_db", None), ledger_db_path),
                 source_ids=[source.id for source in sources],
                 kind=str(args.kind).strip().lower(),
                 web_url_base=str(args.web_url_base),
