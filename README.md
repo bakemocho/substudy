@@ -101,6 +101,7 @@ Technical / developer-facing:
 - `docs/roadmap.md`
 - `docs/extension-ingest-mvp.md`
 - `docs/subtitle-translation.md`
+- `docs/llm-work-items.md`
 
 ## Legal and public sharing
 

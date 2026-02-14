@@ -1,183 +1,68 @@
-# LLM Work Items
+# LLM Work Items for Automations
 
-This document defines what to delegate to LLMs, in what order, and with what I/O contract.
+This document defines recurring automation-ready LLM workflows for dictionary bookmark study.
 
-Target scope: dictionary bookmark knowledge reuse (`4.5` baseline) and follow-up study material generation.
+Primary objective:
 
-## 1. Priority Order
+- Run enrichment and QA continuously with minimal manual steps.
+- Keep outputs import-safe for `dict-bookmarks-import`.
 
-1. Missing-entry enrichment (highest ROI)
-2. Context-aware definition cleanup/rerank
-3. Study-card explanation generation (EN/JA)
-4. Translation QA (EN/JA cue consistency)
-5. Optional: personalized review session curation
+## 1. Automation Set (Recommended)
 
-## 2. Input Sources
+Use one automation per responsibility.
 
-Use existing CLI outputs as stable LLM input:
+| ID  | Name               | Frequency       | Purpose                                      | Output                               |
+| --- | ------------------ | --------------- | -------------------------------------------- | ------------------------------------ |
+| A1  | Missing Export     | Daily           | Export unresolved dictionary bookmarks       | `exports/llm/missing_review.jsonl`   |
+| A2  | Missing Enrichment | Daily           | LLM enrichment for missing entries           | `exports/llm/enriched_missing.jsonl` |
+| A3  | Missing Import     | Daily           | Validate + import enriched rows              | DB updates + import log              |
+| A4  | Review Card Hints  | Daily or Weekly | Generate short study hints from review cards | `exports/llm/review_hints.jsonl`     |
+| A5  | Translation QA     | Weekly          | Detect suspicious EN/JA cue mismatch         | `exports/llm/translation_qa.jsonl`   |
 
-- missing review:
-  - `python3 scripts/substudy.py dict-bookmarks-curate --preset missing_review --format jsonl --limit 200 --output exports/llm/missing_review.jsonl`
-- review cards:
-  - `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200 --output exports/llm/review_cards.jsonl`
-- frequent terms:
-  - `python3 scripts/substudy.py dict-bookmarks-curate --preset frequent_terms --format jsonl --limit 200 --output exports/llm/frequent_terms.jsonl`
+Suggested order in one daily chain:
 
-Recommended ramp-up batch size:
+1. A1 (`Missing Export`)
+2. A2 (`Missing Enrichment`)
+3. A3 (`Missing Import`)
+4. A4 (`Review Card Hints`)
 
-- dry run: 1 item
-- pilot: 5 items
-- small batch: 10 items
-- steady run: 20-50 items
+A5 is independent and can run weekly.
 
-## 3. Task Specs
+## 2. Command Contracts
 
-### 3.1 Missing-entry enrichment
-
-Goal:
-
-- Fill dictionary bookmarks where `missing_entry=1`.
-
-Required input fields:
-
-- Preferred (`review_cards` export): `term`, `lookup_term`, `cue_en_text`, `cue_ja_text`, `source_id`, `video_id`, `cue_start_ms`, `cue_end_ms`, `track`
-- Fallback (`missing_review` export): `term`, `lookup_term`, `cue_text`, `source_id`, `video_id`, `cue_start_ms`, `cue_end_ms`, `track`
-
-Expected output fields (JSONL):
-
-- `source_id`
-- `video_id`
-- `cue_start_ms`
-- `term`
-- `lookup_term`
-- `definition` (short, study-focused, Japanese allowed)
-- `definition_en` (optional concise EN gloss)
-- `examples` (0-2 short examples)
-- `confidence` (`high|medium|low`)
-- `notes` (optional; ambiguity or caution)
-- `track` (required for re-import)
-- `cue_end_ms` (required for re-import)
-- `missing_entry` (`1` for enrichment rows; default)
-- `dict_entry_id` (optional when `missing_entry=1`; required if `missing_entry=0`)
-
-Acceptance:
-
-- no empty `definition`
-- no contradictory claim vs cue context (`cue_en_text` or `cue_text`)
-- confidence is present
-
-### 3.2 Context-aware cleanup / rerank
-
-Goal:
-
-- Improve usefulness when entry is too broad or noisy.
-
-Input:
-
-- bookmark export with existing definition + cue context
-
-Output:
-
-- `definition_refined` (single best sense for this cue)
-- `sense_reason` (why this sense matches cue)
-- `alternatives` (optional short list)
-
-Acceptance:
-
-- refined definition is shorter and more cue-relevant than original
-
-### 3.3 Study-card explanation generation
-
-Goal:
-
-- Produce reusable micro-lessons for spaced review.
-
-Input:
-
-- `review_cards` JSONL
-
-Output:
-
-- `card_id`
-- `term`
-- `one_line_hint_ja`
-- `one_line_hint_en`
-- `common_mistake`
-- `memory_hook` (optional)
-
-Acceptance:
-
-- each hint fits one line (roughly <= 80 chars)
-- no copy-paste of long source definition
-
-### 3.4 EN/JA translation QA
-
-Goal:
-
-- Flag possible mismatch between `cue_en_text` and `cue_ja_text`.
-
-Output:
-
-- `card_id` or cue identifier
-- `qa_result` (`ok|check`)
-- `reason`
-- `suggested_ja` (only if `check`)
-
-Acceptance:
-
-- only high-suspicion cases should be marked `check`
-
-### 3.5 Session curation (optional)
-
-Goal:
-
-- Build a focused study queue (for example: weak + recent + frequent).
-
-Output:
-
-- ranked list with short reason per row
-
-## 4. Merge / Reuse Policy
-
-When re-importing enriched outputs:
-
-- default: `--on-duplicate upsert`
-- use `skip` for conservative runs
-- use `error` only in strict QA pipelines
-
-Recommended import command:
+### A1. Missing Export
 
 ```bash
-python3 scripts/substudy.py dict-bookmarks-import \
-  --input exports/llm/enriched_missing.jsonl \
-  --on-duplicate upsert
+python3 scripts/substudy.py dict-bookmarks-curate \
+  --preset missing_review \
+  --format jsonl \
+  --limit 200 \
+  --output exports/llm/missing_review.jsonl
 ```
 
-Import contract notes:
+Skip rule:
 
-- Re-import schema is stricter than LLM-facing schema.
-- At minimum keep these identifiers unchanged: `source_id`, `video_id`, `track`, `cue_start_ms`, `cue_end_ms`.
-- For known dictionary entries: include positive integer `dict_entry_id`.
-- For missing-entry enrichment: set `missing_entry=1`; `dict_entry_id` can be omitted (auto-generated).
+- If output has 0 rows, downstream A2/A3 may no-op.
 
-## 5. Prompt Rules (for any LLM agent)
+### A2. Missing Enrichment (LLM)
 
-- Prefer cue-context accuracy over dictionary completeness.
-- Do not hallucinate: if uncertain, output low confidence and explain ambiguity.
-- Keep output machine-parseable JSONL (one JSON object per line).
-- Preserve original identifiers (`source_id`, `video_id`, `cue_start_ms`) unchanged.
-- Avoid overly long prose; optimize for quick review in UI.
+Input file:
 
-## 6. Quality Checklist
+- `exports/llm/missing_review.jsonl`
 
-Before import:
+Preferred context source:
 
-1. JSONL parse passes for all lines.
-2. Required IDs are present for every row.
-3. `definition`/`definition_refined` is non-empty.
-4. Spot-check 10 samples against actual cue context.
-5. Duplicate keys merge as expected with selected policy.
-6. Run import validation in dry-run mode and ensure `errors=0`:
+- If richer context is needed, additionally export `review_cards` and join by cue identifiers.
+
+Output file:
+
+- `exports/llm/enriched_missing.jsonl`
+
+Output must remain importable (see section 3).
+
+### A3. Missing Import
+
+Validation first:
 
 ```bash
 python3 scripts/substudy.py dict-bookmarks-import \
@@ -186,10 +71,178 @@ python3 scripts/substudy.py dict-bookmarks-import \
   --dry-run
 ```
 
-## 7. Suggested Next Milestone
+If dry-run passes (`errors=0`), run actual import:
 
-After this document is operational:
+```bash
+python3 scripts/substudy.py dict-bookmarks-import \
+  --input exports/llm/enriched_missing.jsonl \
+  --on-duplicate upsert
+```
 
-1. Automate `missing_review -> LLM -> import` as one script wrapper.
-2. Add "unread LLM enrichment" counter to existing notification flow.
-3. Expose enriched fields directly in hover dictionary popup/reel card.
+### A4. Review Card Hints
+
+Export source cards:
+
+```bash
+python3 scripts/substudy.py dict-bookmarks-curate \
+  --preset review_cards \
+  --format jsonl \
+  --limit 200 \
+  --output exports/llm/review_cards.jsonl
+```
+
+LLM writes:
+
+- `exports/llm/review_hints.jsonl`
+
+### A5. Translation QA
+
+Input (recommended):
+
+- `exports/llm/review_cards.jsonl`
+
+Output:
+
+- `exports/llm/translation_qa.jsonl`
+
+## 3. Import-Safe Schema (Critical)
+
+`dict-bookmarks-import` requires stricter fields than a generic LLM payload.
+
+Minimum fields per row for re-import:
+
+- `source_id`
+- `video_id`
+- `track`
+- `cue_start_ms` (integer)
+- `cue_end_ms` (integer)
+- `term`
+- `term_norm` (recommended; if omitted, it may be normalized from `term`)
+- `lookup_term` (recommended)
+- `definition`
+- `missing_entry` (`1` for missing-entry enrichment)
+
+`dict_entry_id` rules:
+
+- If `missing_entry=1`: `dict_entry_id` can be omitted (auto-generated).
+- If `missing_entry=0`: positive integer `dict_entry_id` is required.
+
+Identifier immutability rule:
+
+- Never modify `source_id`, `video_id`, `track`, `cue_start_ms`, `cue_end_ms`.
+
+## 4. LLM Output Spec by Task
+
+### Missing Enrichment Output
+
+Required:
+
+- `source_id`, `video_id`, `track`, `cue_start_ms`, `cue_end_ms`
+- `term`, `lookup_term`, `definition`, `missing_entry`
+
+Optional:
+
+- `definition_en`
+- `examples` (0-2 short)
+- `confidence` (`high|medium|low`)
+- `notes`
+
+Acceptance:
+
+- `definition` is non-empty.
+- No contradiction with cue context (`cue_en_text` or `cue_text`).
+- Output is valid JSONL (one object per line).
+
+### Review Hint Output
+
+Required:
+
+- `card_id`
+- `term`
+- `one_line_hint_ja`
+- `one_line_hint_en`
+
+Optional:
+
+- `common_mistake`
+- `memory_hook`
+
+Acceptance:
+
+- Hint lines are concise (roughly <= 80 chars).
+
+### Translation QA Output
+
+Required:
+
+- `card_id` (or stable cue identifier)
+- `qa_result` (`ok|check`)
+- `reason`
+
+Optional:
+
+- `suggested_ja` (only when `qa_result=check`)
+
+Acceptance:
+
+- Mark `check` only for high-suspicion mismatch.
+
+## 5. Automation Guardrails
+
+### Global guardrails
+
+- Prefer cue-context accuracy over dictionary completeness.
+- If uncertain, keep `missing_entry=1`, lower confidence, and explain ambiguity.
+- Keep outputs machine-parseable JSONL.
+- Avoid long prose.
+
+### Failure behavior
+
+- If export command fails: stop chain.
+- If LLM output parse fails: stop import and keep artifact for manual inspection.
+- If import dry-run has `errors>0`: do not run actual import.
+
+### Duplicate policy
+
+- Default: `--on-duplicate upsert`
+- Conservative mode: `skip`
+- Strict QA: `error`
+
+## 6. Suggested Automation Prompts (Codex App)
+
+Use these as automation prompts (task only; schedule/workspace are configured separately in UI).
+
+### Prompt for A2 Missing Enrichment
+
+Read `exports/llm/missing_review.jsonl` and generate `exports/llm/enriched_missing.jsonl` as JSONL.
+For each row, fill a concise context-aware `definition` and keep identifiers unchanged.
+Output rows must stay import-safe for `dict-bookmarks-import` (`source_id`, `video_id`, `track`, `cue_start_ms`, `cue_end_ms`, `term`, `definition`, `missing_entry=1`).
+If uncertain, add low confidence and brief notes rather than hallucinating.
+
+### Prompt for A4 Review Card Hints
+
+Read `exports/llm/review_cards.jsonl` and generate `exports/llm/review_hints.jsonl`.
+Create short one-line EN/JA hints per card, plus optional common mistake and memory hook.
+Keep each hint concise and avoid copying long dictionary definitions.
+
+### Prompt for A5 Translation QA
+
+Read `exports/llm/review_cards.jsonl` and generate `exports/llm/translation_qa.jsonl`.
+Set `qa_result=check` only for high-confidence mismatch between EN and JA cue meaning.
+Include a short reason and suggested JA only when check is needed.
+
+## 7. Operational Checklist
+
+Before enabling daily automation:
+
+1. Verify command paths from repo root.
+2. Run A1 -> A2 -> A3 once manually.
+3. Confirm dry-run import returns `errors=0`.
+4. Spot-check at least 10 rows in web UI context.
+5. Enable schedule.
+
+After deployment:
+
+1. Monitor import summary counts (`inserted/updated/skipped/errors`).
+2. Review weekly QA output volume (`check` ratio should stay low).
+3. Adjust batch limits (`--limit`) to keep run time stable.
