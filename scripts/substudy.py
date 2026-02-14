@@ -8,6 +8,8 @@ import datetime as dt
 import json
 import math
 import mimetypes
+import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -50,6 +52,10 @@ DEFAULT_WEB_PORT = 8876
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web"
 MISSING_DICT_ENTRY_ID_BASE = 3_000_000_000
 DEFAULT_DICT_BOOKMARK_EXPORT_DIR = Path("exports")
+DEFAULT_NOTIFY_WEB_URL_BASE = f"http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}"
+DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS = 24
+DEFAULT_NOTIFY_MACOS_LABEL = "com.substudy.notify"
+DEFAULT_NOTIFY_INTERVAL_MINUTES = 90
 
 
 @dataclass
@@ -1750,6 +1756,12 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_notes(source_id, video_id, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_dictionary_bookmarks_lookup
             ON dictionary_bookmarks(source_id, video_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS app_state (
+            state_key TEXT PRIMARY KEY,
+            state_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     ensure_videos_loudness_columns(connection)
@@ -4981,6 +4993,395 @@ def run_dict_bookmarks_curate(
     )
 
 
+def fetch_top_review_notification_item(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    web_url_base: str,
+) -> dict[str, Any] | None:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    if source_ids:
+        placeholders = ",".join("?" for _ in source_ids)
+        where_clauses.append(f"db.source_id IN ({placeholders})")
+        params.extend(source_ids)
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            db.id,
+            db.source_id,
+            db.video_id,
+            db.cue_start_ms,
+            db.cue_end_ms,
+            db.cue_text,
+            db.lookup_term,
+            db.term,
+            db.term_norm,
+            db.missing_entry,
+            db.updated_at,
+            db.created_at,
+            db.definition,
+            COALESCE(v.webpage_url, '') AS webpage_url
+        FROM dictionary_bookmarks db
+        LEFT JOIN videos v
+          ON v.source_id = db.source_id
+         AND v.video_id = db.video_id
+        {where_sql}
+        ORDER BY db.updated_at DESC, db.id DESC
+        LIMIT 400
+        """,
+        tuple(params),
+    ).fetchall()
+    if not rows:
+        return None
+
+    term_stats = collect_dictionary_term_history_stats(connection, source_ids=source_ids)
+    best_item: dict[str, Any] | None = None
+    best_score: float | None = None
+    for row in rows:
+        term_norm = str(row["term_norm"] or "")
+        stats = term_stats.get(term_norm, {})
+        score = float(stats.get("review_priority", 0.0))
+        missing_entry = bool(int(row["missing_entry"] or 0))
+        if missing_entry:
+            score += 1.0
+        if best_score is None or score > best_score:
+            cue_start_ms = int(row["cue_start_ms"] or 0)
+            cue_end_ms = int(row["cue_end_ms"] or cue_start_ms)
+            best_score = score
+            best_item = {
+                "id": int(row["id"]),
+                "source_id": str(row["source_id"] or ""),
+                "video_id": str(row["video_id"] or ""),
+                "cue_start_ms": cue_start_ms,
+                "cue_end_ms": cue_end_ms,
+                "cue_start_label": format_ms_to_clock(cue_start_ms),
+                "cue_end_label": format_ms_to_clock(cue_end_ms),
+                "cue_text": str(row["cue_text"] or ""),
+                "term": str(row["term"] or term_norm),
+                "lookup_term": str(row["lookup_term"] or ""),
+                "missing_entry": missing_entry,
+                "review_priority": score,
+                "webpage_url": str(row["webpage_url"] or ""),
+            }
+
+    if best_item is None:
+        return None
+    best_item["local_jump_url"] = build_local_jump_url(
+        web_url_base=web_url_base,
+        source_id=best_item["source_id"],
+        video_id=best_item["video_id"],
+        cue_start_ms=best_item["cue_start_ms"],
+    )
+    return best_item
+
+
+def fetch_llm_unread_notification_item(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    since_iso: str,
+    web_url_base: str,
+) -> dict[str, Any] | None:
+    where_clauses = [
+        "db.updated_at > ?",
+        "COALESCE(db.updated_at, '') != COALESCE(db.created_at, '')",
+        "db.missing_entry = 0",
+    ]
+    params: list[Any] = [since_iso]
+    if source_ids:
+        placeholders = ",".join("?" for _ in source_ids)
+        where_clauses.append(f"db.source_id IN ({placeholders})")
+        params.extend(source_ids)
+
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+    count_row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS cnt
+        FROM dictionary_bookmarks db
+        {where_sql}
+        """,
+        tuple(params),
+    ).fetchone()
+    unread_count = int(count_row["cnt"] if isinstance(count_row, sqlite3.Row) else count_row[0]) if count_row else 0
+    if unread_count <= 0:
+        return None
+
+    row = connection.execute(
+        f"""
+        SELECT
+            db.id,
+            db.source_id,
+            db.video_id,
+            db.cue_start_ms,
+            db.cue_end_ms,
+            db.cue_text,
+            db.lookup_term,
+            db.term,
+            db.updated_at,
+            COALESCE(v.webpage_url, '') AS webpage_url
+        FROM dictionary_bookmarks db
+        LEFT JOIN videos v
+          ON v.source_id = db.source_id
+         AND v.video_id = db.video_id
+        {where_sql}
+        ORDER BY db.updated_at DESC, db.id DESC
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    if row is None:
+        return None
+
+    source_id = str(row["source_id"])
+    video_id = str(row["video_id"])
+    cue_start_ms = int(row["cue_start_ms"] or 0)
+    return {
+        "unread_count": unread_count,
+        "source_id": source_id,
+        "video_id": video_id,
+        "cue_start_ms": cue_start_ms,
+        "cue_start_label": format_ms_to_clock(cue_start_ms),
+        "cue_end_label": format_ms_to_clock(int(row["cue_end_ms"] or cue_start_ms)),
+        "cue_text": str(row["cue_text"] or ""),
+        "term": str(row["term"] or ""),
+        "lookup_term": str(row["lookup_term"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+        "webpage_url": str(row["webpage_url"] or ""),
+        "local_jump_url": build_local_jump_url(
+            web_url_base=web_url_base,
+            source_id=source_id,
+            video_id=video_id,
+            cue_start_ms=cue_start_ms,
+        ),
+    }
+
+
+def run_notify(
+    db_path: Path,
+    source_ids: list[str],
+    kind: str,
+    web_url_base: str,
+    llm_lookback_hours: int,
+    dry_run: bool,
+) -> None:
+    if kind not in {"review", "llm", "all"}:
+        raise ValueError("kind must be review/llm/all")
+
+    now_iso = now_utc_iso()
+    lookback_hours = max(1, int(llm_lookback_hours))
+    llm_state_key = "notify.llm.last_checked_at"
+    sent_events: list[str] = []
+
+    connection = sqlite3.connect(str(db_path))
+    connection.row_factory = sqlite3.Row
+    try:
+        create_schema(connection)
+
+        if kind in {"review", "all"}:
+            review_item = fetch_top_review_notification_item(
+                connection=connection,
+                source_ids=source_ids,
+                web_url_base=web_url_base,
+            )
+            if review_item:
+                title = "復習しましょう！"
+                term_display = review_item["lookup_term"] or review_item["term"] or "(term)"
+                message = (
+                    f"{term_display} | "
+                    f"{review_item['cue_start_label']}-{review_item['cue_end_label']}"
+                )
+                if dry_run:
+                    print(
+                        "[notify] dry-run review "
+                        f"url={review_item['local_jump_url']} message={message}"
+                    )
+                else:
+                    ok, backend = run_macos_notification(
+                        title=title,
+                        message=message,
+                        open_url=review_item["local_jump_url"],
+                        group="substudy-review",
+                    )
+                    status = "sent" if ok else "failed"
+                    print(
+                        f"[notify] review {status} backend={backend} "
+                        f"url={review_item['local_jump_url']}"
+                    )
+                sent_events.append("review")
+            else:
+                print("[notify] review skipped: no dictionary bookmarks.")
+
+        if kind in {"llm", "all"}:
+            saved_since = get_app_state_value(connection, llm_state_key, default="")
+            if saved_since:
+                since_iso = saved_since
+            else:
+                since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lookback_hours)
+                since_iso = since_dt.replace(microsecond=0).isoformat()
+            llm_item = fetch_llm_unread_notification_item(
+                connection=connection,
+                source_ids=source_ids,
+                since_iso=since_iso,
+                web_url_base=web_url_base,
+            )
+            if llm_item:
+                title = "LLMが解説を追加しました"
+                message = f"未読があります（{llm_item['unread_count']}件）"
+                if dry_run:
+                    print(
+                        "[notify] dry-run llm "
+                        f"url={llm_item['local_jump_url']} count={llm_item['unread_count']}"
+                    )
+                else:
+                    ok, backend = run_macos_notification(
+                        title=title,
+                        message=message,
+                        open_url=llm_item["local_jump_url"],
+                        group="substudy-llm",
+                    )
+                    status = "sent" if ok else "failed"
+                    print(
+                        f"[notify] llm {status} backend={backend} "
+                        f"count={llm_item['unread_count']} url={llm_item['local_jump_url']}"
+                    )
+                sent_events.append("llm")
+            else:
+                print("[notify] llm skipped: no unread LLM-updated bookmarks.")
+
+            if not dry_run:
+                set_app_state_value(connection, llm_state_key, now_iso)
+
+        if dry_run:
+            connection.rollback()
+        else:
+            connection.commit()
+    finally:
+        connection.close()
+
+    if sent_events:
+        print(f"[notify] completed events={','.join(sent_events)}")
+    else:
+        print("[notify] completed events=none")
+
+
+def run_notify_install_macos(
+    label: str,
+    interval_minutes: int,
+    python_bin: str,
+    script_path: Path,
+    config_path: Path,
+    ledger_db_path: Path | None,
+    source_ids: list[str],
+    kind: str,
+    web_url_base: str,
+    llm_lookback_hours: int,
+    plist_path: Path | None,
+    load_now: bool,
+) -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("notify-install-macos is supported only on macOS.")
+    safe_label = str(label).strip() or DEFAULT_NOTIFY_MACOS_LABEL
+    safe_interval = max(1, int(interval_minutes))
+    safe_python = str(python_bin).strip() or sys.executable
+    safe_script = script_path.resolve()
+    safe_config = config_path.resolve()
+    safe_plist_path = (
+        plist_path.expanduser().resolve()
+        if plist_path is not None
+        else (Path.home() / "Library" / "LaunchAgents" / f"{safe_label}.plist")
+    )
+
+    program_args = [
+        safe_python,
+        str(safe_script),
+        "notify",
+        "--config",
+        str(safe_config),
+        "--kind",
+        kind,
+        "--web-url-base",
+        web_url_base,
+        "--llm-lookback-hours",
+        str(max(1, int(llm_lookback_hours))),
+    ]
+    if ledger_db_path is not None:
+        program_args.extend(["--ledger-db", str(ledger_db_path.resolve())])
+    for source_id in source_ids:
+        program_args.extend(["--source", source_id])
+
+    logs_dir = Path.home() / "Library" / "Logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    plist_payload = {
+        "Label": safe_label,
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+        "StartInterval": safe_interval * 60,
+        "StandardOutPath": str(logs_dir / "substudy-notify.out.log"),
+        "StandardErrorPath": str(logs_dir / "substudy-notify.err.log"),
+    }
+
+    safe_plist_path.parent.mkdir(parents=True, exist_ok=True)
+    with safe_plist_path.open("wb") as handle:
+        plistlib.dump(plist_payload, handle, sort_keys=True)
+    print(f"[notify-install-macos] wrote plist: {safe_plist_path}")
+
+    if not load_now:
+        return
+
+    uid = os.getuid()
+    bootstrap_target = f"gui/{uid}"
+    subprocess.run(
+        ["launchctl", "bootout", bootstrap_target, str(safe_plist_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    boot = subprocess.run(
+        ["launchctl", "bootstrap", bootstrap_target, str(safe_plist_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if boot.returncode != 0:
+        raise RuntimeError("launchctl bootstrap failed for notify agent.")
+    subprocess.run(
+        ["launchctl", "enable", f"{bootstrap_target}/{safe_label}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    print(f"[notify-install-macos] loaded agent: {safe_label}")
+
+
+def run_notify_uninstall_macos(
+    label: str,
+    plist_path: Path | None,
+) -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("notify-uninstall-macos is supported only on macOS.")
+    safe_label = str(label).strip() or DEFAULT_NOTIFY_MACOS_LABEL
+    safe_plist_path = (
+        plist_path.expanduser().resolve()
+        if plist_path is not None
+        else (Path.home() / "Library" / "LaunchAgents" / f"{safe_label}.plist")
+    )
+    uid = os.getuid()
+    bootstrap_target = f"gui/{uid}"
+    subprocess.run(
+        ["launchctl", "bootout", bootstrap_target, str(safe_plist_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if safe_plist_path.exists():
+        safe_plist_path.unlink()
+    print(f"[notify-uninstall-macos] removed agent: {safe_label}")
+    print(f"[notify-uninstall-macos] removed plist: {safe_plist_path}")
+
+
 def resolve_output_path(path_value: Path | None, default_path: Path) -> Path:
     if path_value is None:
         return default_path
@@ -5014,6 +5415,115 @@ def parse_bool_flag(raw_value: str | None, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def get_app_state_value(
+    connection: sqlite3.Connection,
+    state_key: str,
+    default: str = "",
+) -> str:
+    row = connection.execute(
+        """
+        SELECT state_value
+        FROM app_state
+        WHERE state_key = ?
+        LIMIT 1
+        """,
+        (state_key,),
+    ).fetchone()
+    if row is None:
+        return default
+    if isinstance(row, sqlite3.Row):
+        value = row["state_value"]
+    else:
+        value = row[0]
+    return default if value in (None, "") else str(value)
+
+
+def set_app_state_value(
+    connection: sqlite3.Connection,
+    state_key: str,
+    state_value: str,
+) -> None:
+    now_iso = now_utc_iso()
+    connection.execute(
+        """
+        INSERT INTO app_state (state_key, state_value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(state_key) DO UPDATE SET
+            state_value = excluded.state_value,
+            updated_at = excluded.updated_at
+        """,
+        (state_key, str(state_value), now_iso),
+    )
+
+
+def build_local_jump_url(
+    web_url_base: str,
+    source_id: str,
+    video_id: str,
+    cue_start_ms: int,
+) -> str:
+    base = str(web_url_base or DEFAULT_NOTIFY_WEB_URL_BASE).strip()
+    if not base:
+        base = DEFAULT_NOTIFY_WEB_URL_BASE
+    parsed = urlparse(base)
+    if not parsed.scheme:
+        base = f"http://{base.lstrip('/')}"
+    base = base.rstrip("/")
+    jump_second = max(0, int(round(int(cue_start_ms) / 1000)))
+    query = urlencode(
+        {
+            "source_id": source_id,
+            "video_id": video_id,
+            "t": str(jump_second),
+        }
+    )
+    return f"{base}/?{query}"
+
+
+def run_macos_notification(
+    title: str,
+    message: str,
+    open_url: str | None = None,
+    group: str | None = None,
+) -> tuple[bool, str]:
+    clean_title = str(title or "").strip() or "Substudy"
+    clean_message = str(message or "").strip() or "Notification"
+    clean_url = str(open_url or "").strip()
+    clean_group = str(group or "").strip()
+
+    notifier = shutil.which("terminal-notifier")
+    if notifier:
+        command = [
+            notifier,
+            "-title",
+            clean_title,
+            "-message",
+            clean_message,
+        ]
+        if clean_group:
+            command.extend(["-group", clean_group])
+        if clean_url:
+            command.extend(["-open", clean_url])
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return (completed.returncode == 0, "terminal-notifier")
+
+    escaped_title = clean_title.replace("\\", "\\\\").replace('"', '\\"')
+    escaped_message = clean_message.replace("\\", "\\\\").replace('"', '\\"')
+    apple_script = f'display notification "{escaped_message}" with title "{escaped_title}"'
+    completed = subprocess.run(
+        ["osascript", "-e", apple_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return (completed.returncode == 0, "osascript")
 
 
 def encode_path_token(path: Path) -> str:
@@ -6948,6 +7458,106 @@ def parse_args() -> argparse.Namespace:
         help="Output file path. Defaults to exports/dictionary_bookmarks_<preset>_<utc>.<format>",
     )
 
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help="Send local study notifications (review / LLM-updated unread)",
+    )
+    notify_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    notify_parser.add_argument("--source", action="append", dest="sources")
+    notify_parser.add_argument("--ledger-db", type=Path)
+    notify_parser.add_argument(
+        "--kind",
+        choices=["review", "llm", "all"],
+        default="all",
+        help="Notification kind (default: all)",
+    )
+    notify_parser.add_argument(
+        "--web-url-base",
+        default=DEFAULT_NOTIFY_WEB_URL_BASE,
+        help="Base URL opened when notification is clicked (default: http://127.0.0.1:8876)",
+    )
+    notify_parser.add_argument(
+        "--llm-lookback-hours",
+        type=int,
+        default=DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS,
+        help="Initial lookback for LLM update detection when no state exists (default: 24)",
+    )
+    notify_parser.add_argument("--dry-run", action="store_true")
+
+    notify_install_parser = subparsers.add_parser(
+        "notify-install-macos",
+        help="Install periodic notification scheduler via macOS launchd",
+    )
+    notify_install_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    notify_install_parser.add_argument("--source", action="append", dest="sources")
+    notify_install_parser.add_argument("--ledger-db", type=Path)
+    notify_install_parser.add_argument(
+        "--label",
+        default=DEFAULT_NOTIFY_MACOS_LABEL,
+        help=f"LaunchAgent label (default: {DEFAULT_NOTIFY_MACOS_LABEL})",
+    )
+    notify_install_parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=DEFAULT_NOTIFY_INTERVAL_MINUTES,
+        help=f"Notification interval minutes (default: {DEFAULT_NOTIFY_INTERVAL_MINUTES})",
+    )
+    notify_install_parser.add_argument(
+        "--kind",
+        choices=["review", "llm", "all"],
+        default="all",
+        help="Notification kind for scheduled runs (default: all)",
+    )
+    notify_install_parser.add_argument(
+        "--web-url-base",
+        default=DEFAULT_NOTIFY_WEB_URL_BASE,
+        help="Base URL opened when notification is clicked",
+    )
+    notify_install_parser.add_argument(
+        "--llm-lookback-hours",
+        type=int,
+        default=DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS,
+        help="Initial lookback for LLM update detection when state is empty",
+    )
+    notify_install_parser.add_argument(
+        "--python-bin",
+        default=sys.executable,
+        help="Python executable for LaunchAgent ProgramArguments",
+    )
+    notify_install_parser.add_argument(
+        "--script-path",
+        type=Path,
+        default=Path(__file__).resolve(),
+        help="Path to substudy.py used by LaunchAgent",
+    )
+    notify_install_parser.add_argument(
+        "--plist-path",
+        type=Path,
+        help="Optional custom LaunchAgent plist path",
+    )
+    notify_install_parser.add_argument(
+        "--no-load",
+        action="store_true",
+        help="Write plist but do not load/bootstrap immediately.",
+    )
+
+    notify_uninstall_parser = subparsers.add_parser(
+        "notify-uninstall-macos",
+        help="Uninstall periodic notification LaunchAgent on macOS",
+    )
+    notify_uninstall_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    notify_uninstall_parser.add_argument("--source", action="append", dest="sources")
+    notify_uninstall_parser.add_argument(
+        "--label",
+        default=DEFAULT_NOTIFY_MACOS_LABEL,
+        help=f"LaunchAgent label (default: {DEFAULT_NOTIFY_MACOS_LABEL})",
+    )
+    notify_uninstall_parser.add_argument(
+        "--plist-path",
+        type=Path,
+        help="Optional custom LaunchAgent plist path",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -6963,6 +7573,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
+    if args.command == "notify-uninstall-macos":
+        try:
+            run_notify_uninstall_macos(
+                label=str(args.label),
+                plist_path=args.plist_path,
+            )
+            return 0
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
     try:
         global_config, all_sources = load_config(args.config)
         sources = select_sources(all_sources, args.sources)
@@ -7135,6 +7757,38 @@ def main() -> int:
             min_videos=max(1, int(args.min_videos)),
         )
         return 0
+
+    if args.command == "notify":
+        run_notify(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            kind=str(args.kind).strip().lower(),
+            web_url_base=str(args.web_url_base),
+            llm_lookback_hours=max(1, int(args.llm_lookback_hours)),
+            dry_run=bool(args.dry_run),
+        )
+        return 0
+
+    if args.command == "notify-install-macos":
+        try:
+            run_notify_install_macos(
+                label=str(args.label),
+                interval_minutes=max(1, int(args.interval_minutes)),
+                python_bin=str(args.python_bin),
+                script_path=resolve_output_path(args.script_path, Path(__file__).resolve()),
+                config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
+                ledger_db_path=ledger_db_path if getattr(args, "ledger_db", None) is not None else None,
+                source_ids=[source.id for source in sources],
+                kind=str(args.kind).strip().lower(),
+                web_url_base=str(args.web_url_base),
+                llm_lookback_hours=max(1, int(args.llm_lookback_hours)),
+                plist_path=args.plist_path,
+                load_now=not bool(args.no_load),
+            )
+            return 0
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "web":
         run_web_ui(

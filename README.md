@@ -58,8 +58,16 @@ Open `http://127.0.0.1:8876`.
 - `python3 scripts/substudy.py dict-bookmarks-import --input exports/dictionary_bookmarks_missing_*.jsonl --on-duplicate upsert`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset frequent_terms --format csv --limit 200`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200`
+- `python3 scripts/substudy.py notify --kind all`
+- `python3 scripts/substudy.py notify-install-macos --interval-minutes 90 --kind all`
+- `python3 scripts/substudy.py notify-uninstall-macos`
 - `python3 scripts/substudy.py downloads --since-hours 24`
 - `python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`
+
+Notification note (macOS):
+
+- Click-to-open notification requires `terminal-notifier` (`brew install terminal-notifier`).
+- Without it, fallback uses AppleScript notification (toast only, no click action).
 
 ## Web study features (MVP)
 
