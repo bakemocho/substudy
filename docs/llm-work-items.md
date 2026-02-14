@@ -30,14 +30,16 @@ A5 is independent and can run weekly.
 
 ## 2. Command Contracts
 
+For automation safety, prefer the wrapper script with built-in preflight:
+
+```bash
+scripts/run_llm_pipeline.sh preflight
+```
+
 ### A1. Missing Export
 
 ```bash
-python3 scripts/substudy.py dict-bookmarks-curate \
-  --preset missing_review \
-  --format jsonl \
-  --limit 200 \
-  --output exports/llm/missing_review.jsonl
+scripts/run_llm_pipeline.sh missing-export --limit 200
 ```
 
 Skip rule:
@@ -65,30 +67,16 @@ Output must remain importable (see section 3).
 Validation first:
 
 ```bash
-python3 scripts/substudy.py dict-bookmarks-import \
-  --input exports/llm/enriched_missing.jsonl \
-  --on-duplicate upsert \
-  --dry-run
+scripts/run_llm_pipeline.sh missing-import
 ```
-
-If dry-run passes (`errors=0`), run actual import:
-
-```bash
-python3 scripts/substudy.py dict-bookmarks-import \
-  --input exports/llm/enriched_missing.jsonl \
-  --on-duplicate upsert
-```
+`missing-import` handles dry-run gating and no-op/blocked cases internally.
 
 ### A4. Review Card Hints
 
 Export source cards:
 
 ```bash
-python3 scripts/substudy.py dict-bookmarks-curate \
-  --preset review_cards \
-  --format jsonl \
-  --limit 200 \
-  --output exports/llm/review_cards.jsonl
+scripts/run_llm_pipeline.sh review-cards-export --limit 200
 ```
 
 LLM writes:
