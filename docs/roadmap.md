@@ -180,9 +180,9 @@ Goal: save-to-learn で終わらせず、辞書ブックマークを継続的に
 
 Status (current sprint):
 
-- [ ] `dictionary_bookmarks` エクスポートCLI（JSONL/CSV）を追加する
-- [ ] 未登録語レビュー向けの抽出条件（`missing_entry=1`）を CLI で指定可能にする
-- [ ] LLM補完の再投入フォーマットを固定し、重複回避ポリシーを実装する
+- [x] `dictionary_bookmarks` エクスポートCLI（JSONL/CSV）を追加する
+- [x] 未登録語レビュー向けの抽出条件（`missing_entry=1`）を CLI で指定可能にする
+- [x] LLM補完の再投入フォーマットを固定し、重複回避ポリシー（`skip/upsert/error`）を実装する
 
 - Add export/query workflow for bookmark reuse:
   - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）

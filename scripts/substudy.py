@@ -4204,6 +4204,388 @@ def run_dict_bookmarks_export(
     )
 
 
+def parse_bool_like(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def load_dict_bookmark_import_rows(input_path: Path, input_format: str) -> list[dict[str, Any]]:
+    if input_format == "jsonl":
+        rows: list[dict[str, Any]] = []
+        with input_path.open("r", encoding="utf-8") as handle:
+            for line_index, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"Invalid JSONL at line {line_index}: {exc}"
+                    ) from exc
+                if not isinstance(parsed, dict):
+                    raise ValueError(
+                        f"Invalid JSONL at line {line_index}: expected object."
+                    )
+                rows.append(parsed)
+        return rows
+
+    if input_format == "csv":
+        rows = []
+        with input_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for parsed in reader:
+                rows.append(dict(parsed))
+        return rows
+
+    raise ValueError("input_format must be jsonl or csv")
+
+
+def normalize_dict_bookmark_import_row(
+    raw_row: dict[str, Any],
+    row_index: int,
+    input_path: Path,
+) -> dict[str, Any]:
+    source_id = str(raw_row.get("source_id") or "").strip()
+    video_id = str(raw_row.get("video_id") or "").strip()
+    track = str(raw_row.get("track") or "").strip()
+    term = str(raw_row.get("term") or "").strip()
+    term_norm = normalize_dictionary_term(raw_row.get("term_norm") or term)
+    lookup_term = str(raw_row.get("lookup_term") or "").strip()
+    definition = str(raw_row.get("definition") or "").strip()
+    dict_source_name = str(raw_row.get("dict_source_name") or "").strip()
+    cue_text = str(raw_row.get("cue_text") or "")
+    missing_entry = parse_bool_like(raw_row.get("missing_entry"), default=False)
+    created_at = str(raw_row.get("created_at") or "").strip() or now_utc_iso()
+    updated_at = str(raw_row.get("updated_at") or "").strip() or now_utc_iso()
+    lookup_path_label = str(raw_row.get("lookup_path_label") or "").strip()
+
+    if not source_id:
+        raise ValueError(f"{input_path}:{row_index}: source_id is required.")
+    if not video_id:
+        raise ValueError(f"{input_path}:{row_index}: video_id is required.")
+    if not term:
+        raise ValueError(f"{input_path}:{row_index}: term is required.")
+    if not term_norm:
+        raise ValueError(f"{input_path}:{row_index}: term_norm is required.")
+
+    try:
+        cue_start_ms = int(raw_row.get("cue_start_ms"))
+        cue_end_ms = int(raw_row.get("cue_end_ms"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{input_path}:{row_index}: cue_start_ms and cue_end_ms must be integers."
+        ) from exc
+
+    if cue_end_ms < cue_start_ms:
+        cue_start_ms, cue_end_ms = cue_end_ms, cue_start_ms
+    cue_start_ms = max(0, cue_start_ms)
+    cue_end_ms = max(cue_start_ms, cue_end_ms)
+
+    raw_lookup_path = raw_row.get("lookup_path")
+    if raw_lookup_path in (None, ""):
+        raw_lookup_path_json = raw_row.get("lookup_path_json")
+        if raw_lookup_path_json not in (None, ""):
+            if isinstance(raw_lookup_path_json, str):
+                try:
+                    raw_lookup_path = json.loads(raw_lookup_path_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{input_path}:{row_index}: lookup_path_json is invalid JSON."
+                    ) from exc
+            else:
+                raw_lookup_path = raw_lookup_path_json
+
+    lookup_path = normalize_dictionary_lookup_path(raw_lookup_path)
+    if not lookup_path:
+        base_term = lookup_term or term
+        base_norm = normalize_dictionary_term(base_term)
+        if base_term or base_norm:
+            lookup_path = [
+                {
+                    "level": 1,
+                    "term": base_term or base_norm,
+                    "term_norm": base_norm,
+                    "source": "import",
+                }
+            ]
+    if not lookup_path_label:
+        lookup_path_label = build_dictionary_lookup_path_label(lookup_path)
+
+    if missing_entry:
+        dict_entry_id = make_missing_dict_entry_id(term_norm)
+        if not definition:
+            definition = "辞書エントリが見つかりません。"
+        if not lookup_term:
+            lookup_term = term
+    else:
+        try:
+            dict_entry_id = int(raw_row.get("dict_entry_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{input_path}:{row_index}: dict_entry_id must be a positive integer for known entries."
+            ) from exc
+        if dict_entry_id <= 0:
+            raise ValueError(
+                f"{input_path}:{row_index}: dict_entry_id must be a positive integer for known entries."
+            )
+        if not definition:
+            raise ValueError(f"{input_path}:{row_index}: definition is required.")
+
+    lookup_path_json = ""
+    if lookup_path:
+        lookup_path_json = json.dumps(lookup_path, ensure_ascii=False, separators=(",", ":"))
+
+    return {
+        "source_id": source_id,
+        "video_id": video_id,
+        "track": track,
+        "cue_start_ms": cue_start_ms,
+        "cue_end_ms": cue_end_ms,
+        "cue_text": cue_text,
+        "dict_entry_id": dict_entry_id,
+        "dict_source_name": dict_source_name,
+        "lookup_term": lookup_term,
+        "term": term,
+        "term_norm": term_norm,
+        "definition": definition,
+        "missing_entry": 1 if missing_entry else 0,
+        "lookup_path_json": lookup_path_json,
+        "lookup_path_label": lookup_path_label,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def run_dict_bookmarks_import(
+    db_path: Path,
+    source_ids: list[str],
+    input_path: Path,
+    input_format: str,
+    on_duplicate: str,
+    dry_run: bool,
+) -> None:
+    if input_format not in {"jsonl", "csv"}:
+        raise ValueError("input_format must be jsonl or csv")
+    if on_duplicate not in {"skip", "upsert", "error"}:
+        raise ValueError("on_duplicate must be skip/upsert/error")
+    if not input_path.exists() or not input_path.is_file():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    raw_rows = load_dict_bookmark_import_rows(input_path, input_format)
+    if not raw_rows:
+        print(f"[dict-bookmarks-import] no rows in {input_path}")
+        return
+
+    allowed_sources = set(source_ids)
+    seen_composites: set[tuple[Any, ...]] = set()
+
+    connection = sqlite3.connect(str(db_path))
+    connection.row_factory = sqlite3.Row
+    create_schema(connection)
+
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        for row_index, raw_row in enumerate(raw_rows, start=1):
+            try:
+                record = normalize_dict_bookmark_import_row(raw_row, row_index, input_path)
+            except ValueError as exc:
+                errors += 1
+                print(f"[dict-bookmarks-import] row {row_index}: {exc}", file=sys.stderr)
+                continue
+
+            if allowed_sources and record["source_id"] not in allowed_sources:
+                skipped += 1
+                continue
+
+            composite_key = (
+                record["source_id"],
+                record["video_id"],
+                record["track"],
+                record["cue_start_ms"],
+                record["cue_end_ms"],
+                record["dict_entry_id"],
+            )
+            if composite_key in seen_composites and on_duplicate == "skip":
+                skipped += 1
+                continue
+            seen_composites.add(composite_key)
+
+            existing = connection.execute(
+                """
+                SELECT
+                    id,
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    cue_text,
+                    dict_entry_id,
+                    dict_source_name,
+                    lookup_term,
+                    term,
+                    term_norm,
+                    definition,
+                    missing_entry,
+                    lookup_path_json,
+                    lookup_path_label,
+                    created_at,
+                    updated_at
+                FROM dictionary_bookmarks
+                WHERE source_id = ?
+                  AND video_id = ?
+                  AND track = ?
+                  AND cue_start_ms = ?
+                  AND cue_end_ms = ?
+                  AND dict_entry_id = ?
+                LIMIT 1
+                """,
+                composite_key,
+            ).fetchone()
+
+            if existing is None:
+                inserted += 1
+                if dry_run:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO dictionary_bookmarks (
+                        source_id,
+                        video_id,
+                        track,
+                        cue_start_ms,
+                        cue_end_ms,
+                        cue_text,
+                        dict_entry_id,
+                        dict_source_name,
+                        lookup_term,
+                        term,
+                        term_norm,
+                        definition,
+                        missing_entry,
+                        lookup_path_json,
+                        lookup_path_label,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["source_id"],
+                        record["video_id"],
+                        record["track"],
+                        record["cue_start_ms"],
+                        record["cue_end_ms"],
+                        record["cue_text"],
+                        record["dict_entry_id"],
+                        record["dict_source_name"],
+                        record["lookup_term"],
+                        record["term"],
+                        record["term_norm"],
+                        record["definition"],
+                        record["missing_entry"],
+                        record["lookup_path_json"],
+                        record["lookup_path_label"],
+                        record["created_at"],
+                        record["updated_at"],
+                    ),
+                )
+                continue
+
+            if on_duplicate == "error":
+                errors += 1
+                print(
+                    "[dict-bookmarks-import] "
+                    f"row {row_index}: duplicate composite key exists id={existing['id']}",
+                    file=sys.stderr,
+                )
+                continue
+            if on_duplicate == "skip":
+                skipped += 1
+                continue
+
+            # upsert mode: avoid destructive overwrite by keeping non-empty existing values.
+            merged_missing = int(existing["missing_entry"])
+            if int(record["missing_entry"]) == 0:
+                merged_missing = 0
+            merged_definition = str(record["definition"] or "").strip() or str(existing["definition"] or "")
+            if merged_missing == 1 and str(existing["definition"] or "").strip() and merged_definition == "辞書エントリが見つかりません。":
+                merged_definition = str(existing["definition"])
+            merged_cue_text = str(record["cue_text"] or "") or str(existing["cue_text"] or "")
+            merged_dict_source_name = str(record["dict_source_name"] or "").strip() or str(existing["dict_source_name"] or "")
+            merged_lookup_term = str(record["lookup_term"] or "").strip() or str(existing["lookup_term"] or "")
+            merged_lookup_path_json = (
+                str(record["lookup_path_json"] or "")
+                if str(record["lookup_path_json"] or "")
+                else str(existing["lookup_path_json"] or "")
+            )
+            merged_lookup_path_label = (
+                str(record["lookup_path_label"] or "").strip()
+                if str(record["lookup_path_label"] or "").strip()
+                else str(existing["lookup_path_label"] or "")
+            )
+
+            updated += 1
+            if dry_run:
+                continue
+            connection.execute(
+                """
+                UPDATE dictionary_bookmarks
+                SET
+                    cue_text = ?,
+                    dict_source_name = ?,
+                    lookup_term = ?,
+                    term = ?,
+                    term_norm = ?,
+                    definition = ?,
+                    missing_entry = ?,
+                    lookup_path_json = ?,
+                    lookup_path_label = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    merged_cue_text,
+                    merged_dict_source_name,
+                    merged_lookup_term,
+                    record["term"],
+                    record["term_norm"],
+                    merged_definition,
+                    merged_missing,
+                    merged_lookup_path_json,
+                    merged_lookup_path_label,
+                    now_utc_iso(),
+                    int(existing["id"]),
+                ),
+            )
+    finally:
+        if dry_run:
+            connection.rollback()
+        else:
+            connection.commit()
+        connection.close()
+
+    print(
+        "[dict-bookmarks-import] "
+        f"rows={len(raw_rows)} inserted={inserted} updated={updated} skipped={skipped} "
+        f"errors={errors} dry_run={str(dry_run).lower()} input={input_path}"
+    )
+
+
 def resolve_output_path(path_value: Path | None, default_path: Path) -> Path:
     if path_value is None:
         return default_path
@@ -6026,6 +6408,37 @@ def parse_args() -> argparse.Namespace:
         help="Output file path. Defaults to exports/dictionary_bookmarks_<status>_<utc>.<format>",
     )
 
+    dict_bookmarks_import_parser = subparsers.add_parser(
+        "dict-bookmarks-import",
+        help="Import dictionary bookmarks from JSONL/CSV with duplicate policy control",
+    )
+    dict_bookmarks_import_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    dict_bookmarks_import_parser.add_argument("--source", action="append", dest="sources")
+    dict_bookmarks_import_parser.add_argument("--ledger-db", type=Path)
+    dict_bookmarks_import_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Input file path (JSONL/CSV).",
+    )
+    dict_bookmarks_import_parser.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="Input format (default: jsonl)",
+    )
+    dict_bookmarks_import_parser.add_argument(
+        "--on-duplicate",
+        choices=["skip", "upsert", "error"],
+        default="upsert",
+        help="Duplicate composite-key behavior (default: upsert)",
+    )
+    dict_bookmarks_import_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and report without writing DB changes.",
+    )
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -6179,6 +6592,18 @@ def main() -> int:
             entry_status=entry_status,
             limit=max(0, int(args.limit)),
             video_ids=args.video_ids,
+        )
+        return 0
+
+    if args.command == "dict-bookmarks-import":
+        input_path = resolve_output_path(args.input, args.input)
+        run_dict_bookmarks_import(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            input_path=input_path,
+            input_format=str(args.format).strip().lower(),
+            on_duplicate=str(args.on_duplicate).strip().lower(),
+            dry_run=bool(args.dry_run),
         )
         return 0
 
