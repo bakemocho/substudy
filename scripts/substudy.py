@@ -898,6 +898,13 @@ def sync_source(
 
     subs_before_ids = set(read_archive_ids(source.subs_archive))
     if not skip_subs:
+        bootstrap_missing_sub_ids: list[str] = []
+        if connection is not None and not dry_run:
+            bootstrap_missing_sub_ids = get_subtitle_missing_bootstrap_ids(
+                connection=connection,
+                source_id=source.id,
+            )
+
         if metadata_candidate_ids is not None:
             subtitle_candidate_ids = []
             seen_subtitle_candidates: set[str] = set()
@@ -908,6 +915,10 @@ def sync_source(
                 subtitle_candidate_ids.append(video_id)
         else:
             subtitle_candidate_ids = list(new_media_ids)
+        for video_id in bootstrap_missing_sub_ids:
+            if video_id in subtitle_candidate_ids:
+                continue
+            subtitle_candidate_ids.append(video_id)
 
         local_sub_ids = set(scan_subtitles(source).keys())
         missing_sub_ids = [
@@ -963,6 +974,7 @@ def sync_source(
             print(
                 f"subtitle targets=0 success=0 failed=0 "
                 f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                 f"deferred={len(deferred_sub_ids)})"
             )
         else:
@@ -971,6 +983,7 @@ def sync_source(
                 print(
                     f"subtitle targets (dry-run): {len(subtitle_target_ids)} "
                     f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                     f"deferred={len(deferred_sub_ids)})"
                 )
             else:
@@ -1100,6 +1113,7 @@ def sync_source(
                     f"subtitle targets={len(subtitle_target_ids)} "
                     f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
                     f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                     f"deferred={len(deferred_sub_ids)})"
                 )
     else:
@@ -2888,6 +2902,32 @@ def get_media_no_audio_bootstrap_ids(
     return [str(row[0]) for row in rows]
 
 
+def get_subtitle_missing_bootstrap_ids(
+    connection: sqlite3.Connection,
+    source_id: str,
+    limit: int = 200,
+) -> list[str]:
+    rows = connection.execute(
+        """
+        SELECT v.video_id
+        FROM videos v
+        LEFT JOIN download_state d
+          ON d.source_id = v.source_id
+         AND d.stage = 'subs'
+         AND d.video_id = v.video_id
+        WHERE v.source_id = ?
+          AND v.has_media = 1
+          AND COALESCE(v.media_path, '') != ''
+          AND COALESCE(v.has_subtitles, 0) = 0
+          AND COALESCE(d.status, '') != 'error'
+        ORDER BY COALESCE(v.upload_date, '') DESC, v.video_id DESC
+        LIMIT ?
+        """,
+        (source_id, limit),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def get_default_backfill_start(source: SourceConfig) -> int:
     if source.backfill_start is not None:
         return source.backfill_start
@@ -3225,7 +3265,21 @@ def run_asr(
 
             has_valid_output = False
             if output_path_value not in (None, ""):
-                has_valid_output = Path(str(output_path_value)).exists()
+                output_path = Path(str(output_path_value))
+                if output_path.exists():
+                    output_size = -1
+                    try:
+                        output_size = output_path.stat().st_size
+                    except OSError:
+                        output_size = -1
+                    if output_size > 0:
+                        has_valid_output = True
+                    elif ffprobe_bin:
+                        has_audio_stream, _ = detect_audio_stream(
+                            media_path=media_path,
+                            ffprobe_bin=ffprobe_bin,
+                        )
+                        has_valid_output = has_audio_stream is False
 
             should_run = force or not (status == "success" and has_valid_output)
             if not should_run:
