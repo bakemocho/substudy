@@ -93,6 +93,17 @@ Output:
 
 - `exports/llm/translation_qa.jsonl`
 
+### Relationship Between A4 and A5
+
+- Shared input: both A4 (`review_hints`) and A5 (`translation_qa`) are generated from `exports/llm/review_cards.jsonl`.
+- Different purpose:
+  - A4 improves learning flow with concise EN/JA hints.
+  - A5 flags potential EN/JA mismatch risk with `qa_result`.
+- Join key: both outputs should be attachable to the same review card by `card_id`.
+- UI usage policy:
+  - Show A4 hints as study support when present.
+  - Show A5 only as warning/review signal (especially when `qa_result=check`).
+
 ## 3. Import-Safe Schema (Critical)
 
 `dict-bookmarks-import` requires stricter fields than a generic LLM payload.

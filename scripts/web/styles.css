@@ -1070,6 +1070,20 @@ textarea {
   color: #b6caef;
 }
 
+.workspace-item-hint {
+  margin: 0;
+  font-size: 0.76rem;
+  line-height: 1.3;
+}
+
+.workspace-item-hint.ja {
+  color: #c7d7ff;
+}
+
+.workspace-item-hint.en {
+  color: #b8cff6;
+}
+
 .workspace-item-meta {
   margin: 0;
   font-size: 0.73rem;

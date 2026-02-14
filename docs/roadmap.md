@@ -243,10 +243,16 @@ Status (minimum implementation):
 - [ ] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
 - [ ] import結果サマリ表示（inserted/updated/skipped/errors）
 - [ ] artifact行からの実操作（open/download）
-- [ ] `review_hints.jsonl` を復習カード表示へ接続（`card_id` joinで hint を表示）
+- [x] `review_hints.jsonl` を復習カード表示へ接続（`card_id` joinで hint を表示）
 - [ ] `translation_qa.jsonl` を復習/missing表示へ接続（`qa_result=check` を警告表示）
 - [ ] artifact種別判定に `review_hints` / `translation_qa` を追加
 - [ ] 4.6向けの軽量回帰テスト追加
+
+Ticket TODO (execution order):
+
+- [x] `4.6-01` review hints 接続: `/api/workspace` で `review_hints.jsonl` を `card_id` joinし、復習カードに one-line JA/EN hint を表示
+- [ ] `4.6-02` translation QA 接続: `translation_qa.jsonl` の `qa_result=check` を復習/missingカードへ警告表示
+- [ ] `4.6-03` artifact改善: `review_hints` / `translation_qa` の種別判定と artifact 行の open/download 操作
 
 Intermediate artifact connectivity audit (2026-02-15):
 

@@ -6083,6 +6083,63 @@ def collect_workspace_artifacts(
     return rows
 
 
+def load_workspace_review_hints(root_dir: Path) -> dict[str, dict[str, str]]:
+    hints_path = root_dir / "exports" / "llm" / "review_hints.jsonl"
+    if not hints_path.exists() or not hints_path.is_file():
+        return {}
+
+    hints_by_card_id: dict[str, dict[str, str]] = {}
+    try:
+        with hints_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                card_id = str(parsed.get("card_id") or "").strip()
+                if not card_id:
+                    continue
+                hint_payload: dict[str, str] = {}
+                for key in (
+                    "one_line_hint_ja",
+                    "one_line_hint_en",
+                    "common_mistake",
+                    "memory_hook",
+                ):
+                    value = str(parsed.get(key) or "").strip()
+                    if value:
+                        hint_payload[key] = value
+                if hint_payload:
+                    hints_by_card_id[card_id] = hint_payload
+    except OSError:
+        return {}
+    return hints_by_card_id
+
+
+def apply_workspace_review_hints(
+    review_cards: list[dict[str, Any]],
+    hints_by_card_id: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    if not review_cards or not hints_by_card_id:
+        return review_cards
+    for card in review_cards:
+        card_id = str(card.get("card_id") or "").strip()
+        if not card_id:
+            continue
+        hint_payload = hints_by_card_id.get(card_id)
+        if not hint_payload:
+            continue
+        for key, value in hint_payload.items():
+            if value:
+                card[key] = value
+    return review_cards
+
+
 def collect_workspace_review_and_missing_rows(
     connection: sqlite3.Connection,
     source_ids: list[str],
@@ -7028,6 +7085,8 @@ def build_web_handler(
                     run_limit=run_limit,
                     pending_limit=pending_limit,
                 )
+            review_hints_by_card_id = load_workspace_review_hints(workspace_root)
+            review_cards = apply_workspace_review_hints(review_cards, review_hints_by_card_id)
 
             artifacts = collect_workspace_artifacts(
                 root_dir=workspace_root,

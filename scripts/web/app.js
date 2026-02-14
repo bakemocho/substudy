@@ -6431,6 +6431,17 @@ function renderWorkspaceReviewItem(item) {
   def.className = "workspace-item-definition";
   def.textContent = truncateText(String(item?.definition || ""), 180);
 
+  const hintJaText = truncateText(String(item?.one_line_hint_ja || ""), 180);
+  const hintEnText = truncateText(String(item?.one_line_hint_en || ""), 180);
+
+  const hintJa = document.createElement("p");
+  hintJa.className = "workspace-item-hint ja";
+  hintJa.textContent = hintJaText ? `hint(ja): ${hintJaText}` : "";
+
+  const hintEn = document.createElement("p");
+  hintEn.className = "workspace-item-hint en";
+  hintEn.textContent = hintEnText ? `hint(en): ${hintEnText}` : "";
+
   const meta = document.createElement("p");
   meta.className = "workspace-item-meta";
   meta.textContent = `${String(item?.cue_start_label || "--:--")} - ${String(item?.cue_end_label || "--:--")} • ${String(item?.source_id || "")} • ${String(item?.video_id || "")}`;
@@ -6450,6 +6461,12 @@ function renderWorkspaceReviewItem(item) {
   }
   if (def.textContent) {
     row.appendChild(def);
+  }
+  if (hintJa.textContent) {
+    row.appendChild(hintJa);
+  }
+  if (hintEn.textContent) {
+    row.appendChild(hintEn);
   }
   row.appendChild(meta);
   row.appendChild(action);
