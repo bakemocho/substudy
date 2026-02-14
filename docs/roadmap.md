@@ -187,6 +187,10 @@ Status (current sprint):
 - [x] term履歴の集計指標（再遭遇回数・復習優先度）を明文化して curated 出力へ組み込む
 - [x] EN/JA復習カード形式（timestamp link付き）の最終フォーマットを固定する
 
+Operational guide:
+
+- `docs/llm-work-items.md` (LLM委譲タスクの優先度・入出力契約・品質チェック・再投入ポリシー)
+
 - Add export/query workflow for bookmark reuse:
   - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）
   - LLM投入用の安定フォーマット（JSONL or CSV）を用意
@@ -218,6 +222,36 @@ Acceptance:
 - ブックマークDBからLLM入力用データを再現可能に抽出できる。
 - 未登録語の補完結果を再投入しても重複/破壊が起きない。
 - 学習カード出力がワンクリック相当で再生成できる。
+
+Clarification (scope boundary):
+
+- `4.5` は「学習データの中間生成物（export/curate/import/LLM連携）まで」を完了範囲とする。
+- 生成物を直接使う専用UI（復習カード画面、ダウンロード管理画面、LLM補完結果ブラウザ）は未実装。
+
+## 4.6) Next: learning workspace UI (4.5生成物の活用)
+
+Goal: `4.5` で作れるデータを、web上でそのまま学習アクションに変換する。
+
+- Add review workspace panel/card in web UI:
+  - queue from `review_cards` equivalent view
+  - EN/JA + term + concise definition + priority
+  - one-click jump to cue (`local_jump_url` 相当)
+- Add "missing entry review" panel:
+  - `missing_entry=1` を優先表示
+  - LLM補完待ち / 補完済み / 要再確認 の状態表示
+- Add lightweight download/run monitor card:
+  - recent `download_runs` summary
+  - pending failures (`download_state.status='error'`) quick view
+- Add saved output browser card:
+  - recent curate/export artifacts (`missing_review`, `frequent_terms`, `review_cards`)
+  - import結果の要約表示（inserted/updated/skipped/errors）
+
+Acceptance:
+
+- 動画再生画面だけでなく、復習開始の入口がweb上に存在する。
+- `4.5` 生成物をCLIなしで確認・ジャンプ・復習できる。
+- 補完待ち語（missing）をweb上で追跡できる。
+- ダウンロード失敗の存在をweb上で把握できる。
 
 ## 5) Next: similar-scene suggestion via cue embeddings
 
