@@ -174,7 +174,7 @@ Acceptance:
 - click-pin / outside-click / `Esc` clear behavior is deterministic.
 - Existing subtitle hover behavior remains intact.
 
-## 4.5) In progress: dictionary bookmark knowledge pipeline (LLM参照・知識集積・教材化)
+## 4.5) Done (baseline): dictionary bookmark knowledge pipeline (LLM参照・知識集積・教材化)
 
 Goal: save-to-learn で終わらせず、辞書ブックマークを継続的に学習資産化する。
 
@@ -184,8 +184,8 @@ Status (current sprint):
 - [x] 未登録語レビュー向けの抽出条件（`missing_entry=1`）を CLI で指定可能にする
 - [x] LLM補完の再投入フォーマットを固定し、重複回避ポリシー（`skip/upsert/error`）を実装する
 - [x] 用途別の curated 出力（`missing_review` / `frequent_terms` / `recent_saved`）をCLI化する
-- [ ] term履歴の集計指標（再遭遇回数・復習優先度）を明文化して curated 出力へ組み込む
-- [ ] EN/JA復習カード形式（timestamp link付き）の最終フォーマットを固定する
+- [x] term履歴の集計指標（再遭遇回数・復習優先度）を明文化して curated 出力へ組み込む
+- [x] EN/JA復習カード形式（timestamp link付き）の最終フォーマットを固定する
 
 - Add export/query workflow for bookmark reuse:
   - `dictionary_bookmarks` から用途別に抽出（未登録語 / 頻出語 / 文脈つき）
@@ -200,6 +200,18 @@ Status (current sprint):
   - 復習カード（EN/JA + cue + timestamp link）
   - 「未登録語レビュー」バッチ
   - 学習セッション用の curated list（難語/頻出/最近保存）
+
+Current spec (implemented):
+
+- `review_priority` heuristic:
+  - `1.2 * reencounter_count + 0.8 * (video_count - 1) + 1.5 * missing_count + 0.1 * min(days_since_last, 30)`
+- `review_cards` fixed fields:
+  - `card_format_version`, `card_id`, `source_id`, `video_id`
+  - `cue_start_ms`, `cue_end_ms`, `cue_start_label`, `cue_end_label`
+  - `cue_en_text`, `cue_ja_text`
+  - `term`, `term_norm`, `lookup_term`, `definition`, `missing_entry`, `lookup_path_label`
+  - `bookmark_count`, `video_count`, `reencounter_count`, `review_priority`
+  - `local_jump_url`, `webpage_url`, `created_at`, `updated_at`
 
 Acceptance:
 

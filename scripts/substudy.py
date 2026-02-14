@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
     import tomllib
@@ -104,6 +104,53 @@ class SourceConfig:
 
 def now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_iso_datetime_utc(raw_value: Any) -> dt.datetime | None:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def compute_review_priority_score(
+    bookmark_count: int,
+    video_count: int,
+    missing_count: int,
+    last_seen_at: str,
+    now_utc: dt.datetime | None = None,
+) -> float:
+    safe_bookmark_count = max(0, int(bookmark_count))
+    safe_video_count = max(0, int(video_count))
+    safe_missing_count = max(0, int(missing_count))
+    reencounter_count = max(0, safe_bookmark_count - 1)
+    now_value = now_utc or dt.datetime.now(dt.timezone.utc)
+    last_seen_dt = parse_iso_datetime_utc(last_seen_at)
+    if last_seen_dt is None:
+        days_since_last = 30.0
+    else:
+        days_since_last = max(0.0, (now_value - last_seen_dt).total_seconds() / 86400.0)
+
+    # Review priority heuristic:
+    # - repeated encounters raise priority
+    # - cross-video spread raises priority
+    # - missing dictionary entries get extra urgency
+    # - older items slowly regain priority over time
+    score = (
+        (reencounter_count * 1.2)
+        + ((safe_video_count - 1) * 0.8)
+        + (safe_missing_count * 1.5)
+        + (min(30.0, days_since_last) * 0.1)
+    )
+    return round(score, 3)
 
 
 def resolve_path(base: Path, raw_value: str | None, default: str) -> Path:
@@ -4617,6 +4664,71 @@ def run_dict_bookmarks_import(
     )
 
 
+def collect_dictionary_term_history_stats(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    if source_ids:
+        placeholders = ",".join("?" for _ in source_ids)
+        where_clauses.append(f"source_id IN ({placeholders})")
+        params.extend(source_ids)
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            term_norm,
+            MAX(CASE
+                WHEN TRIM(COALESCE(term, '')) != '' THEN term
+                ELSE term_norm
+            END) AS term,
+            COUNT(*) AS bookmark_count,
+            COUNT(DISTINCT source_id || ':' || video_id) AS video_count,
+            SUM(CASE WHEN missing_entry = 1 THEN 1 ELSE 0 END) AS missing_count,
+            MIN(created_at) AS first_seen_at,
+            MAX(updated_at) AS last_seen_at
+        FROM dictionary_bookmarks
+        {where_sql}
+        GROUP BY term_norm
+        """,
+        tuple(params),
+    ).fetchall()
+
+    now_value = dt.datetime.now(dt.timezone.utc)
+    stats_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        term_norm = str(row["term_norm"] or "")
+        bookmark_count = int(row["bookmark_count"] or 0)
+        video_count = int(row["video_count"] or 0)
+        missing_count = int(row["missing_count"] or 0)
+        first_seen_at = str(row["first_seen_at"] or "")
+        last_seen_at = str(row["last_seen_at"] or "")
+        reencounter_count = max(0, bookmark_count - 1)
+        score = compute_review_priority_score(
+            bookmark_count=bookmark_count,
+            video_count=video_count,
+            missing_count=missing_count,
+            last_seen_at=last_seen_at,
+            now_utc=now_value,
+        )
+        stats_map[term_norm] = {
+            "term_norm": term_norm,
+            "term": str(row["term"] or term_norm),
+            "bookmark_count": bookmark_count,
+            "video_count": video_count,
+            "missing_count": missing_count,
+            "reencounter_count": reencounter_count,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "review_priority": score,
+        }
+    return stats_map
+
+
 def run_dict_bookmarks_curate(
     db_path: Path,
     source_ids: list[str],
@@ -4629,8 +4741,8 @@ def run_dict_bookmarks_curate(
 ) -> None:
     if output_format not in {"jsonl", "csv"}:
         raise ValueError("output_format must be jsonl or csv")
-    if preset not in {"missing_review", "frequent_terms", "recent_saved"}:
-        raise ValueError("preset must be missing_review/frequent_terms/recent_saved")
+    if preset not in {"missing_review", "frequent_terms", "recent_saved", "review_cards"}:
+        raise ValueError("preset must be missing_review/frequent_terms/recent_saved/review_cards")
 
     safe_limit = max(1, int(limit))
     safe_min_bookmarks = max(1, int(min_bookmarks))
@@ -4639,109 +4751,169 @@ def run_dict_bookmarks_curate(
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
     try:
+        term_stats = collect_dictionary_term_history_stats(connection, source_ids=source_ids)
         where_clauses: list[str] = []
         params: list[Any] = []
         if source_ids:
             placeholders = ",".join("?" for _ in source_ids)
-            where_clauses.append(f"source_id IN ({placeholders})")
+            where_clauses.append(f"db.source_id IN ({placeholders})")
             params.extend(source_ids)
         if preset == "missing_review":
-            where_clauses.append("missing_entry = 1")
+            where_clauses.append("db.missing_entry = 1")
 
         where_sql = ""
         if where_clauses:
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
         records: list[dict[str, Any]] = []
-        if preset in {"missing_review", "recent_saved"}:
+        if preset in {"missing_review", "recent_saved", "review_cards"}:
             rows = connection.execute(
                 f"""
                 SELECT
-                    id,
-                    source_id,
-                    video_id,
-                    track,
-                    cue_start_ms,
-                    cue_end_ms,
-                    cue_text,
-                    dict_entry_id,
-                    dict_source_name,
-                    lookup_term,
-                    term,
-                    term_norm,
-                    definition,
-                    missing_entry,
-                    lookup_path_json,
-                    lookup_path_label,
-                    created_at,
-                    updated_at
-                FROM dictionary_bookmarks
+                    db.id,
+                    db.source_id,
+                    db.video_id,
+                    db.track,
+                    db.cue_start_ms,
+                    db.cue_end_ms,
+                    db.cue_text,
+                    db.dict_entry_id,
+                    db.dict_source_name,
+                    db.lookup_term,
+                    db.term,
+                    db.term_norm,
+                    db.definition,
+                    db.missing_entry,
+                    db.lookup_path_json,
+                    db.lookup_path_label,
+                    db.created_at,
+                    db.updated_at,
+                    COALESCE(v.webpage_url, '') AS webpage_url
+                FROM dictionary_bookmarks db
+                LEFT JOIN videos v
+                  ON v.source_id = db.source_id
+                 AND v.video_id = db.video_id
                 {where_sql}
-                ORDER BY updated_at DESC, id DESC
+                ORDER BY db.updated_at DESC, db.id DESC
                 LIMIT ?
                 """,
                 (*params, safe_limit),
             ).fetchall()
+
+            ja_cues_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+            def resolve_ja_cues(source_id: str, video_id: str) -> list[dict[str, Any]]:
+                key = (source_id, video_id)
+                if key in ja_cues_cache:
+                    return ja_cues_cache[key]
+                ja_path = resolve_ja_subtitle_path(connection, source_id, video_id)
+                if ja_path is None:
+                    ja_cues_cache[key] = []
+                else:
+                    ja_cues_cache[key] = parse_subtitle_cues(ja_path)
+                return ja_cues_cache[key]
+
             for row in rows:
                 serialized = serialize_dictionary_bookmark_row(row)
-                records.append(
-                    {
-                        "id": serialized["id"],
-                        "source_id": serialized["source_id"],
-                        "video_id": serialized["video_id"],
-                        "track": serialized["track"],
-                        "cue_start_ms": serialized["cue_start_ms"],
-                        "cue_end_ms": serialized["cue_end_ms"],
-                        "cue_start_label": format_ms_to_clock(serialized["cue_start_ms"]),
-                        "cue_end_label": format_ms_to_clock(serialized["cue_end_ms"]),
-                        "cue_text": serialized["cue_text"],
-                        "lookup_term": serialized["lookup_term"],
-                        "term": serialized["term"],
-                        "term_norm": serialized["term_norm"],
-                        "definition": serialized["definition"],
-                        "missing_entry": 1 if serialized["missing_entry"] else 0,
-                        "lookup_path_label": serialized["lookup_path_label"],
-                        "updated_at": serialized["updated_at"],
-                        "created_at": serialized["created_at"],
-                    }
-                )
+                stats = term_stats.get(serialized["term_norm"], {})
+                if preset == "review_cards":
+                    ja_text = find_best_subtitle_text_for_range(
+                        resolve_ja_cues(serialized["source_id"], serialized["video_id"]),
+                        serialized["cue_start_ms"],
+                        serialized["cue_end_ms"],
+                    )
+                    local_jump_url = (
+                        f"http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}/?"
+                        + urlencode(
+                            {
+                                "source_id": serialized["source_id"],
+                                "video_id": serialized["video_id"],
+                                "t": str(max(0, int(round(serialized["cue_start_ms"] / 1000)))),
+                            }
+                        )
+                    )
+                    records.append(
+                        {
+                            "card_format_version": "v1",
+                            "card_id": f"dictbm:{serialized['id']}",
+                            "source_id": serialized["source_id"],
+                            "video_id": serialized["video_id"],
+                            "cue_start_ms": serialized["cue_start_ms"],
+                            "cue_end_ms": serialized["cue_end_ms"],
+                            "cue_start_label": format_ms_to_clock(serialized["cue_start_ms"]),
+                            "cue_end_label": format_ms_to_clock(serialized["cue_end_ms"]),
+                            "cue_en_text": serialized["cue_text"],
+                            "cue_ja_text": ja_text,
+                            "term": serialized["term"],
+                            "term_norm": serialized["term_norm"],
+                            "lookup_term": serialized["lookup_term"],
+                            "definition": serialized["definition"],
+                            "missing_entry": 1 if serialized["missing_entry"] else 0,
+                            "lookup_path_label": serialized["lookup_path_label"],
+                            "bookmark_count": int(stats.get("bookmark_count", 1)),
+                            "video_count": int(stats.get("video_count", 1)),
+                            "reencounter_count": int(stats.get("reencounter_count", 0)),
+                            "review_priority": float(stats.get("review_priority", 0.0)),
+                            "local_jump_url": local_jump_url,
+                            "webpage_url": str(row["webpage_url"] or ""),
+                            "created_at": serialized["created_at"],
+                            "updated_at": serialized["updated_at"],
+                        }
+                    )
+                else:
+                    records.append(
+                        {
+                            "id": serialized["id"],
+                            "source_id": serialized["source_id"],
+                            "video_id": serialized["video_id"],
+                            "track": serialized["track"],
+                            "cue_start_ms": serialized["cue_start_ms"],
+                            "cue_end_ms": serialized["cue_end_ms"],
+                            "cue_start_label": format_ms_to_clock(serialized["cue_start_ms"]),
+                            "cue_end_label": format_ms_to_clock(serialized["cue_end_ms"]),
+                            "cue_text": serialized["cue_text"],
+                            "lookup_term": serialized["lookup_term"],
+                            "term": serialized["term"],
+                            "term_norm": serialized["term_norm"],
+                            "definition": serialized["definition"],
+                            "missing_entry": 1 if serialized["missing_entry"] else 0,
+                            "lookup_path_label": serialized["lookup_path_label"],
+                            "bookmark_count": int(stats.get("bookmark_count", 1)),
+                            "video_count": int(stats.get("video_count", 1)),
+                            "reencounter_count": int(stats.get("reencounter_count", 0)),
+                            "review_priority": float(stats.get("review_priority", 0.0)),
+                            "updated_at": serialized["updated_at"],
+                            "created_at": serialized["created_at"],
+                        }
+                    )
         else:
-            rows = connection.execute(
-                f"""
-                SELECT
-                    term_norm,
-                    MAX(CASE
-                        WHEN TRIM(COALESCE(term, '')) != '' THEN term
-                        ELSE term_norm
-                    END) AS term,
-                    COUNT(*) AS bookmark_count,
-                    COUNT(DISTINCT source_id || ':' || video_id) AS video_count,
-                    SUM(CASE WHEN missing_entry = 1 THEN 1 ELSE 0 END) AS missing_count,
-                    MIN(created_at) AS first_seen_at,
-                    MAX(updated_at) AS last_seen_at
-                FROM dictionary_bookmarks
-                {where_sql}
-                GROUP BY term_norm
-                HAVING COUNT(*) >= ?
-                   AND COUNT(DISTINCT source_id || ':' || video_id) >= ?
-                ORDER BY bookmark_count DESC, video_count DESC, last_seen_at DESC, term_norm ASC
-                LIMIT ?
-                """,
-                (*params, safe_min_bookmarks, safe_min_videos, safe_limit),
-            ).fetchall()
-            for row in rows:
-                bookmark_count = int(row["bookmark_count"])
-                video_count = int(row["video_count"])
+            rows = [
+                stats
+                for stats in term_stats.values()
+                if int(stats.get("bookmark_count", 0)) >= safe_min_bookmarks
+                and int(stats.get("video_count", 0)) >= safe_min_videos
+            ]
+            rows.sort(
+                key=lambda item: (
+                    float(item.get("review_priority", 0.0)),
+                    int(item.get("bookmark_count", 0)),
+                    int(item.get("video_count", 0)),
+                    str(item.get("last_seen_at", "")),
+                ),
+                reverse=True,
+            )
+            for stats in rows[:safe_limit]:
                 records.append(
                     {
-                        "term_norm": str(row["term_norm"] or ""),
-                        "term": str(row["term"] or row["term_norm"] or ""),
-                        "bookmark_count": bookmark_count,
-                        "video_count": video_count,
-                        "missing_count": int(row["missing_count"] or 0),
-                        "first_seen_at": str(row["first_seen_at"] or ""),
-                        "last_seen_at": str(row["last_seen_at"] or ""),
-                        "priority_score": (bookmark_count * 1000) + video_count,
+                        "term_norm": str(stats.get("term_norm") or ""),
+                        "term": str(stats.get("term") or stats.get("term_norm") or ""),
+                        "bookmark_count": int(stats.get("bookmark_count", 0)),
+                        "video_count": int(stats.get("video_count", 0)),
+                        "missing_count": int(stats.get("missing_count", 0)),
+                        "reencounter_count": int(stats.get("reencounter_count", 0)),
+                        "first_seen_at": str(stats.get("first_seen_at", "")),
+                        "last_seen_at": str(stats.get("last_seen_at", "")),
+                        "review_priority": float(stats.get("review_priority", 0.0)),
                     }
                 )
 
@@ -4890,6 +5062,42 @@ def parse_subtitle_cues(subtitle_path: Path) -> list[dict[str, Any]]:
     return cues
 
 
+def find_best_subtitle_text_for_range(
+    cues: list[dict[str, Any]],
+    start_ms: int,
+    end_ms: int,
+) -> str:
+    if not cues:
+        return ""
+    safe_start_ms = max(0, int(start_ms))
+    safe_end_ms = max(safe_start_ms, int(end_ms))
+
+    best_overlap = 0
+    best_text = ""
+    for cue in cues:
+        cue_start = max(0, int(cue.get("start_ms") or 0))
+        cue_end = max(cue_start, int(cue.get("end_ms") or cue_start))
+        overlap = min(safe_end_ms, cue_end) - max(safe_start_ms, cue_start)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_text = str(cue.get("text") or "")
+    if best_text:
+        return best_text
+
+    target_ms = safe_start_ms
+    nearest_text = ""
+    nearest_distance = None
+    for cue in cues:
+        cue_start = max(0, int(cue.get("start_ms") or 0))
+        distance = abs(cue_start - target_ms)
+        if nearest_distance is None or distance < nearest_distance:
+            nearest_distance = distance
+            nearest_text = str(cue.get("text") or "")
+    if nearest_distance is not None and nearest_distance <= 1500:
+        return nearest_text
+    return ""
+
+
 def format_ms_to_clock(total_ms: int) -> str:
     safe_ms = max(0, int(total_ms))
     total_seconds = safe_ms // 1000
@@ -4984,6 +5192,41 @@ def get_track_for_video(
         if track["track_id"] == track_id:
             return track
     return None
+
+
+def resolve_ja_subtitle_path(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+) -> Path | None:
+    row = connection.execute(
+        """
+        SELECT subtitle_path
+        FROM subtitles
+        WHERE source_id = ?
+          AND video_id = ?
+          AND (
+                LOWER(COALESCE(language, '')) = 'ja'
+             OR LOWER(COALESCE(language, '')) LIKE 'ja-%'
+             OR LOWER(COALESCE(subtitle_path, '')) LIKE '%.ja.%'
+          )
+        ORDER BY
+          CASE
+            WHEN LOWER(COALESCE(language, '')) = 'ja' THEN 0
+            WHEN LOWER(COALESCE(language, '')) LIKE 'ja-%' THEN 1
+            ELSE 2
+          END ASC,
+          subtitle_path ASC
+        LIMIT 1
+        """,
+        (source_id, video_id),
+    ).fetchone()
+    if row is None:
+        return None
+    path = Path(str(row[0]))
+    if not path.exists() or not path.is_file():
+        return None
+    return path
 
 
 def serialize_bookmark_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
@@ -6617,7 +6860,7 @@ def parse_args() -> argparse.Namespace:
     dict_bookmarks_curate_parser.add_argument("--ledger-db", type=Path)
     dict_bookmarks_curate_parser.add_argument(
         "--preset",
-        choices=["missing_review", "frequent_terms", "recent_saved"],
+        choices=["missing_review", "frequent_terms", "recent_saved", "review_cards"],
         required=True,
         help="Curated view preset to materialize.",
     )
