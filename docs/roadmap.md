@@ -228,9 +228,22 @@ Clarification (scope boundary):
 - `4.5` は「学習データの中間生成物（export/curate/import/LLM連携）まで」を完了範囲とする。
 - 生成物を直接使う専用UI（復習カード画面、ダウンロード管理画面、LLM補完結果ブラウザ）は未実装。
 
-## 4.6) Next: learning workspace UI (4.5生成物の活用)
+## 4.6) In progress: learning workspace UI (4.5生成物の活用)
 
 Goal: `4.5` で作れるデータを、web上でそのまま学習アクションに変換する。
+
+Status (minimum implementation):
+
+- [x] `/api/workspace` 集約APIを追加（review/missing/download monitor/artifacts）
+- [x] 復習ワークスペースカードを追加（review queue / one-click jump）
+- [x] 未登録語レビューカードを追加（`missing_entry=1` 一覧）
+- [x] 運用モニタカードを追加（recent `download_runs` + pending failures）
+- [x] 生成物カードを追加（`exports/` の最近ファイル一覧）
+- [x] 「このキューへ」ジャンプのフィルタ回避を実装（必要時に `字幕状態=all` へフォールバック）
+- [ ] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
+- [ ] import結果サマリ表示（inserted/updated/skipped/errors）
+- [ ] artifact行からの実操作（open/download）
+- [ ] 4.6向けの軽量回帰テスト追加
 
 - Add review workspace panel/card in web UI:
   - queue from `review_cards` equivalent view

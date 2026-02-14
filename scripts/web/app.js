@@ -25,6 +25,12 @@ const DICT_PREFETCH_BATCH_SIZE = 12;
 const DICT_PREFETCH_BATCH_DELAY_MS = 32;
 const DICT_PREFETCH_START_DELAY_MS = 90;
 const DICT_POPUP_Z_BASE = 30;
+const WORKSPACE_REVIEW_LIMIT = 24;
+const WORKSPACE_MISSING_LIMIT = 20;
+const WORKSPACE_RUN_LIMIT = 10;
+const WORKSPACE_PENDING_LIMIT = 20;
+const WORKSPACE_ARTIFACT_LIMIT = 24;
+const WORKSPACE_SINCE_HOURS = 72;
 const PLAYER_CARD_SNAP_THRESHOLD_PX = 22;
 const PLAYER_CARD_SNAP_RELEASE_DELTA = 180;
 const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
@@ -171,6 +177,11 @@ const state = {
     }
     return "all";
   })(),
+  workspaceReviewCards: [],
+  workspaceMissingEntries: [],
+  workspaceDownloadMonitor: null,
+  workspaceArtifacts: [],
+  workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
 };
 
@@ -222,6 +233,14 @@ const elements = {
   bookmarkRangeBtn: document.getElementById("bookmarkRangeBtn"),
   bookmarkNoteInput: document.getElementById("bookmarkNoteInput"),
   rangeStatus: document.getElementById("rangeStatus"),
+  workspaceRefreshBtn: document.getElementById("workspaceRefreshBtn"),
+  workspaceSummary: document.getElementById("workspaceSummary"),
+  workspaceReviewList: document.getElementById("workspaceReviewList"),
+  workspaceMissingList: document.getElementById("workspaceMissingList"),
+  workspaceDownloadSummary: document.getElementById("workspaceDownloadSummary"),
+  workspaceDownloadRuns: document.getElementById("workspaceDownloadRuns"),
+  workspacePendingFailures: document.getElementById("workspacePendingFailures"),
+  workspaceArtifacts: document.getElementById("workspaceArtifacts"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
@@ -313,6 +332,40 @@ function formatTimeMs(value) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatShortIso(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) {
+    return text;
+  }
+  const year = parsed.getFullYear();
+  const month = String(parsed.getMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getDate()).padStart(2, "0");
+  const hour = String(parsed.getHours()).padStart(2, "0");
+  const minute = String(parsed.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hour}:${minute}`;
+}
+
+function formatBytesShort(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) {
+    return "";
+  }
+  if (size < 1024) {
+    return `${Math.round(size)} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  if (size < 1024 * 1024 * 1024) {
+    return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 function updateAutoplayToggle() {
@@ -2509,6 +2562,7 @@ async function toggleDictionaryBookmark(payload) {
   if (keyFromBookmark && keyFromBookmark !== keyFromPayload) {
     syncDictionaryBookmarkButtonsForKey(keyFromBookmark);
   }
+  loadWorkspaceData({ silent: true }).catch(() => {});
   return {
     status,
     bookmark,
@@ -6235,6 +6289,357 @@ async function removeBookmark(bookmarkId) {
   setStatus("ブックマークを削除しました。", "ok");
 }
 
+function resetWorkspaceState() {
+  state.workspaceReviewCards = [];
+  state.workspaceMissingEntries = [];
+  state.workspaceDownloadMonitor = null;
+  state.workspaceArtifacts = [];
+}
+
+function renderWorkspaceList(container, items, renderItem, emptyMessage) {
+  if (!container) {
+    return;
+  }
+  container.textContent = "";
+  if (!Array.isArray(items) || items.length <= 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = emptyMessage;
+    container.appendChild(empty);
+    return;
+  }
+  for (const item of items) {
+    const row = renderItem(item);
+    if (row) {
+      container.appendChild(row);
+    }
+  }
+}
+
+function buildWorkspaceJumpMeta(item) {
+  const sourceId = String(item?.source_id || "");
+  const videoId = String(item?.video_id || "");
+  const cueStartMs = Number(item?.cue_start_ms);
+  const cueStartSec = Number.isFinite(cueStartMs) ? Math.max(0, Math.round(cueStartMs / 1000)) : 0;
+  return { sourceId, videoId, cueStartSec };
+}
+
+async function jumpToWorkspaceCue(item) {
+  const { sourceId, videoId, cueStartSec } = buildWorkspaceJumpMeta(item);
+  if (!sourceId || !videoId) {
+    return;
+  }
+  const jumpLabel = `復習キューへジャンプ: ${sourceId} ${formatTimeMs(Math.round(cueStartSec * 1000))}`;
+  const findTargetIndex = () => state.videos.findIndex(
+    (video) => String(video?.source_id || "") === sourceId && String(video?.video_id || "") === videoId
+  );
+  const currentMatchesTarget = () => {
+    const current = currentVideo();
+    return Boolean(
+      current
+      && String(current.source_id || "") === sourceId
+      && String(current.video_id || "") === videoId
+    );
+  };
+
+  let targetIndex = findTargetIndex();
+  if (targetIndex >= 0) {
+    await openVideo(targetIndex, true, "push", cueStartSec);
+    setStatus(jumpLabel, "ok");
+    return;
+  }
+
+  const attempts = [];
+  const pushAttempt = (attemptSourceId, attemptFilter, note) => {
+    const key = `${String(attemptSourceId || "")}::${String(attemptFilter || "")}`;
+    if (attempts.some((attempt) => attempt.key === key)) {
+      return;
+    }
+    attempts.push({
+      key,
+      sourceId: String(attemptSourceId || ""),
+      translationFilter: normalizeTranslationFilter(attemptFilter, "all"),
+      note: String(note || ""),
+    });
+  };
+
+  const currentSourceFilter = String(elements.sourceSelect?.value || "").trim();
+  pushAttempt(currentSourceFilter, state.translationFilter, "");
+  pushAttempt(sourceId, state.translationFilter, "");
+  pushAttempt("", state.translationFilter, "");
+  if (state.translationFilter !== "all") {
+    pushAttempt(sourceId, "all", "字幕状態フィルタを all に切替");
+    pushAttempt("", "all", "字幕状態フィルタを all に切替");
+  }
+
+  for (const attempt of attempts) {
+    await loadFeed(
+      attempt.sourceId,
+      false,
+      videoId,
+      attempt.translationFilter,
+      cueStartSec
+    );
+    targetIndex = findTargetIndex();
+    if (targetIndex >= 0) {
+      await openVideo(targetIndex, true, "push", cueStartSec);
+      const statusMessage = attempt.note ? `${jumpLabel} (${attempt.note})` : jumpLabel;
+      setStatus(statusMessage, "ok");
+      return;
+    }
+    if (currentMatchesTarget()) {
+      const statusMessage = attempt.note ? `${jumpLabel} (${attempt.note})` : jumpLabel;
+      setStatus(statusMessage, "ok");
+      return;
+    }
+  }
+
+  if (state.translationFilter !== "all") {
+    throw new Error("対象動画が現在フィルタに含まれません。字幕状態を「全動画」にすると移動できます。");
+  }
+  throw new Error("対象動画が現在のフィード条件で見つかりません。");
+}
+
+function renderWorkspaceReviewItem(item) {
+  const row = document.createElement("article");
+  row.className = "workspace-item";
+
+  const head = document.createElement("div");
+  head.className = "workspace-item-head";
+
+  const title = document.createElement("p");
+  title.className = "workspace-item-title";
+  const term = String(item?.lookup_term || item?.term || "(term)");
+  title.textContent = term;
+
+  const score = document.createElement("span");
+  score.className = "workspace-badge";
+  score.textContent = `P:${Number(item?.review_priority || 0).toFixed(2)}`;
+
+  head.appendChild(title);
+  head.appendChild(score);
+
+  const cue = document.createElement("p");
+  cue.className = "workspace-item-cue en";
+  cue.textContent = String(item?.cue_en_text || "(英語字幕なし)");
+
+  const ja = document.createElement("p");
+  ja.className = "workspace-item-cue ja";
+  ja.textContent = String(item?.cue_ja_text || "");
+
+  const def = document.createElement("p");
+  def.className = "workspace-item-definition";
+  def.textContent = truncateText(String(item?.definition || ""), 180);
+
+  const meta = document.createElement("p");
+  meta.className = "workspace-item-meta";
+  meta.textContent = `${String(item?.cue_start_label || "--:--")} - ${String(item?.cue_end_label || "--:--")} • ${String(item?.source_id || "")} • ${String(item?.video_id || "")}`;
+
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "workspace-jump-btn";
+  action.textContent = "このキューへ";
+  action.addEventListener("click", () => {
+    jumpToWorkspaceCue(item).catch((error) => setStatus(error.message, "error"));
+  });
+
+  row.appendChild(head);
+  row.appendChild(cue);
+  if (ja.textContent) {
+    row.appendChild(ja);
+  }
+  if (def.textContent) {
+    row.appendChild(def);
+  }
+  row.appendChild(meta);
+  row.appendChild(action);
+  return row;
+}
+
+function renderWorkspaceMissingItem(item) {
+  const row = document.createElement("article");
+  row.className = "workspace-item";
+
+  const head = document.createElement("div");
+  head.className = "workspace-item-head";
+
+  const title = document.createElement("p");
+  title.className = "workspace-item-title";
+  title.textContent = String(item?.lookup_term || item?.term || "(missing)");
+
+  const badge = document.createElement("span");
+  badge.className = "workspace-badge missing";
+  badge.textContent = "missing";
+
+  head.appendChild(title);
+  head.appendChild(badge);
+
+  const cue = document.createElement("p");
+  cue.className = "workspace-item-cue en";
+  cue.textContent = String(item?.cue_en_text || "(英語字幕なし)");
+
+  const meta = document.createElement("p");
+  meta.className = "workspace-item-meta";
+  meta.textContent = `${String(item?.cue_start_label || "--:--")} • ${String(item?.source_id || "")} • ${String(item?.video_id || "")}`;
+
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "workspace-jump-btn";
+  action.textContent = "確認する";
+  action.addEventListener("click", () => {
+    jumpToWorkspaceCue(item).catch((error) => setStatus(error.message, "error"));
+  });
+
+  row.appendChild(head);
+  row.appendChild(cue);
+  row.appendChild(meta);
+  row.appendChild(action);
+  return row;
+}
+
+function renderWorkspaceDownloadRuns() {
+  renderWorkspaceList(
+    elements.workspaceDownloadRuns,
+    state.workspaceDownloadMonitor?.recent_runs || [],
+    (run) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      title.textContent = `${String(run?.stage || "")} • ${String(run?.status || "")} • ${String(run?.source_id || "")}`;
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      meta.textContent = `${formatShortIso(run?.started_at)} • ok:${Number(run?.success_count || 0)} / ng:${Number(run?.failure_count || 0)}`;
+
+      row.appendChild(title);
+      row.appendChild(meta);
+      return row;
+    },
+    "直近の実行履歴はありません。"
+  );
+}
+
+function renderWorkspacePendingFailures() {
+  renderWorkspaceList(
+    elements.workspacePendingFailures,
+    state.workspaceDownloadMonitor?.pending_failures || [],
+    (failure) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      title.textContent = `failure • ${String(failure?.source_id || "")}/${String(failure?.video_id || "")}`;
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      meta.textContent = `${String(failure?.stage || "")} • retry:${Number(failure?.retry_count || 0)} • ${formatShortIso(failure?.updated_at)}`;
+
+      row.appendChild(title);
+      row.appendChild(meta);
+      return row;
+    },
+    "保留中の失敗はありません。"
+  );
+}
+
+function renderWorkspaceArtifacts() {
+  renderWorkspaceList(
+    elements.workspaceArtifacts,
+    state.workspaceArtifacts || [],
+    (artifact) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      title.textContent = `${String(artifact?.kind || "artifact")} • ${String(artifact?.name || "")}`;
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      const sizeLabel = formatBytesShort(artifact?.size_bytes);
+      meta.textContent = `${String(artifact?.relative_path || "")} • ${sizeLabel} • ${formatShortIso(artifact?.updated_at)}`;
+
+      row.appendChild(title);
+      row.appendChild(meta);
+      return row;
+    },
+    "生成物がまだありません。"
+  );
+}
+
+function renderWorkspacePanels() {
+  const reviewCount = Array.isArray(state.workspaceReviewCards) ? state.workspaceReviewCards.length : 0;
+  const missingCount = Array.isArray(state.workspaceMissingEntries) ? state.workspaceMissingEntries.length : 0;
+  const pendingCount = Number(state.workspaceDownloadMonitor?.pending_count || 0);
+
+  if (elements.workspaceSummary) {
+    elements.workspaceSummary.textContent = `review:${reviewCount} • missing:${missingCount} • pending:${pendingCount}`;
+  }
+  if (elements.workspaceDownloadSummary) {
+    const sinceHours = Number(state.workspaceDownloadMonitor?.since_hours || WORKSPACE_SINCE_HOURS);
+    const recentRuns = Array.isArray(state.workspaceDownloadMonitor?.recent_runs)
+      ? state.workspaceDownloadMonitor.recent_runs.length
+      : 0;
+    elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} / pending=${pendingCount}`;
+  }
+
+  renderWorkspaceList(
+    elements.workspaceReviewList,
+    state.workspaceReviewCards,
+    (item) => renderWorkspaceReviewItem(item),
+    "復習キューはまだありません。"
+  );
+  renderWorkspaceList(
+    elements.workspaceMissingList,
+    state.workspaceMissingEntries,
+    (item) => renderWorkspaceMissingItem(item),
+    "未登録語はありません。"
+  );
+  renderWorkspaceDownloadRuns();
+  renderWorkspacePendingFailures();
+  renderWorkspaceArtifacts();
+}
+
+async function loadWorkspaceData(options = {}) {
+  const { silent = false } = options;
+  if (!elements.workspaceReviewList || !elements.workspaceMissingList) {
+    return;
+  }
+
+  const requestToken = state.workspaceLoadToken + 1;
+  state.workspaceLoadToken = requestToken;
+  if (!silent && elements.workspaceSummary) {
+    elements.workspaceSummary.textContent = "復習データを読み込み中...";
+  }
+
+  const params = new URLSearchParams({
+    review_limit: String(WORKSPACE_REVIEW_LIMIT),
+    missing_limit: String(WORKSPACE_MISSING_LIMIT),
+    run_limit: String(WORKSPACE_RUN_LIMIT),
+    pending_limit: String(WORKSPACE_PENDING_LIMIT),
+    artifact_limit: String(WORKSPACE_ARTIFACT_LIMIT),
+    since_hours: String(WORKSPACE_SINCE_HOURS),
+  });
+  const sourceId = String(elements.sourceSelect?.value || "").trim();
+  if (sourceId) {
+    params.set("source_id", sourceId);
+  }
+
+  const payload = await apiRequest(`/api/workspace?${params.toString()}`);
+  if (requestToken !== state.workspaceLoadToken) {
+    return;
+  }
+
+  state.workspaceReviewCards = Array.isArray(payload.review_cards) ? payload.review_cards : [];
+  state.workspaceMissingEntries = Array.isArray(payload.missing_entries) ? payload.missing_entries : [];
+  state.workspaceDownloadMonitor = payload.download_monitor || null;
+  state.workspaceArtifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
+  renderWorkspacePanels();
+}
+
 async function openVideo(index, autoplay = true, historyMode = "push", startTimeSec = null) {
   if (!state.videos.length) {
     return;
@@ -6362,6 +6767,8 @@ async function loadFeed(
     state.subtitlePanelActiveIndex = -1;
     renderSubtitlePanelLoading("動画がありません。");
     renderBookmarkList();
+    resetWorkspaceState();
+    renderWorkspacePanels();
     setStatus("条件に一致する動画がありません。", "error");
     return;
   }
@@ -6380,6 +6787,11 @@ async function loadFeed(
   resetPlaybackTracking(initialIndex);
   const initialPlaybackTimeSec = usedPreferredVideo ? preferredPlaybackTimeSec : null;
   await openVideo(initialIndex, true, "keep", initialPlaybackTimeSec);
+  loadWorkspaceData({ silent: true }).catch((error) => {
+    if (elements.workspaceSummary) {
+      elements.workspaceSummary.textContent = `復習データ読み込み失敗: ${error.message}`;
+    }
+  });
   if (serverFilterMismatch) {
     setStatus(
       `${state.videos.length}件の動画を読み込みました。和訳フィルタはローカル適用です（Webサーバー再起動推奨）。`,
@@ -7137,6 +7549,18 @@ function bindEvents() {
       resetControlsToggleFade();
     });
   }
+  if (elements.workspaceRefreshBtn) {
+    elements.workspaceRefreshBtn.addEventListener("click", () => {
+      loadWorkspaceData({ silent: false })
+        .then(() => {
+          setStatus("復習ワークスペースを更新しました。", "ok");
+        })
+        .catch((error) => {
+          setStatus(error.message, "error");
+        });
+      resetControlsToggleFade();
+    });
+  }
 
   elements.autoplayToggle.addEventListener("click", () => {
     state.autoplayContinuous = !state.autoplayContinuous;
@@ -7356,6 +7780,8 @@ async function initialize() {
   loadVolumeSettings();
   updateVideoProgressTimer();
   updatePlayPauseButton();
+  resetWorkspaceState();
+  renderWorkspacePanels();
   bindEvents();
 
   try {

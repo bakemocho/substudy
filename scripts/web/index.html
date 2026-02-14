@@ -111,6 +111,39 @@
             </details>
           </article>
 
+          <article class="card workspace-review-card">
+            <div class="workspace-card-head">
+              <h3>復習ワークスペース</h3>
+              <button id="workspaceRefreshBtn" class="workspace-refresh-btn" type="button">更新</button>
+            </div>
+            <p id="workspaceSummary" class="hint">復習データを読み込み中...</p>
+
+            <div class="workspace-section">
+              <p class="workspace-section-title">復習キュー</p>
+              <div id="workspaceReviewList" class="workspace-list"></div>
+            </div>
+
+            <div class="workspace-section">
+              <p class="workspace-section-title">未登録語レビュー</p>
+              <div id="workspaceMissingList" class="workspace-list"></div>
+            </div>
+          </article>
+
+          <article class="card workspace-monitor-card">
+            <h3>運用モニタ</h3>
+            <div class="workspace-section">
+              <p class="workspace-section-title">Download 状況</p>
+              <p id="workspaceDownloadSummary" class="hint">読み込み中...</p>
+              <div id="workspaceDownloadRuns" class="workspace-list compact"></div>
+              <div id="workspacePendingFailures" class="workspace-list compact"></div>
+            </div>
+
+            <div class="workspace-section">
+              <p class="workspace-section-title">最近の生成物</p>
+              <div id="workspaceArtifacts" class="workspace-list compact"></div>
+            </div>
+          </article>
+
           <article class="card">
             <h3>動画メモ</h3>
             <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>

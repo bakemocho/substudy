@@ -6023,12 +6023,317 @@ def serialize_dictionary_bookmark_row(
     }
 
 
+def _infer_workspace_artifact_kind(path: Path) -> str:
+    name = path.name.lower()
+    if "missing_review" in name:
+        return "missing_review"
+    if "review_cards" in name:
+        return "review_cards"
+    if "frequent_terms" in name:
+        return "frequent_terms"
+    if "recent_saved" in name:
+        return "recent_saved"
+    if "translation" in name:
+        return "translation"
+    if "import" in name:
+        return "import"
+    return "artifact"
+
+
+def collect_workspace_artifacts(
+    root_dir: Path,
+    limit: int,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, int(limit))
+    exports_dir = root_dir / "exports"
+    if not exports_dir.exists() or not exports_dir.is_dir():
+        return []
+
+    candidates: list[tuple[float, Path, int]] = []
+    for glob_pattern in ("**/*.jsonl", "**/*.csv", "**/*.txt", "**/*.log", "**/*.json"):
+        for path in exports_dir.glob(glob_pattern):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            candidates.append((float(stat.st_mtime), path, int(stat.st_size)))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    rows: list[dict[str, Any]] = []
+    for modified_epoch, path, size_bytes in candidates[:safe_limit]:
+        try:
+            relative_path = str(path.relative_to(root_dir))
+        except ValueError:
+            relative_path = str(path.name)
+        updated_at = dt.datetime.fromtimestamp(
+            modified_epoch,
+            tz=dt.timezone.utc,
+        ).replace(microsecond=0).isoformat()
+        rows.append(
+            {
+                "name": path.name,
+                "relative_path": relative_path,
+                "kind": _infer_workspace_artifact_kind(path),
+                "size_bytes": size_bytes,
+                "updated_at": updated_at,
+            }
+        )
+    return rows
+
+
+def collect_workspace_review_and_missing_rows(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    review_limit: int,
+    missing_limit: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    safe_review_limit = max(1, int(review_limit))
+    safe_missing_limit = max(1, int(missing_limit))
+    scan_limit = max(safe_review_limit * 10, safe_missing_limit * 10, 320)
+
+    where_clauses: list[str] = []
+    params: list[Any] = []
+    if source_ids:
+        placeholders = ",".join("?" for _ in source_ids)
+        where_clauses.append(f"db.source_id IN ({placeholders})")
+        params.extend(source_ids)
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            db.id,
+            db.source_id,
+            db.video_id,
+            db.track,
+            db.cue_start_ms,
+            db.cue_end_ms,
+            db.cue_text,
+            db.dict_entry_id,
+            db.dict_source_name,
+            db.lookup_term,
+            db.term,
+            db.term_norm,
+            db.definition,
+            db.missing_entry,
+            db.lookup_path_json,
+            db.lookup_path_label,
+            db.created_at,
+            db.updated_at,
+            COALESCE(v.webpage_url, '') AS webpage_url
+        FROM dictionary_bookmarks db
+        LEFT JOIN videos v
+          ON v.source_id = db.source_id
+         AND v.video_id = db.video_id
+        {where_sql}
+        ORDER BY db.updated_at DESC, db.id DESC
+        LIMIT ?
+        """,
+        (*params, scan_limit),
+    ).fetchall()
+    if not rows:
+        return ([], [])
+
+    term_stats = collect_dictionary_term_history_stats(connection, source_ids=source_ids)
+
+    selected_review: list[dict[str, Any]] = []
+    selected_missing: list[dict[str, Any]] = []
+    for row in rows:
+        serialized = serialize_dictionary_bookmark_row(row)
+        serialized["webpage_url"] = str(row["webpage_url"] or "")
+        if len(selected_review) < safe_review_limit:
+            selected_review.append(serialized)
+        if serialized["missing_entry"] and len(selected_missing) < safe_missing_limit:
+            selected_missing.append(serialized)
+        if len(selected_review) >= safe_review_limit and len(selected_missing) >= safe_missing_limit:
+            break
+
+    ja_cues_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    def resolve_ja_cues_for_workspace(source_id: str, video_id: str) -> list[dict[str, Any]]:
+        key = (source_id, video_id)
+        if key in ja_cues_cache:
+            return ja_cues_cache[key]
+        ja_path = resolve_ja_subtitle_path(connection, source_id, video_id)
+        if ja_path is None:
+            ja_cues_cache[key] = []
+        else:
+            ja_cues_cache[key] = parse_subtitle_cues(ja_path)
+        return ja_cues_cache[key]
+
+    def to_workspace_card(serialized: dict[str, Any], include_card_id: bool) -> dict[str, Any]:
+        term_norm = str(serialized.get("term_norm") or "")
+        stats = term_stats.get(term_norm, {})
+        cue_start_ms = int(serialized["cue_start_ms"])
+        cue_end_ms = int(serialized["cue_end_ms"])
+        card = {
+            "source_id": str(serialized["source_id"]),
+            "video_id": str(serialized["video_id"]),
+            "track": str(serialized.get("track") or ""),
+            "cue_start_ms": cue_start_ms,
+            "cue_end_ms": cue_end_ms,
+            "cue_start_label": format_ms_to_clock(cue_start_ms),
+            "cue_end_label": format_ms_to_clock(cue_end_ms),
+            "cue_en_text": str(serialized.get("cue_text") or ""),
+            "cue_ja_text": find_best_subtitle_text_for_range(
+                resolve_ja_cues_for_workspace(
+                    str(serialized["source_id"]),
+                    str(serialized["video_id"]),
+                ),
+                cue_start_ms,
+                cue_end_ms,
+            ),
+            "term": str(serialized.get("term") or ""),
+            "term_norm": term_norm,
+            "lookup_term": str(serialized.get("lookup_term") or ""),
+            "definition": str(serialized.get("definition") or ""),
+            "missing_entry": 1 if bool(serialized.get("missing_entry")) else 0,
+            "lookup_path_label": str(serialized.get("lookup_path_label") or ""),
+            "bookmark_count": int(stats.get("bookmark_count", 1)),
+            "video_count": int(stats.get("video_count", 1)),
+            "reencounter_count": int(stats.get("reencounter_count", 0)),
+            "review_priority": float(stats.get("review_priority", 0.0)),
+            "local_jump_url": (
+                "/?"
+                + urlencode(
+                    {
+                        "source_id": str(serialized["source_id"]),
+                        "video_id": str(serialized["video_id"]),
+                        "t": str(max(0, int(round(cue_start_ms / 1000)))),
+                    }
+                )
+            ),
+            "webpage_url": str(serialized.get("webpage_url") or ""),
+            "created_at": str(serialized.get("created_at") or ""),
+            "updated_at": str(serialized.get("updated_at") or ""),
+        }
+        if include_card_id:
+            card["card_id"] = f"dictbm:{int(serialized['id'])}"
+        else:
+            card["id"] = int(serialized["id"])
+        return card
+
+    review_cards = [to_workspace_card(item, include_card_id=True) for item in selected_review]
+    missing_cards = [to_workspace_card(item, include_card_id=False) for item in selected_missing]
+    return (review_cards, missing_cards)
+
+
+def collect_workspace_download_monitor(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    since_hours: int,
+    run_limit: int,
+    pending_limit: int,
+) -> dict[str, Any]:
+    safe_hours = max(1, int(since_hours))
+    safe_run_limit = max(1, int(run_limit))
+    safe_pending_limit = max(1, int(pending_limit))
+    since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=safe_hours)
+    since_iso = since_dt.replace(microsecond=0).isoformat()
+
+    source_filter_sql_runs = ""
+    source_filter_sql_pending = ""
+    source_params: list[Any] = []
+    if source_ids:
+        placeholders = ",".join("?" for _ in source_ids)
+        source_filter_sql_runs = f"AND source_id IN ({placeholders})"
+        source_filter_sql_pending = f"AND source_id IN ({placeholders})"
+        source_params = list(source_ids)
+
+    recent_runs = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            started_at,
+            stage,
+            status,
+            COALESCE(target_count, 0) AS target_count,
+            COALESCE(success_count, 0) AS success_count,
+            COALESCE(failure_count, 0) AS failure_count,
+            COALESCE(exit_code, 0) AS exit_code,
+            COALESCE(error_message, '') AS error_message
+        FROM download_runs
+        WHERE started_at >= ?
+          {source_filter_sql_runs}
+        ORDER BY started_at DESC, run_id DESC
+        LIMIT ?
+        """,
+        (since_iso, *source_params, safe_run_limit),
+    ).fetchall()
+
+    pending_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            stage,
+            video_id,
+            retry_count,
+            COALESCE(next_retry_at, '') AS next_retry_at,
+            COALESCE(last_error, '') AS last_error,
+            updated_at
+        FROM download_state
+        WHERE status = 'error'
+          {source_filter_sql_pending}
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (*source_params, safe_pending_limit),
+    ).fetchall()
+
+    pending_count_row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS pending_count
+        FROM download_state
+        WHERE status = 'error'
+          {source_filter_sql_pending}
+        """,
+        tuple(source_params),
+    ).fetchone()
+    pending_count = int(pending_count_row["pending_count"]) if pending_count_row else 0
+
+    return {
+        "since_hours": safe_hours,
+        "recent_runs": [
+            {
+                "source_id": str(row["source_id"] or ""),
+                "started_at": str(row["started_at"] or ""),
+                "stage": str(row["stage"] or ""),
+                "status": str(row["status"] or ""),
+                "target_count": int(row["target_count"] or 0),
+                "success_count": int(row["success_count"] or 0),
+                "failure_count": int(row["failure_count"] or 0),
+                "exit_code": int(row["exit_code"] or 0),
+                "error_message": str(row["error_message"] or ""),
+            }
+            for row in recent_runs
+        ],
+        "pending_failures": [
+            {
+                "source_id": str(row["source_id"] or ""),
+                "stage": str(row["stage"] or ""),
+                "video_id": str(row["video_id"] or ""),
+                "retry_count": int(row["retry_count"] or 0),
+                "next_retry_at": str(row["next_retry_at"] or ""),
+                "last_error": str(row["last_error"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+            }
+            for row in pending_rows
+        ],
+        "pending_count": pending_count,
+    }
+
+
 def build_web_handler(
     db_path: Path,
     static_dir: Path,
     allowed_source_ids: set[str],
 ) -> type[BaseHTTPRequestHandler]:
     static_root = static_dir.resolve()
+    workspace_root = db_path.resolve().parent.parent
 
     class SubstudyWebHandler(BaseHTTPRequestHandler):
         server_version = "SubstudyWeb/0.1"
@@ -6660,6 +6965,84 @@ def build_web_handler(
                 }
             )
 
+        def _handle_api_workspace(self, query: dict[str, list[str]]) -> None:
+            source_filter = self._normalize_source(query.get("source_id", [None])[0])
+            if source_filter and not self._is_source_allowed(source_filter):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            review_limit = clamp_int(
+                query.get("review_limit", [None])[0],
+                default=24,
+                minimum=1,
+                maximum=160,
+            )
+            missing_limit = clamp_int(
+                query.get("missing_limit", [None])[0],
+                default=20,
+                minimum=1,
+                maximum=160,
+            )
+            run_limit = clamp_int(
+                query.get("run_limit", [None])[0],
+                default=10,
+                minimum=1,
+                maximum=80,
+            )
+            pending_limit = clamp_int(
+                query.get("pending_limit", [None])[0],
+                default=20,
+                minimum=1,
+                maximum=200,
+            )
+            since_hours = clamp_int(
+                query.get("since_hours", [None])[0],
+                default=72,
+                minimum=1,
+                maximum=24 * 30,
+            )
+            artifact_limit = clamp_int(
+                query.get("artifact_limit", [None])[0],
+                default=24,
+                minimum=1,
+                maximum=240,
+            )
+
+            source_scope: list[str] = []
+            if source_filter:
+                source_scope = [source_filter]
+            elif allowed_source_ids:
+                source_scope = sorted(allowed_source_ids)
+
+            with self._open_connection() as connection:
+                review_cards, missing_entries = collect_workspace_review_and_missing_rows(
+                    connection=connection,
+                    source_ids=source_scope,
+                    review_limit=review_limit,
+                    missing_limit=missing_limit,
+                )
+                download_monitor = collect_workspace_download_monitor(
+                    connection=connection,
+                    source_ids=source_scope,
+                    since_hours=since_hours,
+                    run_limit=run_limit,
+                    pending_limit=pending_limit,
+                )
+
+            artifacts = collect_workspace_artifacts(
+                root_dir=workspace_root,
+                limit=artifact_limit,
+            )
+            self._send_json(
+                {
+                    "source_id": source_filter or "",
+                    "review_cards": review_cards,
+                    "missing_entries": missing_entries,
+                    "download_monitor": download_monitor,
+                    "artifacts": artifacts,
+                }
+            )
+
         def _handle_api_toggle_dictionary_bookmark(self) -> None:
             try:
                 payload = self._read_json_body()
@@ -7199,6 +7582,9 @@ def build_web_handler(
                     return
                 if path == "/api/dictionary-bookmarks":
                     self._handle_api_dictionary_bookmarks_get(query)
+                    return
+                if path == "/api/workspace":
+                    self._handle_api_workspace(query)
                     return
                 self._send_error_json(404, "Not found.")
             except BrokenPipeError:
