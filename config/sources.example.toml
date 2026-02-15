@@ -4,6 +4,7 @@ base_data_dir = "~/substudy-data"
 # Generate/update once: yt-dlp --cookies-from-browser chrome --cookies ~/.local/share/substudy/cookies.txt "https://www.tiktok.com"
 # cookies_file = "~/.local/share/substudy/cookies.txt"
 cookies_from_browser = "chrome"
+# Primary video format. If this yields no audio stream, sync will try audio donor mux fallback.
 video_format = "bv*+ba/best"
 sub_langs = "en.*,en,und"
 sub_format = "vtt/ttml/best"

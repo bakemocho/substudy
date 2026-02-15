@@ -48,6 +48,9 @@ via `.github/workflows/privacy-check.yml`.
     `yt-dlp --cookies-from-browser chrome --cookies ~/.local/share/substudy/cookies.txt "https://www.tiktok.com"`
 - `media_archive` / `subs_archive`
   - If missing, `sync` bootstraps archive IDs from existing local files to avoid repeated re-fetch attempts.
+- `video_format`
+  - Primary media download format.
+  - If the primary file has no audio stream, `sync` keeps that video, fetches an audio donor with `-f download`, and muxes audio locally via `ffmpeg` (`-shortest`) so output duration follows the primary video length.
 - `asr_*`
   - ASR is primary subtitle pipeline.
   - `asr_command` can use local Whisper CLI (no OpenAI API key required).
@@ -59,7 +62,7 @@ via `.github/workflows/privacy-check.yml`.
   - One row per sync stage execution (`media`, `subs`, `meta`) with status and counts.
 - `download_state` table:
   - Per-video latest status for each stage.
-- Failed `meta` and `subs` items are auto-retried in later `sync` runs with exponential backoff.
+- Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
 - Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
 

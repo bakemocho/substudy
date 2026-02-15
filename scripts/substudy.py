@@ -678,23 +678,25 @@ def sync_source(
             evaluated_media_ids.append(video_id)
 
         ffprobe_bin = shutil.which("ffprobe")
+        ffmpeg_bin = shutil.which("ffmpeg")
+        media_fallback_work_dir = source.media_dir / ".audio_fallback"
 
-        def run_media_fallback_download(
+        def run_media_primary_download(
             video_id: str,
             output_path: Path | None,
         ) -> tuple[Path | None, str | None]:
             video_url = safe_video_url(video_id)
             if video_url is None:
-                return None, "cannot build video URL for fallback"
+                return None, "cannot build video URL for primary download"
 
-            fallback_command = [
+            primary_command = [
                 source.ytdlp_bin,
                 *cookie_flags,
                 "--continue",
                 "--force-overwrites",
                 *retry_flags,
                 "-f",
-                "download",
+                source.video_format,
                 "-o",
                 (
                     str(output_path)
@@ -705,21 +707,125 @@ def sync_source(
                 video_url,
             ]
             try:
-                fallback_exit_code = run_command(
-                    fallback_command,
+                primary_exit_code = run_command(
+                    primary_command,
                     dry_run=False,
                     raise_on_error=False,
                 )
             except Exception as exc:
-                return None, f"audio fallback command exception: {exc}"
+                return None, f"primary download command exception: {exc}"
 
-            if fallback_exit_code != 0:
-                return None, f"audio fallback command exit code {fallback_exit_code}"
+            if primary_exit_code != 0:
+                return None, f"primary download command exit code {primary_exit_code}"
 
             refreshed_media_path = find_media_file_for_video(source, video_id)
             if refreshed_media_path is None or not refreshed_media_path.exists():
-                return None, "media file missing after fallback download"
+                return None, "media file missing after primary download"
             return refreshed_media_path, None
+
+        def run_media_audio_fallback_merge(
+            video_id: str,
+            media_path: Path,
+        ) -> tuple[Path | None, str | None]:
+            if ffmpeg_bin is None:
+                return None, "ffmpeg not found for audio fallback merge"
+
+            video_url = safe_video_url(video_id)
+            if video_url is None:
+                return None, "cannot build video URL for audio fallback"
+
+            media_fallback_work_dir.mkdir(parents=True, exist_ok=True)
+            donor_media_path = media_fallback_work_dir / f"{video_id}.donor.mp4"
+            merged_temp_path = media_fallback_work_dir / f"{video_id}.merged.tmp.mp4"
+            merged_output_path = (
+                media_path
+                if media_path.suffix.lower() == ".mp4"
+                else media_path.with_suffix(".mp4")
+            )
+
+            fallback_command = [
+                source.ytdlp_bin,
+                *cookie_flags,
+                "--continue",
+                "--force-overwrites",
+                *retry_flags,
+                "-f",
+                "download",
+                "-o",
+                str(donor_media_path),
+                "--no-playlist",
+                video_url,
+            ]
+
+            try:
+                try:
+                    fallback_exit_code = run_command(
+                        fallback_command,
+                        dry_run=False,
+                        raise_on_error=False,
+                    )
+                except Exception as exc:
+                    return None, f"audio fallback command exception: {exc}"
+
+                if fallback_exit_code != 0:
+                    return None, f"audio fallback command exit code {fallback_exit_code}"
+                if not donor_media_path.exists():
+                    return None, "audio fallback donor file missing after download"
+
+                merge_command = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    str(media_path),
+                    "-i",
+                    str(donor_media_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    str(merged_temp_path),
+                ]
+                completed = subprocess.run(
+                    merge_command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if completed.returncode != 0:
+                    merged_output = f"{completed.stderr}\n{completed.stdout}".strip()
+                    message = merged_output.splitlines()[-1].strip() if merged_output else ""
+                    return None, message or f"ffmpeg exited with code {completed.returncode}"
+
+                try:
+                    if merged_output_path != media_path and merged_output_path.exists():
+                        merged_output_path.unlink()
+                    merged_temp_path.replace(merged_output_path)
+                    if merged_output_path != media_path and media_path.exists():
+                        media_path.unlink()
+                except OSError as exc:
+                    return None, f"failed to replace merged media file: {exc}"
+
+                if not merged_output_path.exists():
+                    return None, "merged media file missing after audio fallback merge"
+                return merged_output_path, None
+            finally:
+                if donor_media_path.exists():
+                    try:
+                        donor_media_path.unlink()
+                    except OSError:
+                        pass
+                if merged_temp_path.exists():
+                    try:
+                        merged_temp_path.unlink()
+                    except OSError:
+                        pass
 
         if not dry_run and media_audio_target_ids and ffprobe_bin is not None:
             for video_id in media_audio_target_ids:
@@ -729,12 +835,12 @@ def sync_source(
 
                 media_path = find_media_file_for_video(source, video_id)
                 if media_path is None or not media_path.exists():
-                    media_path, fallback_error = run_media_fallback_download(video_id, None)
-                    if fallback_error is not None:
-                        media_audio_fallback_failures[video_id] = fallback_error
+                    media_path, primary_error = run_media_primary_download(video_id, None)
+                    if primary_error is not None:
+                        media_audio_fallback_failures[video_id] = primary_error
                         print(
-                            f"[media] {source.id}/{video_id}: audio fallback failed "
-                            f"({fallback_error})",
+                            f"[media] {source.id}/{video_id}: primary download failed "
+                            f"({primary_error})",
                             file=sys.stderr,
                         )
                         continue
@@ -753,7 +859,7 @@ def sync_source(
                     )
                     continue
 
-                media_path_after, fallback_error = run_media_fallback_download(video_id, media_path)
+                media_path_after, fallback_error = run_media_audio_fallback_merge(video_id, media_path)
                 if fallback_error is not None:
                     media_audio_fallback_failures[video_id] = fallback_error
                     print(
@@ -772,7 +878,7 @@ def sync_source(
                     repaired_media_ids.add(video_id)
                     print(
                         f"[media] {source.id}/{video_id}: recovered audio stream "
-                        "(format=download)"
+                        "(format=download+mux)"
                     )
                     continue
 
