@@ -28,6 +28,7 @@ const DICT_POPUP_Z_BASE = 30;
 const WORKSPACE_REVIEW_LIMIT = 24;
 const WORKSPACE_MISSING_LIMIT = 20;
 const WORKSPACE_RUN_LIMIT = 10;
+const WORKSPACE_IMPORT_RUN_LIMIT = 6;
 const WORKSPACE_PENDING_LIMIT = 20;
 const WORKSPACE_ARTIFACT_LIMIT = 24;
 const WORKSPACE_SINCE_HOURS = 72;
@@ -180,6 +181,7 @@ const state = {
   workspaceReviewCards: [],
   workspaceMissingEntries: [],
   workspaceDownloadMonitor: null,
+  workspaceImportMonitor: null,
   workspaceArtifacts: [],
   workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
@@ -240,6 +242,8 @@ const elements = {
   workspaceDownloadSummary: document.getElementById("workspaceDownloadSummary"),
   workspaceDownloadRuns: document.getElementById("workspaceDownloadRuns"),
   workspacePendingFailures: document.getElementById("workspacePendingFailures"),
+  workspaceImportSummary: document.getElementById("workspaceImportSummary"),
+  workspaceImportRuns: document.getElementById("workspaceImportRuns"),
   workspaceArtifacts: document.getElementById("workspaceArtifacts"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
@@ -6293,6 +6297,7 @@ function resetWorkspaceState() {
   state.workspaceReviewCards = [];
   state.workspaceMissingEntries = [];
   state.workspaceDownloadMonitor = null;
+  state.workspaceImportMonitor = null;
   state.workspaceArtifacts = [];
 }
 
@@ -6497,7 +6502,15 @@ function renderWorkspaceMissingItem(item) {
 
   const badge = document.createElement("span");
   badge.className = "workspace-badge missing";
-  badge.textContent = "missing";
+  const missingStatus = String(item?.missing_status || "pending").trim().toLowerCase();
+  if (missingStatus === "enriched") {
+    badge.classList.add("missing-enriched");
+  } else if (missingStatus === "needs_review") {
+    badge.classList.add("missing-needs-review");
+  } else {
+    badge.classList.add("missing-pending");
+  }
+  badge.textContent = String(item?.missing_status_label || "LLM補完待ち");
 
   head.appendChild(title);
   head.appendChild(badge);
@@ -6584,6 +6597,31 @@ function renderWorkspacePendingFailures() {
   );
 }
 
+function renderWorkspaceImportRuns() {
+  renderWorkspaceList(
+    elements.workspaceImportRuns,
+    state.workspaceImportMonitor?.recent_runs || [],
+    (run) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      const status = String(run?.status || "");
+      title.textContent = `import • ${status} • dry_run:${run?.dry_run ? "yes" : "no"}`;
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      meta.textContent = `i:${Number(run?.inserted_count || 0)} / u:${Number(run?.updated_count || 0)} / s:${Number(run?.skipped_count || 0)} / e:${Number(run?.error_count || 0)} • rows:${Number(run?.row_count || 0)} • ${formatShortIso(run?.finished_at)}`;
+
+      row.appendChild(title);
+      row.appendChild(meta);
+      return row;
+    },
+    "import履歴はありません。"
+  );
+}
+
 function renderWorkspaceArtifacts() {
   renderWorkspaceList(
     elements.workspaceArtifacts,
@@ -6639,9 +6677,22 @@ function renderWorkspacePanels() {
   const reviewCount = Array.isArray(state.workspaceReviewCards) ? state.workspaceReviewCards.length : 0;
   const missingCount = Array.isArray(state.workspaceMissingEntries) ? state.workspaceMissingEntries.length : 0;
   const pendingCount = Number(state.workspaceDownloadMonitor?.pending_count || 0);
+  let missingPendingCount = 0;
+  let missingEnrichedCount = 0;
+  let missingNeedsReviewCount = 0;
+  for (const item of state.workspaceMissingEntries || []) {
+    const status = String(item?.missing_status || "pending").trim().toLowerCase();
+    if (status === "enriched") {
+      missingEnrichedCount += 1;
+    } else if (status === "needs_review") {
+      missingNeedsReviewCount += 1;
+    } else {
+      missingPendingCount += 1;
+    }
+  }
 
   if (elements.workspaceSummary) {
-    elements.workspaceSummary.textContent = `review:${reviewCount} • missing:${missingCount} • pending:${pendingCount}`;
+    elements.workspaceSummary.textContent = `review:${reviewCount} • missing:${missingCount}(待:${missingPendingCount} 済:${missingEnrichedCount} 再:${missingNeedsReviewCount}) • pending:${pendingCount}`;
   }
   if (elements.workspaceDownloadSummary) {
     const sinceHours = Number(state.workspaceDownloadMonitor?.since_hours || WORKSPACE_SINCE_HOURS);
@@ -6649,6 +6700,14 @@ function renderWorkspacePanels() {
       ? state.workspaceDownloadMonitor.recent_runs.length
       : 0;
     elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} / pending=${pendingCount}`;
+  }
+  if (elements.workspaceImportSummary) {
+    const latest = state.workspaceImportMonitor?.latest || null;
+    if (!latest) {
+      elements.workspaceImportSummary.textContent = "import履歴はありません。";
+    } else {
+      elements.workspaceImportSummary.textContent = `latest(${String(latest?.status || "")}): i:${Number(latest?.inserted_count || 0)} / u:${Number(latest?.updated_count || 0)} / s:${Number(latest?.skipped_count || 0)} / e:${Number(latest?.error_count || 0)}`;
+    }
   }
 
   renderWorkspaceList(
@@ -6665,6 +6724,7 @@ function renderWorkspacePanels() {
   );
   renderWorkspaceDownloadRuns();
   renderWorkspacePendingFailures();
+  renderWorkspaceImportRuns();
   renderWorkspaceArtifacts();
 }
 
@@ -6684,6 +6744,7 @@ async function loadWorkspaceData(options = {}) {
     review_limit: String(WORKSPACE_REVIEW_LIMIT),
     missing_limit: String(WORKSPACE_MISSING_LIMIT),
     run_limit: String(WORKSPACE_RUN_LIMIT),
+    import_run_limit: String(WORKSPACE_IMPORT_RUN_LIMIT),
     pending_limit: String(WORKSPACE_PENDING_LIMIT),
     artifact_limit: String(WORKSPACE_ARTIFACT_LIMIT),
     since_hours: String(WORKSPACE_SINCE_HOURS),
@@ -6701,6 +6762,7 @@ async function loadWorkspaceData(options = {}) {
   state.workspaceReviewCards = Array.isArray(payload.review_cards) ? payload.review_cards : [];
   state.workspaceMissingEntries = Array.isArray(payload.missing_entries) ? payload.missing_entries : [];
   state.workspaceDownloadMonitor = payload.download_monitor || null;
+  state.workspaceImportMonitor = payload.import_monitor || null;
   state.workspaceArtifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
   renderWorkspacePanels();
 }

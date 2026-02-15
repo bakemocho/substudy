@@ -1769,6 +1769,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
     ensure_dictionary_bookmarks_schema(connection)
+    ensure_dictionary_import_runs_table(connection)
 
 
 def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
@@ -1850,6 +1851,32 @@ def ensure_translation_runs_table(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_translation_runs_video
             ON translation_runs(source_id, video_id, target_lang, status);
+        """
+    )
+
+
+def ensure_dictionary_import_runs_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS dictionary_import_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_scope TEXT NOT NULL DEFAULT '',
+            input_path TEXT NOT NULL,
+            input_format TEXT NOT NULL,
+            on_duplicate TEXT NOT NULL,
+            dry_run INTEGER NOT NULL DEFAULT 0,
+            row_count INTEGER NOT NULL DEFAULT 0,
+            inserted_count INTEGER NOT NULL DEFAULT 0,
+            updated_count INTEGER NOT NULL DEFAULT 0,
+            skipped_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'completed',
+            error_message TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dictionary_import_runs_time
+            ON dictionary_import_runs(finished_at DESC, run_id DESC);
         """
     )
 
@@ -4527,24 +4554,71 @@ def run_dict_bookmarks_import(
     if not input_path.exists() or not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    raw_rows = load_dict_bookmark_import_rows(input_path, input_format)
-    if not raw_rows:
-        print(f"[dict-bookmarks-import] no rows in {input_path}")
-        return
-
+    started_at = now_utc_iso()
+    source_scope = ",".join(sorted({str(item).strip() for item in source_ids if str(item).strip()}))
+    raw_rows: list[dict[str, Any]] = []
     allowed_sources = set(source_ids)
     seen_composites: set[tuple[Any, ...]] = set()
 
     connection = sqlite3.connect(str(db_path))
     connection.row_factory = sqlite3.Row
     create_schema(connection)
+    connection.commit()
 
+    row_count = 0
     inserted = 0
     updated = 0
     skipped = 0
     errors = 0
+    status = "completed"
+    error_message = ""
+
+    def write_import_run_log() -> None:
+        connection.execute(
+            """
+            INSERT INTO dictionary_import_runs (
+                source_scope,
+                input_path,
+                input_format,
+                on_duplicate,
+                dry_run,
+                row_count,
+                inserted_count,
+                updated_count,
+                skipped_count,
+                error_count,
+                status,
+                error_message,
+                started_at,
+                finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_scope,
+                str(input_path),
+                input_format,
+                on_duplicate,
+                1 if dry_run else 0,
+                row_count,
+                inserted,
+                updated,
+                skipped,
+                errors,
+                status,
+                error_message,
+                started_at,
+                now_utc_iso(),
+            ),
+        )
 
     try:
+        raw_rows = load_dict_bookmark_import_rows(input_path, input_format)
+        row_count = len(raw_rows)
+        if not raw_rows:
+            status = "noop"
+            print(f"[dict-bookmarks-import] no rows in {input_path}")
+            return
+
         for row_index, raw_row in enumerate(raw_rows, start=1):
             try:
                 record = normalize_dict_bookmark_import_row(raw_row, row_index, input_path)
@@ -4717,16 +4791,27 @@ def run_dict_bookmarks_import(
                     int(existing["id"]),
                 ),
             )
+        if errors > 0:
+            status = "completed_with_errors"
+    except Exception as exc:
+        status = "failed"
+        error_message = str(exc)
+        raise
     finally:
         if dry_run:
             connection.rollback()
         else:
             connection.commit()
+        try:
+            write_import_run_log()
+            connection.commit()
+        except sqlite3.Error as exc:
+            print(f"[dict-bookmarks-import] failed to write run log: {exc}", file=sys.stderr)
         connection.close()
 
     print(
         "[dict-bookmarks-import] "
-        f"rows={len(raw_rows)} inserted={inserted} updated={updated} skipped={skipped} "
+        f"rows={row_count} inserted={inserted} updated={updated} skipped={skipped} "
         f"errors={errors} dry_run={str(dry_run).lower()} input={input_path}"
     )
 
@@ -6208,6 +6293,28 @@ def apply_workspace_translation_qa(
     return cards
 
 
+def apply_workspace_missing_entry_states(
+    missing_cards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not missing_cards:
+        return missing_cards
+    default_missing_definition = "辞書エントリが見つかりません。"
+    for card in missing_cards:
+        qa_result = str(card.get("qa_result") or "").strip().lower()
+        definition = str(card.get("definition") or "").strip()
+        status = "pending"
+        label = "LLM補完待ち"
+        if definition and definition != default_missing_definition:
+            status = "enriched"
+            label = "補完済み"
+        if qa_result == "check":
+            status = "needs_review"
+            label = "要再確認"
+        card["missing_status"] = status
+        card["missing_status_label"] = label
+    return missing_cards
+
+
 def collect_workspace_review_and_missing_rows(
     connection: sqlite3.Connection,
     source_ids: list[str],
@@ -6449,6 +6556,97 @@ def collect_workspace_download_monitor(
             for row in pending_rows
         ],
         "pending_count": pending_count,
+    }
+
+
+def collect_workspace_import_monitor(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    run_limit: int,
+) -> dict[str, Any]:
+    safe_run_limit = max(1, int(run_limit))
+    scan_limit = max(safe_run_limit * 6, 24)
+    rows = connection.execute(
+        """
+        SELECT
+            run_id,
+            source_scope,
+            input_path,
+            input_format,
+            on_duplicate,
+            dry_run,
+            row_count,
+            inserted_count,
+            updated_count,
+            skipped_count,
+            error_count,
+            status,
+            COALESCE(error_message, '') AS error_message,
+            started_at,
+            finished_at
+        FROM dictionary_import_runs
+        ORDER BY finished_at DESC, run_id DESC
+        LIMIT ?
+        """,
+        (scan_limit,),
+    ).fetchall()
+
+    scope_filter = {str(item).strip() for item in source_ids if str(item).strip()}
+
+    def include_row(row: sqlite3.Row) -> bool:
+        if not scope_filter:
+            return True
+        source_scope_raw = str(row["source_scope"] or "").strip()
+        if not source_scope_raw:
+            return True
+        source_scope_items = {
+            item.strip()
+            for item in source_scope_raw.split(",")
+            if item.strip()
+        }
+        return not source_scope_items.isdisjoint(scope_filter)
+
+    filtered_rows = [row for row in rows if include_row(row)][:safe_run_limit]
+
+    recent_runs: list[dict[str, Any]] = [
+        {
+            "run_id": int(row["run_id"] or 0),
+            "source_scope": str(row["source_scope"] or ""),
+            "input_path": str(row["input_path"] or ""),
+            "input_format": str(row["input_format"] or ""),
+            "on_duplicate": str(row["on_duplicate"] or ""),
+            "dry_run": bool(int(row["dry_run"] or 0)),
+            "row_count": int(row["row_count"] or 0),
+            "inserted_count": int(row["inserted_count"] or 0),
+            "updated_count": int(row["updated_count"] or 0),
+            "skipped_count": int(row["skipped_count"] or 0),
+            "error_count": int(row["error_count"] or 0),
+            "status": str(row["status"] or ""),
+            "error_message": str(row["error_message"] or ""),
+            "started_at": str(row["started_at"] or ""),
+            "finished_at": str(row["finished_at"] or ""),
+        }
+        for row in filtered_rows
+    ]
+
+    latest_summary: dict[str, Any] | None = None
+    if recent_runs:
+        latest = recent_runs[0]
+        latest_summary = {
+            "status": str(latest["status"] or ""),
+            "dry_run": bool(latest["dry_run"]),
+            "row_count": int(latest["row_count"] or 0),
+            "inserted_count": int(latest["inserted_count"] or 0),
+            "updated_count": int(latest["updated_count"] or 0),
+            "skipped_count": int(latest["skipped_count"] or 0),
+            "error_count": int(latest["error_count"] or 0),
+            "finished_at": str(latest["finished_at"] or ""),
+            "error_message": str(latest["error_message"] or ""),
+        }
+
+    return {
+        "recent_runs": recent_runs,
+        "latest": latest_summary,
     }
 
 
@@ -7160,6 +7358,12 @@ def build_web_handler(
                 minimum=1,
                 maximum=80,
             )
+            import_run_limit = clamp_int(
+                query.get("import_run_limit", [None])[0],
+                default=6,
+                minimum=1,
+                maximum=80,
+            )
             pending_limit = clamp_int(
                 query.get("pending_limit", [None])[0],
                 default=20,
@@ -7199,11 +7403,17 @@ def build_web_handler(
                     run_limit=run_limit,
                     pending_limit=pending_limit,
                 )
+                import_monitor = collect_workspace_import_monitor(
+                    connection=connection,
+                    source_ids=source_scope,
+                    run_limit=import_run_limit,
+                )
             review_hints_by_card_id = load_workspace_review_hints(workspace_root)
             review_cards = apply_workspace_review_hints(review_cards, review_hints_by_card_id)
             translation_qa_by_card_id = load_workspace_translation_qa(workspace_root)
             review_cards = apply_workspace_translation_qa(review_cards, translation_qa_by_card_id)
             missing_entries = apply_workspace_translation_qa(missing_entries, translation_qa_by_card_id)
+            missing_entries = apply_workspace_missing_entry_states(missing_entries)
 
             artifacts = collect_workspace_artifacts(
                 root_dir=workspace_root,
@@ -7215,6 +7425,7 @@ def build_web_handler(
                     "review_cards": review_cards,
                     "missing_entries": missing_entries,
                     "download_monitor": download_monitor,
+                    "import_monitor": import_monitor,
                     "artifacts": artifacts,
                 }
             )

@@ -240,8 +240,8 @@ Status (minimum implementation):
 - [x] 運用モニタカードを追加（recent `download_runs` + pending failures）
 - [x] 生成物カードを追加（`exports/` の最近ファイル一覧）
 - [x] 「このキューへ」ジャンプのフィルタ回避を実装（必要時に `字幕状態=all` へフォールバック）
-- [ ] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
-- [ ] import結果サマリ表示（inserted/updated/skipped/errors）
+- [x] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
+- [x] import結果サマリ表示（inserted/updated/skipped/errors）
 - [x] artifact行からの実操作（open/download）
 - [x] `review_hints.jsonl` を復習カード表示へ接続（`card_id` joinで hint を表示）
 - [x] `translation_qa.jsonl` を復習/missing表示へ接続（`qa_result=check` を警告表示）
@@ -253,6 +253,9 @@ Ticket TODO (execution order):
 - [x] `4.6-01` review hints 接続: `/api/workspace` で `review_hints.jsonl` を `card_id` joinし、復習カードに one-line JA/EN hint を表示
 - [x] `4.6-02` translation QA 接続: `translation_qa.jsonl` の `qa_result=check` を復習/missingカードへ警告表示
 - [x] `4.6-03` artifact改善: `review_hints` / `translation_qa` の種別判定と artifact 行の open/download 操作
+- [x] `4.6-04` missing状態表示: `missing_entries` に `LLM補完待ち / 補完済み / 要再確認` を表示
+- [x] `4.6-05` importサマリ表示: `dict-bookmarks-import` の `inserted/updated/skipped/errors` を workspace monitor に表示
+- [ ] `4.6-06` 4.6回帰テスト: review/qa join・artifact open/download・import monitor の軽量テストを追加
 
 Intermediate artifact connectivity audit (2026-02-15):
 
