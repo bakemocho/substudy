@@ -2294,6 +2294,62 @@ function updateDictionaryBookmarkButtonState(buttonEl, saved, pending = false) {
   );
 }
 
+function collectUniqueDictionaryBookmarkPayloads(payloads) {
+  if (!Array.isArray(payloads) || !payloads.length) {
+    return [];
+  }
+  const unique = new Map();
+  for (const payload of payloads) {
+    const key = dictionaryBookmarkKeyFromPayload(payload);
+    if (!key || unique.has(key)) {
+      continue;
+    }
+    unique.set(key, payload);
+  }
+  return Array.from(unique.values());
+}
+
+function countSavedDictionaryBookmarkPayloads(payloads) {
+  if (!Array.isArray(payloads) || !payloads.length) {
+    return 0;
+  }
+  let savedCount = 0;
+  for (const payload of payloads) {
+    if (isDictionaryBookmarkSaved(payload)) {
+      savedCount += 1;
+    }
+  }
+  return savedCount;
+}
+
+function updateDictionaryBulkBookmarkButtonState(buttonEl, payloads, pending = false) {
+  if (!(buttonEl instanceof HTMLButtonElement)) {
+    return;
+  }
+  const uniquePayloads = collectUniqueDictionaryBookmarkPayloads(payloads);
+  const totalCount = uniquePayloads.length;
+  const savedCount = countSavedDictionaryBookmarkPayloads(uniquePayloads);
+  const allSaved = totalCount > 0 && savedCount >= totalCount;
+  const partiallySaved = savedCount > 0 && savedCount < totalCount;
+
+  buttonEl.classList.toggle("saved", allSaved);
+  buttonEl.classList.toggle("partial", partiallySaved);
+  buttonEl.classList.toggle("pending", Boolean(pending));
+
+  const labelDefault = String(buttonEl.dataset.dictBulkLabelDefault || "☆");
+  const labelSaved = String(buttonEl.dataset.dictBulkLabelSaved || "★");
+  const labelPartial = String(buttonEl.dataset.dictBulkLabelPartial || "◐");
+  buttonEl.textContent = pending
+    ? "..."
+    : (allSaved ? labelSaved : (partiallySaved ? labelPartial : labelDefault));
+  buttonEl.setAttribute(
+    "aria-label",
+    pending
+      ? "辞書ブックマーク処理中"
+      : (allSaved ? "辞書ブックマークを一括解除" : "辞書ブックマークを一括保存")
+  );
+}
+
 function rebuildDictionaryBookmarkedTermNorms() {
   const next = new Set();
   for (const bookmark of state.dictBookmarks.values()) {
@@ -2532,6 +2588,10 @@ async function loadDictionaryBookmarks() {
 }
 
 async function toggleDictionaryBookmark(payload) {
+  return toggleDictionaryBookmarkWithOptions(payload, { refreshWorkspace: true });
+}
+
+async function toggleDictionaryBookmarkWithOptions(payload, options = {}) {
   if (!payload) {
     return { status: "invalid", bookmark: null };
   }
@@ -2566,11 +2626,52 @@ async function toggleDictionaryBookmark(payload) {
   if (keyFromBookmark && keyFromBookmark !== keyFromPayload) {
     syncDictionaryBookmarkButtonsForKey(keyFromBookmark);
   }
-  loadWorkspaceData({ silent: true }).catch(() => {});
+  const shouldRefreshWorkspace = options.refreshWorkspace !== false;
+  if (shouldRefreshWorkspace) {
+    loadWorkspaceData({ silent: true }).catch(() => {});
+  }
   return {
     status,
     bookmark,
     key,
+  };
+}
+
+async function toggleDictionaryBookmarkBulk(payloads, options = {}) {
+  const uniquePayloads = collectUniqueDictionaryBookmarkPayloads(payloads);
+  if (!uniquePayloads.length) {
+    return {
+      action: "none",
+      changedCount: 0,
+      totalCount: 0,
+      targetCount: 0,
+    };
+  }
+  const savedCount = countSavedDictionaryBookmarkPayloads(uniquePayloads);
+  const action = savedCount >= uniquePayloads.length ? "remove" : "save";
+  const targetPayloads = action === "remove"
+    ? uniquePayloads.filter((payload) => isDictionaryBookmarkSaved(payload))
+    : uniquePayloads.filter((payload) => !isDictionaryBookmarkSaved(payload));
+
+  let changedCount = 0;
+  for (const payload of targetPayloads) {
+    const result = await toggleDictionaryBookmarkWithOptions(payload, { refreshWorkspace: false });
+    if (action === "remove" && result?.status === "removed") {
+      changedCount += 1;
+    }
+    if (action === "save" && result?.status === "saved") {
+      changedCount += 1;
+    }
+  }
+
+  if (options.refreshWorkspace !== false) {
+    loadWorkspaceData({ silent: true }).catch(() => {});
+  }
+  return {
+    action,
+    changedCount,
+    totalCount: uniquePayloads.length,
+    targetCount: targetPayloads.length,
   };
 }
 
@@ -4070,6 +4171,22 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
   }
 
   const groups = groupDictionaryRows(rows);
+  const bulkBookmarkRefreshHooks = [];
+  const registerBulkBookmarkRefreshHook = (hook) => {
+    if (typeof hook === "function") {
+      bulkBookmarkRefreshHooks.push(hook);
+    }
+  };
+  const refreshBulkBookmarkButtons = () => {
+    for (const hook of bulkBookmarkRefreshHooks) {
+      try {
+        hook();
+      } catch {
+        // no-op
+      }
+    }
+  };
+
   if (!groups.length) {
     const empty = document.createElement("p");
     empty.className = "subtitle-dict-empty";
@@ -4124,15 +4241,19 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
       popupEl.appendChild(actions);
     }
   } else {
+    const levelBookmarkPayloads = [];
     const list = document.createElement("div");
     list.className = "subtitle-dict-list";
     for (const group of groups) {
       const item = document.createElement("article");
       item.className = "subtitle-dict-item";
 
+      const head = document.createElement("div");
+      head.className = "subtitle-dict-item-head";
+
       const label = document.createElement("strong");
       label.textContent = group.term || term;
-      item.appendChild(label);
+      head.appendChild(label);
 
       const fromTerms = new Set();
       for (const entry of group.entries) {
@@ -4142,12 +4263,16 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
         }
       }
 
+      const groupBookmarkPayloads = [];
       if (fromTerms.size === 1) {
         const [singleFrom] = Array.from(fromTerms);
         const match = document.createElement("small");
         match.className = "subtitle-dict-match";
         match.textContent = `from: ${singleFrom}`;
+        item.appendChild(head);
         item.appendChild(match);
+      } else {
+        item.appendChild(head);
       }
 
       const defs = document.createElement("ul");
@@ -4158,6 +4283,7 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
 
         const bookmarkPayload = buildDictionaryBookmarkPayload(entry, group.term || term, { node });
         if (bookmarkPayload) {
+          groupBookmarkPayloads.push(bookmarkPayload);
           const bookmarkBtn = document.createElement("button");
           bookmarkBtn.type = "button";
           bookmarkBtn.className = "subtitle-dict-bookmark-btn";
@@ -4193,6 +4319,7 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
               })
               .finally(() => {
                 bookmarkBtn.disabled = false;
+                refreshBulkBookmarkButtons();
               });
           });
           defItem.appendChild(bookmarkBtn);
@@ -4219,9 +4346,107 @@ function renderSubtitleDictionaryPopup(term, rows, anchorEl, options = {}) {
         defs.appendChild(defItem);
       }
 
+      const uniqueGroupBookmarkPayloads = collectUniqueDictionaryBookmarkPayloads(groupBookmarkPayloads);
+      if (uniqueGroupBookmarkPayloads.length > 0) {
+        for (const payload of uniqueGroupBookmarkPayloads) {
+          levelBookmarkPayloads.push(payload);
+        }
+        const groupBookmarkBtn = document.createElement("button");
+        groupBookmarkBtn.type = "button";
+        groupBookmarkBtn.className = "subtitle-dict-bookmark-btn subtitle-dict-group-bookmark-btn";
+        groupBookmarkBtn.dataset.dictBulkLabelDefault = "☆";
+        groupBookmarkBtn.dataset.dictBulkLabelPartial = "◐";
+        groupBookmarkBtn.dataset.dictBulkLabelSaved = "★";
+        const refreshGroupBookmarkBtn = () => {
+          updateDictionaryBulkBookmarkButtonState(groupBookmarkBtn, uniqueGroupBookmarkPayloads, false);
+        };
+        registerBulkBookmarkRefreshHook(refreshGroupBookmarkBtn);
+        refreshGroupBookmarkBtn();
+        groupBookmarkBtn.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          groupBookmarkBtn.disabled = true;
+          updateDictionaryBulkBookmarkButtonState(groupBookmarkBtn, uniqueGroupBookmarkPayloads, true);
+          toggleDictionaryBookmarkBulk(uniqueGroupBookmarkPayloads)
+            .then((result) => {
+              const action = String(result?.action || "");
+              const changedCount = Number(result?.changedCount || 0);
+              if (action === "save") {
+                setStatus(`見出し単位で ${changedCount} 件保存しました。`, "ok");
+              } else if (action === "remove") {
+                setStatus(`見出し単位で ${changedCount} 件解除しました。`, "ok");
+              }
+            })
+            .catch((error) => {
+              const message = String(error?.message || "");
+              if (message.includes("Not found") || message.includes("404")) {
+                state.dictBookmarksApiAvailable = false;
+                setStatus("辞書ブックマークAPIが未対応です。サーバー再起動後に利用できます。", "error");
+                return;
+              }
+              setStatus(message || "辞書ブックマーク一括更新に失敗しました。", "error");
+            })
+            .finally(() => {
+              groupBookmarkBtn.disabled = false;
+              refreshBulkBookmarkButtons();
+            });
+        });
+        head.appendChild(groupBookmarkBtn);
+      }
+
       item.appendChild(defs);
       list.appendChild(item);
     }
+
+    const uniqueLevelBookmarkPayloads = collectUniqueDictionaryBookmarkPayloads(levelBookmarkPayloads);
+    if (uniqueLevelBookmarkPayloads.length > 0) {
+      const levelActions = document.createElement("div");
+      levelActions.className = "subtitle-dict-level-actions";
+      const levelBookmarkBtn = document.createElement("button");
+      levelBookmarkBtn.type = "button";
+      levelBookmarkBtn.className = "subtitle-dict-bookmark-btn subtitle-dict-level-bookmark-btn";
+      levelBookmarkBtn.dataset.dictBulkLabelDefault = "☆";
+      levelBookmarkBtn.dataset.dictBulkLabelPartial = "◐";
+      levelBookmarkBtn.dataset.dictBulkLabelSaved = "★";
+      const refreshLevelBookmarkBtn = () => {
+        updateDictionaryBulkBookmarkButtonState(levelBookmarkBtn, uniqueLevelBookmarkPayloads, false);
+      };
+      registerBulkBookmarkRefreshHook(refreshLevelBookmarkBtn);
+      refreshLevelBookmarkBtn();
+      levelBookmarkBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        levelBookmarkBtn.disabled = true;
+        updateDictionaryBulkBookmarkButtonState(levelBookmarkBtn, uniqueLevelBookmarkPayloads, true);
+        toggleDictionaryBookmarkBulk(uniqueLevelBookmarkPayloads)
+          .then((result) => {
+            const action = String(result?.action || "");
+            const changedCount = Number(result?.changedCount || 0);
+            const levelLabel = node ? `lv.${node.depth + 1}` : "lv";
+            if (action === "save") {
+              setStatus(`${levelLabel} 全体で ${changedCount} 件保存しました。`, "ok");
+            } else if (action === "remove") {
+              setStatus(`${levelLabel} 全体で ${changedCount} 件解除しました。`, "ok");
+            }
+          })
+          .catch((error) => {
+            const message = String(error?.message || "");
+            if (message.includes("Not found") || message.includes("404")) {
+              state.dictBookmarksApiAvailable = false;
+              setStatus("辞書ブックマークAPIが未対応です。サーバー再起動後に利用できます。", "error");
+              return;
+            }
+            setStatus(message || "辞書ブックマーク一括更新に失敗しました。", "error");
+          })
+          .finally(() => {
+            levelBookmarkBtn.disabled = false;
+            refreshBulkBookmarkButtons();
+          });
+      });
+      levelActions.appendChild(levelBookmarkBtn);
+      popupEl.appendChild(levelActions);
+    }
+
     popupEl.appendChild(list);
   }
 

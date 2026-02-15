@@ -316,9 +316,17 @@ body {
   background: rgba(7, 12, 24, 0.72);
 }
 
+.subtitle-dict-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
 .subtitle-dict-item strong {
   display: block;
-  margin-bottom: 3px;
+  margin-bottom: 0;
   color: rgba(232, 241, 255, 0.96);
   font-size: 0.86rem;
 }
@@ -375,21 +383,34 @@ body {
   color: #ffe79d;
 }
 
+.subtitle-dict-bookmark-btn.partial {
+  border-color: rgba(124, 226, 192, 0.72);
+  color: #bff9e2;
+}
+
 .subtitle-dict-bookmark-btn.pending {
   opacity: 0.68;
   cursor: default;
+}
+
+.subtitle-dict-level-actions {
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.subtitle-dict-group-bookmark-btn,
+.subtitle-dict-level-bookmark-btn,
+.subtitle-dict-empty-bookmark-btn {
+  position: static;
+  top: auto;
+  right: auto;
 }
 
 .subtitle-dict-empty-actions {
   margin-top: 8px;
   display: flex;
   justify-content: flex-end;
-}
-
-.subtitle-dict-empty-bookmark-btn {
-  position: static;
-  top: auto;
-  right: auto;
 }
 
 .subtitle-dict-inline-word {
