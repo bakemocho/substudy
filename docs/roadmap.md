@@ -255,7 +255,7 @@ Ticket TODO (execution order):
 - [x] `4.6-03` artifact改善: `review_hints` / `translation_qa` の種別判定と artifact 行の open/download 操作
 - [x] `4.6-04` missing状態表示: `missing_entries` に `LLM補完待ち / 補完済み / 要再確認` を表示
 - [x] `4.6-05` importサマリ表示: `dict-bookmarks-import` の `inserted/updated/skipped/errors` を workspace monitor に表示
-- [ ] `4.6-06` 4.6回帰テスト: review/qa join・artifact open/download・import monitor の軽量テストを追加
+- [x] `4.6-06` 4.6回帰テスト: review/qa join・artifact open/download・import monitor の軽量テストを追加（`tests/test_workspace_regression.py`）
 
 Intermediate artifact connectivity audit (2026-02-15):
 

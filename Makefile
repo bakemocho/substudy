@@ -1,7 +1,7 @@
 PYTHON ?= python3
 CONFIG ?= config/sources.toml
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index privacy-check
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index privacy-check test
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -38,3 +38,6 @@ dict-index:
 
 privacy-check:
 	./scripts/privacy_check.sh
+
+test:
+	$(PYTHON) -m unittest discover -s tests -p "test_*.py"

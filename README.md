@@ -58,11 +58,15 @@ Open `http://127.0.0.1:8876`.
 - `python3 scripts/substudy.py dict-bookmarks-import --input exports/dictionary_bookmarks_missing_*.jsonl --on-duplicate upsert`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset frequent_terms --format csv --limit 200`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200`
+- `scripts/run_llm_pipeline.sh missing-export --limit 200`
+- `scripts/run_llm_pipeline.sh missing-import`
+- `scripts/run_llm_pipeline.sh review-cards-export --limit 200`
 - `python3 scripts/substudy.py notify --kind all`
 - `python3 scripts/substudy.py notify-install-macos --interval-minutes 90 --kind all`
 - `python3 scripts/substudy.py notify-uninstall-macos`
 - `python3 scripts/substudy.py downloads --since-hours 24`
 - `python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`
+- `make test`
 
 Notification note (macOS):
 
@@ -81,6 +85,12 @@ Notification note (macOS):
   - save current subtitle (`B`)
   - save playback range (`R` start, `T` save)
 - video favorite toggle (`F`) and per-video memo
+- workspace panels:
+  - review queue with `review_hints` join (`one_line_hint_ja/en`)
+  - EN/JA mismatch warning from `translation_qa` (`qa_result=check`)
+  - missing-entry status (`LLM補完待ち / 補完済み / 要再確認`)
+  - import result monitor (`inserted/updated/skipped/errors`)
+  - recent artifact browser with `open` / `download`
 
 SQLite learning tables:
 
