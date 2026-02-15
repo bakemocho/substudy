@@ -6442,6 +6442,14 @@ function renderWorkspaceReviewItem(item) {
   hintEn.className = "workspace-item-hint en";
   hintEn.textContent = hintEnText ? `hint(en): ${hintEnText}` : "";
 
+  const qaResult = String(item?.qa_result || "").trim().toLowerCase();
+  const qaReason = truncateText(String(item?.qa_reason || ""), 160);
+  const qaWarning = document.createElement("p");
+  qaWarning.className = "workspace-item-warning";
+  qaWarning.textContent = qaResult === "check"
+    ? `qa(check): ${qaReason || "EN/JA mismatch suspicion"}`
+    : "";
+
   const meta = document.createElement("p");
   meta.className = "workspace-item-meta";
   meta.textContent = `${String(item?.cue_start_label || "--:--")} - ${String(item?.cue_end_label || "--:--")} • ${String(item?.source_id || "")} • ${String(item?.video_id || "")}`;
@@ -6467,6 +6475,9 @@ function renderWorkspaceReviewItem(item) {
   }
   if (hintEn.textContent) {
     row.appendChild(hintEn);
+  }
+  if (qaWarning.textContent) {
+    row.appendChild(qaWarning);
   }
   row.appendChild(meta);
   row.appendChild(action);
@@ -6495,6 +6506,14 @@ function renderWorkspaceMissingItem(item) {
   cue.className = "workspace-item-cue en";
   cue.textContent = String(item?.cue_en_text || "(英語字幕なし)");
 
+  const qaResult = String(item?.qa_result || "").trim().toLowerCase();
+  const qaReason = truncateText(String(item?.qa_reason || ""), 160);
+  const qaWarning = document.createElement("p");
+  qaWarning.className = "workspace-item-warning";
+  qaWarning.textContent = qaResult === "check"
+    ? `qa(check): ${qaReason || "EN/JA mismatch suspicion"}`
+    : "";
+
   const meta = document.createElement("p");
   meta.className = "workspace-item-meta";
   meta.textContent = `${String(item?.cue_start_label || "--:--")} • ${String(item?.source_id || "")} • ${String(item?.video_id || "")}`;
@@ -6509,6 +6528,9 @@ function renderWorkspaceMissingItem(item) {
 
   row.appendChild(head);
   row.appendChild(cue);
+  if (qaWarning.textContent) {
+    row.appendChild(qaWarning);
+  }
   row.appendChild(meta);
   row.appendChild(action);
   return row;
@@ -6579,8 +6601,34 @@ function renderWorkspaceArtifacts() {
       const sizeLabel = formatBytesShort(artifact?.size_bytes);
       meta.textContent = `${String(artifact?.relative_path || "")} • ${sizeLabel} • ${formatShortIso(artifact?.updated_at)}`;
 
+      const actions = document.createElement("div");
+      actions.className = "workspace-artifact-actions";
+
+      const openUrl = String(artifact?.open_url || "");
+      if (openUrl) {
+        const openLink = document.createElement("a");
+        openLink.className = "workspace-jump-btn workspace-artifact-btn";
+        openLink.href = openUrl;
+        openLink.target = "_blank";
+        openLink.rel = "noopener";
+        openLink.textContent = "open";
+        actions.appendChild(openLink);
+      }
+
+      const downloadUrl = String(artifact?.download_url || "");
+      if (downloadUrl) {
+        const downloadLink = document.createElement("a");
+        downloadLink.className = "workspace-jump-btn workspace-artifact-btn";
+        downloadLink.href = downloadUrl;
+        downloadLink.textContent = "download";
+        actions.appendChild(downloadLink);
+      }
+
       row.appendChild(title);
       row.appendChild(meta);
+      if (actions.childElementCount > 0) {
+        row.appendChild(actions);
+      }
       return row;
     },
     "生成物がまだありません。"

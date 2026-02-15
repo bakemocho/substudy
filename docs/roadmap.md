@@ -242,17 +242,17 @@ Status (minimum implementation):
 - [x] 「このキューへ」ジャンプのフィルタ回避を実装（必要時に `字幕状態=all` へフォールバック）
 - [ ] missing項目の状態表示（LLM補完待ち / 補完済み / 要再確認）
 - [ ] import結果サマリ表示（inserted/updated/skipped/errors）
-- [ ] artifact行からの実操作（open/download）
+- [x] artifact行からの実操作（open/download）
 - [x] `review_hints.jsonl` を復習カード表示へ接続（`card_id` joinで hint を表示）
-- [ ] `translation_qa.jsonl` を復習/missing表示へ接続（`qa_result=check` を警告表示）
-- [ ] artifact種別判定に `review_hints` / `translation_qa` を追加
+- [x] `translation_qa.jsonl` を復習/missing表示へ接続（`qa_result=check` を警告表示）
+- [x] artifact種別判定に `review_hints` / `translation_qa` を追加
 - [ ] 4.6向けの軽量回帰テスト追加
 
 Ticket TODO (execution order):
 
 - [x] `4.6-01` review hints 接続: `/api/workspace` で `review_hints.jsonl` を `card_id` joinし、復習カードに one-line JA/EN hint を表示
-- [ ] `4.6-02` translation QA 接続: `translation_qa.jsonl` の `qa_result=check` を復習/missingカードへ警告表示
-- [ ] `4.6-03` artifact改善: `review_hints` / `translation_qa` の種別判定と artifact 行の open/download 操作
+- [x] `4.6-02` translation QA 接続: `translation_qa.jsonl` の `qa_result=check` を復習/missingカードへ警告表示
+- [x] `4.6-03` artifact改善: `review_hints` / `translation_qa` の種別判定と artifact 行の open/download 操作
 
 Intermediate artifact connectivity audit (2026-02-15):
 
@@ -261,8 +261,8 @@ Intermediate artifact connectivity audit (2026-02-15):
 | `exports/llm/missing_review.jsonl`   | A1 Missing Export     | A2 Missing Enrichment input | Indirectly connected (`A1 -> A2 -> A3 -> DB`)    |
 | `exports/llm/enriched_missing.jsonl` | A2 Missing Enrichment | A3 Missing Import input     | Indirectly connected (`DB`反映後にworkspace表示) |
 | `exports/llm/review_cards.jsonl`     | A4 pre-step export    | A4/A5 LLM input             | Intermediate only（UIはDB起点で直接は未使用）    |
-| `exports/llm/review_hints.jsonl`     | A4 Review Hints       | no runtime consumer         | Not connected                                    |
-| `exports/llm/translation_qa.jsonl`   | A5 Translation QA     | no runtime consumer         | Not connected                                    |
+| `exports/llm/review_hints.jsonl`     | A4 Review Hints       | `/api/workspace` review join | Connected（復習カードに hint 表示）               |
+| `exports/llm/translation_qa.jsonl`   | A5 Translation QA     | `/api/workspace` QA join     | Connected（`qa_result=check` 警告表示）           |
 | `exports/*/frequent_terms*`          | curate/export CLI     | no runtime consumer         | Not connected（artifact listのみ）               |
 | `exports/*/recent_saved*`            | curate/export CLI     | no runtime consumer         | Not connected（artifact listのみ）               |
 

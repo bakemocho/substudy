@@ -6027,8 +6027,12 @@ def _infer_workspace_artifact_kind(path: Path) -> str:
     name = path.name.lower()
     if "missing_review" in name:
         return "missing_review"
+    if "review_hints" in name:
+        return "review_hints"
     if "review_cards" in name:
         return "review_cards"
+    if "translation_qa" in name:
+        return "translation_qa"
     if "frequent_terms" in name:
         return "frequent_terms"
     if "recent_saved" in name:
@@ -6067,6 +6071,10 @@ def collect_workspace_artifacts(
             relative_path = str(path.relative_to(root_dir))
         except ValueError:
             relative_path = str(path.name)
+        try:
+            token = encode_path_token(path.resolve())
+        except OSError:
+            token = ""
         updated_at = dt.datetime.fromtimestamp(
             modified_epoch,
             tz=dt.timezone.utc,
@@ -6078,6 +6086,8 @@ def collect_workspace_artifacts(
                 "kind": _infer_workspace_artifact_kind(path),
                 "size_bytes": size_bytes,
                 "updated_at": updated_at,
+                "open_url": f"/artifact/{token}" if token else "",
+                "download_url": f"/artifact/{token}?download=1" if token else "",
             }
         )
     return rows
@@ -6138,6 +6148,64 @@ def apply_workspace_review_hints(
             if value:
                 card[key] = value
     return review_cards
+
+
+def load_workspace_translation_qa(root_dir: Path) -> dict[str, dict[str, str]]:
+    qa_path = root_dir / "exports" / "llm" / "translation_qa.jsonl"
+    if not qa_path.exists() or not qa_path.is_file():
+        return {}
+
+    qa_by_card_id: dict[str, dict[str, str]] = {}
+    try:
+        with qa_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                card_id = str(parsed.get("card_id") or "").strip()
+                if not card_id:
+                    continue
+                qa_result = str(parsed.get("qa_result") or "").strip().lower()
+                if qa_result != "check":
+                    continue
+                payload: dict[str, str] = {
+                    "qa_result": "check",
+                }
+                reason = str(parsed.get("reason") or "").strip()
+                suggested_ja = str(parsed.get("suggested_ja") or "").strip()
+                if reason:
+                    payload["qa_reason"] = reason
+                if suggested_ja:
+                    payload["qa_suggested_ja"] = suggested_ja
+                qa_by_card_id[card_id] = payload
+    except OSError:
+        return {}
+    return qa_by_card_id
+
+
+def apply_workspace_translation_qa(
+    cards: list[dict[str, Any]],
+    qa_by_card_id: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    if not cards or not qa_by_card_id:
+        return cards
+    for card in cards:
+        card_id = str(card.get("card_id") or "").strip()
+        if not card_id:
+            continue
+        qa_payload = qa_by_card_id.get(card_id)
+        if not qa_payload:
+            continue
+        for key, value in qa_payload.items():
+            if value:
+                card[key] = value
+    return cards
 
 
 def collect_workspace_review_and_missing_rows(
@@ -6227,7 +6295,9 @@ def collect_workspace_review_and_missing_rows(
         stats = term_stats.get(term_norm, {})
         cue_start_ms = int(serialized["cue_start_ms"])
         cue_end_ms = int(serialized["cue_end_ms"])
+        card_id = f"dictbm:{int(serialized['id'])}"
         card = {
+            "card_id": card_id,
             "source_id": str(serialized["source_id"]),
             "video_id": str(serialized["video_id"]),
             "track": str(serialized.get("track") or ""),
@@ -6268,9 +6338,7 @@ def collect_workspace_review_and_missing_rows(
             "created_at": str(serialized.get("created_at") or ""),
             "updated_at": str(serialized.get("updated_at") or ""),
         }
-        if include_card_id:
-            card["card_id"] = f"dictbm:{int(serialized['id'])}"
-        else:
+        if not include_card_id:
             card["id"] = int(serialized["id"])
         return card
 
@@ -6536,6 +6604,52 @@ def build_web_handler(
                         remaining -= len(chunk)
             except OSError:
                 return
+
+        def _serve_workspace_artifact_file(self, token: str, force_download: bool = False) -> None:
+            artifact_path = decode_path_token(token)
+            exports_root = (workspace_root / "exports").resolve()
+            if artifact_path is None:
+                self._send_error_json(404, "Artifact file not found.")
+                return
+            try:
+                resolved_path = artifact_path.resolve()
+            except OSError:
+                self._send_error_json(404, "Artifact file not found.")
+                return
+            if resolved_path != exports_root and exports_root not in resolved_path.parents:
+                self._send_error_json(403, "Access denied.")
+                return
+            if not resolved_path.exists() or not resolved_path.is_file():
+                self._send_error_json(404, "Artifact file not found.")
+                return
+            try:
+                payload = resolved_path.read_bytes()
+            except OSError:
+                self._send_error_json(500, "Failed to read artifact file.")
+                return
+
+            suffix = resolved_path.suffix.lower()
+            if suffix in {".jsonl", ".log", ".txt"}:
+                content_type = "text/plain"
+            elif suffix == ".json":
+                content_type = "application/json"
+            elif suffix == ".csv":
+                content_type = "text/csv"
+            else:
+                content_type = mimetypes.guess_type(str(resolved_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                f"{content_type}; charset=utf-8" if content_type.startswith("text/") else content_type,
+            )
+            self.send_header("Content-Length", str(len(payload)))
+            filename = resolved_path.name.replace('"', "")
+            if force_download:
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            else:
+                self.send_header("Content-Disposition", f'inline; filename="{filename}"')
+            self.end_headers()
+            self.wfile.write(payload)
 
         def _is_source_allowed(self, source_id: str) -> bool:
             if not allowed_source_ids:
@@ -7087,6 +7201,9 @@ def build_web_handler(
                 )
             review_hints_by_card_id = load_workspace_review_hints(workspace_root)
             review_cards = apply_workspace_review_hints(review_cards, review_hints_by_card_id)
+            translation_qa_by_card_id = load_workspace_translation_qa(workspace_root)
+            review_cards = apply_workspace_translation_qa(review_cards, translation_qa_by_card_id)
+            missing_entries = apply_workspace_translation_qa(missing_entries, translation_qa_by_card_id)
 
             artifacts = collect_workspace_artifacts(
                 root_dir=workspace_root,
@@ -7623,6 +7740,11 @@ def build_web_handler(
                 if path.startswith("/media/"):
                     token = path[len("/media/") :]
                     self._serve_media_file(token)
+                    return
+                if path.startswith("/artifact/"):
+                    token = path[len("/artifact/") :]
+                    force_download = parse_bool_flag(query.get("download", [None])[0], default=False)
+                    self._serve_workspace_artifact_file(token, force_download=force_download)
                     return
                 if path == "/api/feed":
                     self._handle_api_feed(query)
