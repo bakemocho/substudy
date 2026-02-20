@@ -185,7 +185,6 @@ const state = {
   workspaceArtifacts: [],
   sourceTargets: [],
   sourceTargetsManagedPath: "",
-  sourceTargetEditId: "",
   workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
 };
@@ -258,6 +257,7 @@ const elements = {
   sourceTargetDataDirInput: document.getElementById("sourceTargetDataDirInput"),
   sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
   sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
+  sourceTargetFormHint: document.getElementById("sourceTargetFormHint"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
@@ -6566,9 +6566,39 @@ function sourceTargetOriginLabel(origin) {
   return "config";
 }
 
+function findSourceTargetById(sourceId) {
+  const lookupId = String(sourceId || "").trim();
+  if (!lookupId) {
+    return null;
+  }
+  const targets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
+  for (const item of targets) {
+    if (String(item?.id || "").trim() === lookupId) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function refreshSourceTargetFormState() {
+  const sourceId = String(elements.sourceTargetIdInput?.value || "").trim();
+  const existingItem = findSourceTargetById(sourceId);
+  if (elements.sourceTargetSaveBtn) {
+    elements.sourceTargetSaveBtn.textContent = existingItem ? "更新" : "追加";
+  }
+  if (elements.sourceTargetFormHint) {
+    if (!sourceId) {
+      elements.sourceTargetFormHint.textContent = "source id が既存なら更新、未登録なら追加します。";
+    } else if (existingItem) {
+      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は既存です。保存で更新します。`;
+    } else {
+      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は未登録です。保存で追加します。`;
+    }
+  }
+}
+
 function setSourceTargetFormFromItem(item = null) {
   const target = item || null;
-  state.sourceTargetEditId = target ? String(target.id || "") : "";
   if (elements.sourceTargetIdInput) {
     elements.sourceTargetIdInput.value = target ? String(target.id || "") : "";
   }
@@ -6589,6 +6619,7 @@ function setSourceTargetFormFromItem(item = null) {
   if (elements.sourceTargetEnabledInput) {
     elements.sourceTargetEnabledInput.checked = target ? Boolean(target.enabled) : true;
   }
+  refreshSourceTargetFormState();
 }
 
 function buildSourceTargetPayloadFromItem(item, overrides = {}) {
@@ -6637,13 +6668,22 @@ function buildSourceTargetPayloadFromForm() {
   };
 }
 
-async function upsertSourceTarget(payload, doneMessage) {
-  await apiRequest("/api/source-targets/upsert", {
+async function upsertSourceTarget(payload, doneMessage = "") {
+  const result = await apiRequest("/api/source-targets/upsert", {
     method: "POST",
     body: JSON.stringify(payload),
   });
   await loadSourceTargets({ silent: true });
-  setStatus(doneMessage, "ok");
+  if (doneMessage) {
+    setStatus(doneMessage, "ok");
+    return;
+  }
+  const status = String(result?.status || "").trim().toLowerCase();
+  if (status === "created") {
+    setStatus(`ターゲットを追加しました: ${payload.id}`, "ok");
+    return;
+  }
+  setStatus(`ターゲットを更新しました: ${payload.id}`, "ok");
 }
 
 async function removeSourceTargetOverride(item) {
@@ -6655,7 +6695,7 @@ async function removeSourceTargetOverride(item) {
     method: "POST",
     body: JSON.stringify({ id: sourceId }),
   });
-  if (state.sourceTargetEditId === sourceId) {
+  if (String(elements.sourceTargetIdInput?.value || "").trim() === sourceId) {
     setSourceTargetFormFromItem(null);
   }
   await loadSourceTargets({ silent: true });
@@ -6717,13 +6757,8 @@ function renderSourceTargetsPanel() {
       editBtn.textContent = "編集";
       editBtn.addEventListener("click", () => {
         const sourceId = String(item?.id || "").trim();
-        if (sourceId && state.sourceTargetEditId === sourceId) {
-          setSourceTargetFormFromItem(null);
-          setStatus("新規入力モードに戻しました。", "ok");
-          return;
-        }
         setSourceTargetFormFromItem(item);
-        setStatus(`編集対象: ${sourceId}`, "ok");
+        setStatus(`フォームに読み込みました: ${sourceId}`, "ok");
       });
       actions.appendChild(editBtn);
 
@@ -6784,6 +6819,7 @@ async function loadSourceTargets(options = {}) {
   state.sourceTargets = Array.isArray(payload.targets) ? payload.targets : [];
   state.sourceTargetsManagedPath = String(payload.managed_path || "");
   renderSourceTargetsPanel();
+  refreshSourceTargetFormState();
 }
 
 function renderWorkspaceList(container, items, renderItem, emptyMessage) {
@@ -8224,11 +8260,16 @@ function bindEvents() {
         setStatus(error.message, "error");
         return;
       }
-      upsertSourceTarget(payload, `ターゲットを保存しました: ${payload.id}`)
+      upsertSourceTarget(payload)
         .catch((error) => {
           setStatus(error.message, "error");
         });
       resetControlsToggleFade();
+    });
+  }
+  if (elements.sourceTargetIdInput) {
+    elements.sourceTargetIdInput.addEventListener("input", () => {
+      refreshSourceTargetFormState();
     });
   }
   if (elements.sourceTargetHandleInput) {
