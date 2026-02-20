@@ -258,7 +258,6 @@ const elements = {
   sourceTargetDataDirInput: document.getElementById("sourceTargetDataDirInput"),
   sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
   sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
-  sourceTargetResetBtn: document.getElementById("sourceTargetResetBtn"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
@@ -6717,8 +6716,14 @@ function renderSourceTargetsPanel() {
       editBtn.className = "workspace-jump-btn workspace-artifact-btn";
       editBtn.textContent = "編集";
       editBtn.addEventListener("click", () => {
+        const sourceId = String(item?.id || "").trim();
+        if (sourceId && state.sourceTargetEditId === sourceId) {
+          setSourceTargetFormFromItem(null);
+          setStatus("新規入力モードに戻しました。", "ok");
+          return;
+        }
         setSourceTargetFormFromItem(item);
-        setStatus(`編集対象: ${String(item?.id || "")}`, "ok");
+        setStatus(`編集対象: ${sourceId}`, "ok");
       });
       actions.appendChild(editBtn);
 
@@ -8223,13 +8228,6 @@ function bindEvents() {
         .catch((error) => {
           setStatus(error.message, "error");
         });
-      resetControlsToggleFade();
-    });
-  }
-  if (elements.sourceTargetResetBtn) {
-    elements.sourceTargetResetBtn.addEventListener("click", () => {
-      setSourceTargetFormFromItem(null);
-      setStatus("ターゲット入力をリセットしました。", "ok");
       resetControlsToggleFade();
     });
   }
