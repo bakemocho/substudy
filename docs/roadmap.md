@@ -256,6 +256,13 @@ Ticket TODO (execution order):
 - [x] `4.6-04` missing状態表示: `missing_entries` に `LLM補完待ち / 補完済み / 要再確認` を表示
 - [x] `4.6-05` importサマリ表示: `dict-bookmarks-import` の `inserted/updated/skipped/errors` を workspace monitor に表示
 - [x] `4.6-06` 4.6回帰テスト: review/qa join・artifact open/download・import monitor の軽量テストを追加（`tests/test_workspace_regression.py`）
+- [ ] `4.6-07` TikTok likes監視ガードレール: `/@handle/liked` が `foryou` へリダイレクトされるケースを明示エラー化し、workspace monitor に原因（cookie/権限/URL種別）を表示
+- [ ] `4.6-08` likes取得のフォールバック運用: `yt-dlp` 単体で likes 列挙不可時の代替入力（URLリスト投入）を運用フローとして文書化し、`sync` 側に手順リンクを追加
+
+Known issue (2026-02-20):
+
+- `source.url = https://www.tiktok.com/@<handle>/liked` で、環境/セッションにより `https://www.tiktok.com/foryou?lang=en` へリダイレクトされ、`yt-dlp` が `Unsupported URL` で失敗するケースを確認。
+- 同条件でも `https://www.tiktok.com/@<handle>` は取得できるため、likes監視の可用性は posts監視より低い。
 
 Intermediate artifact connectivity audit (2026-02-15):
 

@@ -1145,12 +1145,62 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.workspace-progress-wrap {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(132, 159, 232, 0.36);
+  background: rgba(8, 14, 30, 0.78);
+  overflow: hidden;
+}
+
+.workspace-progress-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(111, 141, 255, 0.9), rgba(83, 241, 216, 0.9));
+  transition: width 180ms ease;
+}
+
+.workspace-progress-bar.running {
+  background: linear-gradient(90deg, rgba(111, 141, 255, 0.9), rgba(83, 241, 216, 0.9));
+}
+
+.workspace-progress-bar.ok {
+  background: linear-gradient(90deg, rgba(82, 208, 158, 0.95), rgba(123, 230, 190, 0.95));
+}
+
+.workspace-progress-bar.error {
+  background: linear-gradient(90deg, rgba(255, 99, 125, 0.95), rgba(255, 149, 119, 0.95));
+}
+
 .workspace-jump-btn {
   width: auto;
   justify-self: start;
   padding: 6px 10px;
   border-radius: 999px;
   font-size: 0.74rem;
+}
+
+.source-target-card .workspace-list.compact {
+  max-height: 28vh;
+}
+
+.source-target-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.source-target-enabled-field input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  margin: 0;
+}
+
+.source-target-item .workspace-artifact-actions {
+  margin-top: 2px;
 }
 
 .shortcuts ul {
@@ -1288,6 +1338,7 @@ textarea {
   .study-column .subtitle-reel-card,
   .study-column .workspace-review-card,
   .study-column .workspace-monitor-card,
+  .study-column .source-target-card,
   .study-column .shortcuts {
     grid-column: span 2;
   }
@@ -1332,8 +1383,13 @@ textarea {
   .study-column .subtitle-reel-card,
   .study-column .workspace-review-card,
   .study-column .workspace-monitor-card,
+  .study-column .source-target-card,
   .study-column .shortcuts {
     grid-column: span 1;
+  }
+
+  .source-target-form-grid {
+    grid-template-columns: 1fr;
   }
 
   .subtitle-reel-card {

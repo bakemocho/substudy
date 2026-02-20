@@ -150,6 +150,52 @@
             </div>
           </article>
 
+          <article class="card source-target-card">
+            <div class="workspace-card-head">
+              <h3>監視ターゲット管理</h3>
+              <button id="sourceTargetsRefreshBtn" class="workspace-refresh-btn" type="button">更新</button>
+            </div>
+            <p id="sourceTargetsSummary" class="hint">監視ターゲットを読み込み中...</p>
+            <div id="sourceTargetsList" class="workspace-list compact"></div>
+
+            <details class="bookmark-inline-tools source-target-editor">
+              <summary>ターゲット追加 / 更新</summary>
+              <div class="source-target-form-grid">
+                <label class="field">
+                  <span>source id</span>
+                  <input id="sourceTargetIdInput" type="text" placeholder="例: storiesofcz_likes" />
+                </label>
+                <label class="field">
+                  <span>監視種別</span>
+                  <select id="sourceTargetWatchKindSelect">
+                    <option value="posts">投稿</option>
+                    <option value="likes">いいね欄</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>対象アカウント（@不要）</span>
+                  <input id="sourceTargetHandleInput" type="text" placeholder="例: storiesofcz" />
+                </label>
+                <label class="field">
+                  <span>カスタムURL（任意）</span>
+                  <input id="sourceTargetUrlInput" type="text" placeholder="未入力なら自動生成" />
+                </label>
+                <label class="field">
+                  <span>保存先 data_dir（任意）</span>
+                  <input id="sourceTargetDataDirInput" type="text" placeholder="未入力なら source id" />
+                </label>
+                <label class="field source-target-enabled-field">
+                  <span>有効化</span>
+                  <input id="sourceTargetEnabledInput" type="checkbox" checked />
+                </label>
+              </div>
+              <div class="inline-actions">
+                <button id="sourceTargetSaveBtn" type="button">保存</button>
+                <button id="sourceTargetResetBtn" type="button">新規入力</button>
+              </div>
+            </details>
+          </article>
+
           <article class="card">
             <h3>動画メモ</h3>
             <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>

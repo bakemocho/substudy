@@ -45,6 +45,8 @@ ledger_csv = "data/master_ledger.csv"
 [[sources]]
 id = "example_creator"
 platform = "tiktok"
+# watch_kind = "posts"        # posts | likes
+# target_handle = "example_creator"
 url = "https://www.tiktok.com/@example_creator"
 enabled = true
 
@@ -71,3 +73,13 @@ asr_dir = "asr"
 # backfill_window = 300
 # backfill_windows_per_run = 2
 # asr_enabled = true
+
+# いいね欄を監視する例（公開いいねのみ取得可能）:
+#
+# [[sources]]
+# id = "example_creator_likes"
+# platform = "tiktok"
+# watch_kind = "likes"
+# target_handle = "example_creator"
+# enabled = true
+# data_dir = "example_creator_likes"

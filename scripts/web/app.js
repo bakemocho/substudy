@@ -183,6 +183,9 @@ const state = {
   workspaceDownloadMonitor: null,
   workspaceImportMonitor: null,
   workspaceArtifacts: [],
+  sourceTargets: [],
+  sourceTargetsManagedPath: "",
+  sourceTargetEditId: "",
   workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
 };
@@ -245,6 +248,17 @@ const elements = {
   workspaceImportSummary: document.getElementById("workspaceImportSummary"),
   workspaceImportRuns: document.getElementById("workspaceImportRuns"),
   workspaceArtifacts: document.getElementById("workspaceArtifacts"),
+  sourceTargetsRefreshBtn: document.getElementById("sourceTargetsRefreshBtn"),
+  sourceTargetsSummary: document.getElementById("sourceTargetsSummary"),
+  sourceTargetsList: document.getElementById("sourceTargetsList"),
+  sourceTargetIdInput: document.getElementById("sourceTargetIdInput"),
+  sourceTargetWatchKindSelect: document.getElementById("sourceTargetWatchKindSelect"),
+  sourceTargetHandleInput: document.getElementById("sourceTargetHandleInput"),
+  sourceTargetUrlInput: document.getElementById("sourceTargetUrlInput"),
+  sourceTargetDataDirInput: document.getElementById("sourceTargetDataDirInput"),
+  sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
+  sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
+  sourceTargetResetBtn: document.getElementById("sourceTargetResetBtn"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
@@ -6526,6 +6540,247 @@ function resetWorkspaceState() {
   state.workspaceArtifacts = [];
 }
 
+function normalizeSourceTargetHandleInput(rawValue) {
+  const rawText = String(rawValue || "").trim();
+  if (!rawText) {
+    return "";
+  }
+  const match = rawText.match(/tiktok\.com\/@([^/?]+)/i);
+  if (match && match[1]) {
+    return String(match[1]).trim();
+  }
+  return rawText.replace(/^@+/, "").split("/", 1)[0].trim();
+}
+
+function sourceTargetWatchKindLabel(watchKind) {
+  return String(watchKind || "").trim().toLowerCase() === "likes" ? "いいね欄" : "投稿";
+}
+
+function sourceTargetOriginLabel(origin) {
+  const normalized = String(origin || "").trim().toLowerCase();
+  if (normalized === "managed") {
+    return "managed";
+  }
+  if (normalized === "managed_override") {
+    return "override";
+  }
+  return "config";
+}
+
+function setSourceTargetFormFromItem(item = null) {
+  const target = item || null;
+  state.sourceTargetEditId = target ? String(target.id || "") : "";
+  if (elements.sourceTargetIdInput) {
+    elements.sourceTargetIdInput.value = target ? String(target.id || "") : "";
+  }
+  if (elements.sourceTargetWatchKindSelect) {
+    elements.sourceTargetWatchKindSelect.value = target ? String(target.watch_kind || "posts") : "posts";
+  }
+  if (elements.sourceTargetHandleInput) {
+    elements.sourceTargetHandleInput.value = target
+      ? String(target.target_handle || target.handle || "")
+      : "";
+  }
+  if (elements.sourceTargetUrlInput) {
+    elements.sourceTargetUrlInput.value = target ? String(target.url || "") : "";
+  }
+  if (elements.sourceTargetDataDirInput) {
+    elements.sourceTargetDataDirInput.value = target ? String(target.data_dir || "") : "";
+  }
+  if (elements.sourceTargetEnabledInput) {
+    elements.sourceTargetEnabledInput.checked = target ? Boolean(target.enabled) : true;
+  }
+}
+
+function buildSourceTargetPayloadFromItem(item, overrides = {}) {
+  const merged = {
+    id: String(item?.id || ""),
+    watch_kind: String(item?.watch_kind || "posts"),
+    target_handle: String(item?.target_handle || item?.handle || ""),
+    url: String(item?.url || ""),
+    data_dir: String(item?.data_dir || ""),
+    enabled: Boolean(item?.enabled),
+    ...overrides,
+  };
+  const payload = {
+    id: String(merged.id || "").trim(),
+    watch_kind: String(merged.watch_kind || "posts").trim().toLowerCase() === "likes" ? "likes" : "posts",
+    target_handle: normalizeSourceTargetHandleInput(merged.target_handle),
+    url: String(merged.url || "").trim(),
+    data_dir: String(merged.data_dir || "").trim(),
+    enabled: Boolean(merged.enabled),
+  };
+  return payload;
+}
+
+function buildSourceTargetPayloadFromForm() {
+  const id = String(elements.sourceTargetIdInput?.value || "").trim();
+  const watchKind = String(elements.sourceTargetWatchKindSelect?.value || "posts").trim().toLowerCase() === "likes"
+    ? "likes"
+    : "posts";
+  const targetHandle = normalizeSourceTargetHandleInput(elements.sourceTargetHandleInput?.value || "");
+  const url = String(elements.sourceTargetUrlInput?.value || "").trim();
+  const dataDir = String(elements.sourceTargetDataDirInput?.value || "").trim();
+  const enabled = Boolean(elements.sourceTargetEnabledInput?.checked);
+  if (!id) {
+    throw new Error("source id を入力してください。");
+  }
+  if (!targetHandle && !url) {
+    throw new Error("対象アカウントかカスタムURLのどちらかを入力してください。");
+  }
+  return {
+    id,
+    watch_kind: watchKind,
+    target_handle: targetHandle,
+    url,
+    data_dir: dataDir,
+    enabled,
+  };
+}
+
+async function upsertSourceTarget(payload, doneMessage) {
+  await apiRequest("/api/source-targets/upsert", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  await loadSourceTargets({ silent: true });
+  setStatus(doneMessage, "ok");
+}
+
+async function removeSourceTargetOverride(item) {
+  const sourceId = String(item?.id || "").trim();
+  if (!sourceId) {
+    return;
+  }
+  await apiRequest("/api/source-targets/remove", {
+    method: "POST",
+    body: JSON.stringify({ id: sourceId }),
+  });
+  if (state.sourceTargetEditId === sourceId) {
+    setSourceTargetFormFromItem(null);
+  }
+  await loadSourceTargets({ silent: true });
+  setStatus(`ターゲット設定を解除しました: ${sourceId}`, "ok");
+}
+
+function renderSourceTargetsPanel() {
+  const targets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
+  const enabledCount = targets.filter((item) => Boolean(item?.enabled)).length;
+  const likesCount = targets.filter(
+    (item) => String(item?.watch_kind || "").trim().toLowerCase() === "likes"
+  ).length;
+  if (elements.sourceTargetsSummary) {
+    const managedPath = String(state.sourceTargetsManagedPath || "").trim();
+    const summary = `targets:${targets.length} • enabled:${enabledCount} • likes:${likesCount}`;
+    elements.sourceTargetsSummary.textContent = managedPath
+      ? `${summary} • managed:${managedPath}`
+      : summary;
+  }
+
+  renderWorkspaceList(
+    elements.sourceTargetsList,
+    targets,
+    (item) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact source-target-item";
+
+      const head = document.createElement("div");
+      head.className = "workspace-item-head";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      title.textContent = `${String(item?.id || "")} • ${sourceTargetWatchKindLabel(item?.watch_kind)}`;
+
+      const badge = document.createElement("span");
+      badge.className = "workspace-badge";
+      badge.textContent = Boolean(item?.enabled) ? "enabled" : "disabled";
+      if (!item?.enabled) {
+        badge.classList.add("missing");
+      }
+
+      head.appendChild(title);
+      head.appendChild(badge);
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      meta.textContent = `@${String(item?.target_handle || item?.handle || "-")} • origin:${sourceTargetOriginLabel(item?.origin)} • videos:${Number(item?.video_count || 0)}`;
+
+      const url = document.createElement("p");
+      url.className = "workspace-item-meta";
+      url.textContent = String(item?.url || "");
+
+      const actions = document.createElement("div");
+      actions.className = "workspace-artifact-actions";
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "workspace-jump-btn workspace-artifact-btn";
+      editBtn.textContent = "編集";
+      editBtn.addEventListener("click", () => {
+        setSourceTargetFormFromItem(item);
+        setStatus(`編集対象: ${String(item?.id || "")}`, "ok");
+      });
+      actions.appendChild(editBtn);
+
+      const toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.className = "workspace-jump-btn workspace-artifact-btn";
+      const enableNext = !Boolean(item?.enabled);
+      toggleBtn.textContent = enableNext ? "有効化" : "無効化";
+      toggleBtn.addEventListener("click", () => {
+        const payload = buildSourceTargetPayloadFromItem(item, { enabled: enableNext });
+        upsertSourceTarget(
+          payload,
+          `${String(item?.id || "")} を${enableNext ? "有効化" : "無効化"}しました。`
+        ).catch((error) => setStatus(error.message, "error"));
+      });
+      actions.appendChild(toggleBtn);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "workspace-jump-btn workspace-artifact-btn";
+      const origin = String(item?.origin || "").trim().toLowerCase();
+      if (origin === "managed_override") {
+        removeBtn.textContent = "override解除";
+      } else {
+        removeBtn.textContent = "削除";
+      }
+      if (origin === "config") {
+        removeBtn.disabled = true;
+        removeBtn.title = "config 側の定義はここからは削除できません。";
+      } else {
+        removeBtn.addEventListener("click", () => {
+          removeSourceTargetOverride(item).catch((error) => setStatus(error.message, "error"));
+        });
+      }
+      actions.appendChild(removeBtn);
+
+      row.appendChild(head);
+      row.appendChild(meta);
+      if (url.textContent) {
+        row.appendChild(url);
+      }
+      row.appendChild(actions);
+      return row;
+    },
+    "監視ターゲットは未設定です。"
+  );
+}
+
+async function loadSourceTargets(options = {}) {
+  const { silent = false } = options;
+  if (!elements.sourceTargetsList) {
+    return;
+  }
+  if (!silent && elements.sourceTargetsSummary) {
+    elements.sourceTargetsSummary.textContent = "監視ターゲットを読み込み中...";
+  }
+  const payload = await apiRequest("/api/source-targets");
+  state.sourceTargets = Array.isArray(payload.targets) ? payload.targets : [];
+  state.sourceTargetsManagedPath = String(payload.managed_path || "");
+  renderSourceTargetsPanel();
+}
+
 function renderWorkspaceList(container, items, renderItem, emptyMessage) {
   if (!container) {
     return;
@@ -6788,10 +7043,40 @@ function renderWorkspaceDownloadRuns() {
 
       const meta = document.createElement("p");
       meta.className = "workspace-item-meta";
-      meta.textContent = `${formatShortIso(run?.started_at)} • ok:${Number(run?.success_count || 0)} / ng:${Number(run?.failure_count || 0)}`;
+      const targetCount = Number(run?.target_count || 0);
+      const successCount = Number(run?.success_count || 0);
+      const failureCount = Number(run?.failure_count || 0);
+      const processedCount = Math.max(0, successCount + failureCount);
+      const status = String(run?.status || "").trim().toLowerCase();
+      const progressSuffix = targetCount > 0 ? ` • ${processedCount}/${targetCount}` : "";
+      meta.textContent = `${formatShortIso(run?.started_at)} • ok:${successCount} / ng:${failureCount}${progressSuffix}`;
 
       row.appendChild(title);
       row.appendChild(meta);
+      if (targetCount > 0) {
+        const progressWrap = document.createElement("div");
+        progressWrap.className = "workspace-progress-wrap";
+        const progressBar = document.createElement("div");
+        progressBar.className = "workspace-progress-bar";
+        const ratio = Math.max(0, Math.min(1, processedCount / targetCount));
+        if (status === "error") {
+          progressBar.classList.add("error");
+        } else if (status === "success" && ratio >= 1) {
+          progressBar.classList.add("ok");
+        } else if (status === "running") {
+          progressBar.classList.add("running");
+        }
+        progressBar.style.width = `${Math.round(ratio * 100)}%`;
+        progressWrap.appendChild(progressBar);
+        row.appendChild(progressWrap);
+      }
+      const errorMessage = String(run?.error_message || "").trim();
+      if (errorMessage) {
+        const detail = document.createElement("p");
+        detail.className = "workspace-item-meta";
+        detail.textContent = errorMessage;
+        row.appendChild(detail);
+      }
       return row;
     },
     "直近の実行履歴はありません。"
@@ -7913,6 +8198,47 @@ function bindEvents() {
       resetControlsToggleFade();
     });
   }
+  if (elements.sourceTargetsRefreshBtn) {
+    elements.sourceTargetsRefreshBtn.addEventListener("click", () => {
+      loadSourceTargets({ silent: false })
+        .then(() => {
+          setStatus("監視ターゲットを更新しました。", "ok");
+        })
+        .catch((error) => {
+          setStatus(error.message, "error");
+        });
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.sourceTargetSaveBtn) {
+    elements.sourceTargetSaveBtn.addEventListener("click", () => {
+      let payload = null;
+      try {
+        payload = buildSourceTargetPayloadFromForm();
+      } catch (error) {
+        setStatus(error.message, "error");
+        return;
+      }
+      upsertSourceTarget(payload, `ターゲットを保存しました: ${payload.id}`)
+        .catch((error) => {
+          setStatus(error.message, "error");
+        });
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.sourceTargetResetBtn) {
+    elements.sourceTargetResetBtn.addEventListener("click", () => {
+      setSourceTargetFormFromItem(null);
+      setStatus("ターゲット入力をリセットしました。", "ok");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.sourceTargetHandleInput) {
+    elements.sourceTargetHandleInput.addEventListener("blur", () => {
+      const normalized = normalizeSourceTargetHandleInput(elements.sourceTargetHandleInput.value);
+      elements.sourceTargetHandleInput.value = normalized;
+    });
+  }
 
   elements.autoplayToggle.addEventListener("click", () => {
     state.autoplayContinuous = !state.autoplayContinuous;
@@ -8134,6 +8460,8 @@ async function initialize() {
   updatePlayPauseButton();
   resetWorkspaceState();
   renderWorkspacePanels();
+  setSourceTargetFormFromItem(null);
+  renderSourceTargetsPanel();
   bindEvents();
 
   try {
@@ -8150,6 +8478,11 @@ async function initialize() {
       state.translationFilter,
       initialSelection.playbackTimeSec
     );
+    try {
+      await loadSourceTargets({ silent: true });
+    } catch (error) {
+      setStatus(`監視ターゲット読み込み失敗: ${error.message}`, "error");
+    }
     schedulePhoneShellSnapCheck();
     setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
   } catch (error) {

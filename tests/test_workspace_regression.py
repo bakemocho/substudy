@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import sys
 import tempfile
@@ -154,6 +155,201 @@ class WorkspaceRegressionTests(unittest.TestCase):
             self.assertTrue(
                 str(response.headers.get("Content-Disposition", "")).startswith("attachment;")
             )
+
+    def test_load_config_with_managed_target_overrides(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        managed_path = config_dir / "source_targets.json"
+        managed_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "targets": [
+                        {
+                            "id": "storiesofcz",
+                            "watch_kind": "posts",
+                            "target_handle": "storiesofcz",
+                            "enabled": False,
+                            "url": "https://www.tiktok.com/@storiesofcz",
+                        },
+                        {
+                            "id": "storiesofcz_likes",
+                            "watch_kind": "likes",
+                            "target_handle": "storiesofcz",
+                            "enabled": True,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        self.assertIn("storiesofcz", by_id)
+        self.assertIn("storiesofcz_likes", by_id)
+
+        override_source = by_id["storiesofcz"]
+        self.assertFalse(override_source.enabled)
+        self.assertEqual(override_source.origin, "managed_override")
+
+        likes_source = by_id["storiesofcz_likes"]
+        self.assertTrue(likes_source.enabled)
+        self.assertEqual(likes_source.watch_kind, "likes")
+        self.assertEqual(likes_source.target_handle, "storiesofcz")
+        self.assertEqual(likes_source.url, "https://www.tiktok.com/@storiesofcz/liked")
+        self.assertEqual(likes_source.origin, "managed")
+
+    def test_source_target_api_upsert_and_remove(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        upsert_url = f"http://{host}:{port}/api/source-targets/upsert"
+        list_url = f"http://{host}:{port}/api/source-targets"
+        remove_url = f"http://{host}:{port}/api/source-targets/remove"
+
+        upsert_payload = {
+            "id": "storiesofcz_likes",
+            "watch_kind": "likes",
+            "target_handle": "storiesofcz",
+            "enabled": True,
+        }
+        request = urllib.request.Request(
+            upsert_url,
+            data=json.dumps(upsert_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertIn(payload.get("status"), {"created", "updated"})
+
+        with urllib.request.urlopen(list_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            list_payload = json.loads(response.read().decode("utf-8"))
+        by_id = {row["id"]: row for row in list_payload.get("targets", [])}
+        self.assertIn("storiesofcz_likes", by_id)
+        self.assertEqual(by_id["storiesofcz_likes"]["watch_kind"], "likes")
+        self.assertEqual(by_id["storiesofcz_likes"]["url"], "https://www.tiktok.com/@storiesofcz/liked")
+
+        remove_request = urllib.request.Request(
+            remove_url,
+            data=json.dumps({"id": "storiesofcz_likes"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(remove_request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            remove_payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(remove_payload.get("status"), "removed")
+
+        with urllib.request.urlopen(list_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            list_payload_after = json.loads(response.read().decode("utf-8"))
+        by_id_after = {row["id"]: row for row in list_payload_after.get("targets", [])}
+        self.assertNotIn("storiesofcz_likes", by_id_after)
+
+    def test_feed_sources_include_configured_sources_without_media(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+
+[[sources]]
+id = "ortbake"
+platform = "tiktok"
+url = "https://www.tiktok.com/@ortbake/liked"
+watch_kind = "likes"
+target_handle = "ortbake"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(payload.get("count"), 0)
+        self.assertEqual(payload.get("videos"), [])
+        source_ids = set(payload.get("sources", []))
+        self.assertIn("storiesofcz", source_ids)
+        self.assertIn("ortbake", source_ids)
 
 
 if __name__ == "__main__":

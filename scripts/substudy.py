@@ -35,6 +35,12 @@ DEFAULT_CONFIG = Path("config/sources.toml")
 DEFAULT_LEDGER_DB = Path("data/master_ledger.sqlite")
 DEFAULT_LEDGER_CSV = Path("data/master_ledger.csv")
 DEFAULT_TIKTOK_VIDEO_URL = "https://www.tiktok.com/@{handle}/video/{id}"
+DEFAULT_TIKTOK_PROFILE_URL = "https://www.tiktok.com/@{handle}"
+DEFAULT_TIKTOK_LIKED_URL = "https://www.tiktok.com/@{handle}/liked"
+SOURCE_WATCH_KIND_POSTS = "posts"
+SOURCE_WATCH_KIND_LIKES = "likes"
+DEFAULT_MANAGED_TARGETS_FILE_NAME = "source_targets.json"
+MANAGED_TARGETS_FORMAT_VERSION = 1
 DEFAULT_PLAYLIST_END = 200
 DEFAULT_ASR_EXTS = ["srt", "vtt"]
 DEFAULT_LOUDNESS_TARGET_LUFS = -16.0
@@ -70,6 +76,8 @@ class SourceConfig:
     id: str
     platform: str
     url: str
+    watch_kind: str
+    target_handle: str | None
     enabled: bool
     data_dir: Path
     media_dir: Path
@@ -107,6 +115,7 @@ class SourceConfig:
     media_output_template: str
     subs_output_template: str
     meta_output_template: str
+    origin: str
 
 
 def now_utc_iso() -> str:
@@ -242,6 +251,149 @@ def parse_ext_list(raw_value: Any) -> list[str]:
     return exts or list(DEFAULT_ASR_EXTS)
 
 
+def resolve_managed_targets_path(config_path: Path) -> Path:
+    candidate = config_path.expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    return (candidate.parent / DEFAULT_MANAGED_TARGETS_FILE_NAME).resolve()
+
+
+def normalize_source_watch_kind(raw_value: Any) -> str:
+    normalized = str(raw_value or "").strip().lower()
+    if normalized in {
+        SOURCE_WATCH_KIND_LIKES,
+        "liked",
+        "likes_feed",
+        "liked_feed",
+        "favorite",
+        "favorites",
+    }:
+        return SOURCE_WATCH_KIND_LIKES
+    return SOURCE_WATCH_KIND_POSTS
+
+
+def normalize_tiktok_handle(raw_value: Any) -> str | None:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    if "tiktok.com/" in text.lower():
+        inferred = infer_tiktok_handle(text)
+        if inferred:
+            return inferred
+    normalized = text.lstrip("@").strip()
+    normalized = normalized.split("/", 1)[0].strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def build_tiktok_source_url(handle: str, watch_kind: str) -> str:
+    if watch_kind == SOURCE_WATCH_KIND_LIKES:
+        return DEFAULT_TIKTOK_LIKED_URL.format(handle=handle)
+    return DEFAULT_TIKTOK_PROFILE_URL.format(handle=handle)
+
+
+def load_managed_source_overrides(config_path: Path) -> list[dict[str, Any]]:
+    managed_path = resolve_managed_targets_path(config_path)
+    if not managed_path.exists():
+        return []
+    try:
+        payload = json.loads(managed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[config] warning: failed to parse managed targets file ({managed_path}): {exc}", file=sys.stderr)
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw_item in raw_targets:
+        if not isinstance(raw_item, dict):
+            continue
+        source_id = str(raw_item.get("id", "")).strip()
+        if not source_id or source_id in seen_ids:
+            continue
+        seen_ids.add(source_id)
+        platform = str(raw_item.get("platform", "tiktok") or "tiktok").strip().lower()
+        watch_kind = normalize_source_watch_kind(raw_item.get("watch_kind"))
+        target_handle = normalize_tiktok_handle(
+            raw_item.get("target_handle")
+            if raw_item.get("target_handle") not in (None, "")
+            else raw_item.get("handle")
+        )
+        url_raw = str(raw_item.get("url", "")).strip()
+        if not url_raw and platform == "tiktok" and target_handle:
+            url_raw = build_tiktok_source_url(target_handle, watch_kind)
+        if not url_raw:
+            print(
+                f"[config] warning: skip managed target '{source_id}' because url/target_handle is missing",
+                file=sys.stderr,
+            )
+            continue
+
+        normalized: dict[str, Any] = {
+            "id": source_id,
+            "platform": platform,
+            "url": url_raw,
+            "watch_kind": watch_kind,
+            "enabled": parse_bool_like(raw_item.get("enabled"), default=True),
+        }
+        if target_handle:
+            normalized["target_handle"] = target_handle
+            if watch_kind == SOURCE_WATCH_KIND_POSTS:
+                normalized["handle"] = target_handle
+        data_dir = str(raw_item.get("data_dir", "")).strip()
+        if data_dir:
+            normalized["data_dir"] = data_dir
+        video_url_template = str(raw_item.get("video_url_template", "")).strip()
+        if video_url_template:
+            normalized["video_url_template"] = video_url_template
+        entries.append(normalized)
+    return entries
+
+
+def merge_source_rows_with_managed_overrides(
+    base_rows: list[dict[str, Any]],
+    managed_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    merged_by_id: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    origin_by_id: dict[str, str] = {}
+
+    for raw_row in base_rows:
+        if not isinstance(raw_row, dict):
+            continue
+        source_id = str(raw_row.get("id", "")).strip()
+        if not source_id:
+            continue
+        normalized = dict(raw_row)
+        normalized["id"] = source_id
+        if source_id not in merged_by_id:
+            order.append(source_id)
+        merged_by_id[source_id] = normalized
+        origin_by_id[source_id] = "config"
+
+    for managed_row in managed_rows:
+        source_id = str(managed_row.get("id", "")).strip()
+        if not source_id:
+            continue
+        if source_id in merged_by_id:
+            merged = dict(merged_by_id[source_id])
+            merged.update(managed_row)
+            merged_by_id[source_id] = merged
+            origin_by_id[source_id] = "managed_override"
+            continue
+        merged_by_id[source_id] = dict(managed_row)
+        order.append(source_id)
+        origin_by_id[source_id] = "managed"
+
+    merged_rows = [merged_by_id[source_id] for source_id in order if source_id in merged_by_id]
+    return merged_rows, origin_by_id
+
+
 def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -288,15 +440,50 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
     )
     global_cookies_file = parse_optional_path(cwd, global_raw.get("cookies_file"))
 
-    sources_raw = raw.get("sources", [])
+    sources_raw_base = raw.get("sources", [])
+    if sources_raw_base is None:
+        sources_raw_base = []
+    if not isinstance(sources_raw_base, list):
+        raise ValueError("`sources` must be a list of tables.")
+    managed_overrides = load_managed_source_overrides(config_path)
+    sources_raw, source_origin_by_id = merge_source_rows_with_managed_overrides(
+        [row for row in sources_raw_base if isinstance(row, dict)],
+        managed_overrides,
+    )
     if not sources_raw:
-        raise ValueError("No [[sources]] entries found in config.")
+        raise ValueError("No sources found in config (including managed targets).")
 
     sources: list[SourceConfig] = []
     for source_raw in sources_raw:
-        source_id = str(source_raw["id"])
-        platform = str(source_raw.get("platform", "tiktok"))
-        url = str(source_raw["url"])
+        source_id = str(source_raw.get("id", "")).strip()
+        if not source_id:
+            raise ValueError("Each source requires a non-empty `id`.")
+        platform = str(source_raw.get("platform", "tiktok") or "tiktok").strip().lower()
+        watch_kind = normalize_source_watch_kind(source_raw.get("watch_kind"))
+        source_url_raw = str(source_raw.get("url", "")).strip()
+        target_handle = normalize_tiktok_handle(
+            source_raw.get("target_handle")
+            if source_raw.get("target_handle") not in (None, "")
+            else source_raw.get("handle")
+        )
+        if not target_handle and source_url_raw:
+            target_handle = normalize_tiktok_handle(infer_tiktok_handle(source_url_raw))
+        url = source_url_raw
+        if not url and platform == "tiktok" and target_handle:
+            url = build_tiktok_source_url(target_handle, watch_kind)
+        if not url:
+            raise ValueError(
+                f"Source '{source_id}' is missing `url`. "
+                "Set `url` directly, or set `target_handle` (and optional `watch_kind`)."
+            )
+
+        configured_handle = normalize_tiktok_handle(source_raw.get("handle"))
+        if configured_handle:
+            effective_handle = configured_handle
+        elif target_handle:
+            effective_handle = target_handle
+        else:
+            effective_handle = None
 
         data_dir = resolve_source_root(
             base_data_dir=base_data_dir,
@@ -343,7 +530,9 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             id=source_id,
             platform=platform,
             url=url,
-            enabled=bool(source_raw.get("enabled", True)),
+            watch_kind=watch_kind,
+            target_handle=target_handle,
+            enabled=parse_bool_like(source_raw.get("enabled"), default=True),
             data_dir=data_dir,
             media_dir=resolve_path(data_dir, source_raw.get("media_dir"), "media"),
             subs_dir=resolve_path(data_dir, source_raw.get("subs_dir"), "subs"),
@@ -351,7 +540,7 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             media_archive=resolve_path(data_dir, source_raw.get("media_archive"), "archives/media.archive.txt"),
             subs_archive=resolve_path(data_dir, source_raw.get("subs_archive"), "archives/subs.archive.txt"),
             urls_file=resolve_path(data_dir, source_raw.get("urls_file"), "archives/urls.txt"),
-            handle=source_raw.get("handle") or infer_tiktok_handle(url),
+            handle=effective_handle,
             video_url_template=source_raw.get("video_url_template"),
             video_id_regex=str(source_raw.get("video_id_regex", r"_(\d{10,})_")),
             ytdlp_bin=str(source_raw.get("ytdlp_bin", global_raw.get("ytdlp_bin", "yt-dlp"))),
@@ -397,6 +586,7 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
                 source_raw.get("subs_output_template", "%(id)s.%(language)s.%(ext)s")
             ),
             meta_output_template=str(source_raw.get("meta_output_template", "%(id)s.%(ext)s")),
+            origin=source_origin_by_id.get(source_id, "config"),
         )
         sources.append(source)
 
@@ -827,78 +1017,132 @@ def sync_source(
                     except OSError:
                         pass
 
+        if (
+            connection is not None
+            and not dry_run
+            and media_run_id is not None
+            and media_audio_target_ids
+        ):
+            update_download_run_progress(
+                connection=connection,
+                run_id=media_run_id,
+                target_count=len(media_audio_target_ids),
+                success_count=0,
+                failure_count=0,
+                error_message=f"audio_fallback 0/{len(media_audio_target_ids)}",
+            )
+            connection.commit()
+
         if not dry_run and media_audio_target_ids and ffprobe_bin is not None:
             for video_id in media_audio_target_ids:
                 if video_id not in seen_evaluated_media_ids:
                     seen_evaluated_media_ids.add(video_id)
                     evaluated_media_ids.append(video_id)
 
-                media_path = find_media_file_for_video(source, video_id)
-                if media_path is None or not media_path.exists():
-                    media_path, primary_error = run_media_primary_download(video_id, None)
-                    if primary_error is not None:
-                        media_audio_fallback_failures[video_id] = primary_error
+                progress_note = ""
+                try:
+                    media_path = find_media_file_for_video(source, video_id)
+                    if media_path is None or not media_path.exists():
+                        media_path, primary_error = run_media_primary_download(video_id, None)
+                        if primary_error is not None:
+                            media_audio_fallback_failures[video_id] = primary_error
+                            progress_note = "primary_failed"
+                            print(
+                                f"[media] {source.id}/{video_id}: primary download failed "
+                                f"({primary_error})",
+                                file=sys.stderr,
+                            )
+                            continue
+
+                    has_audio_stream, probe_error = detect_audio_stream(
+                        media_path=media_path,
+                        ffprobe_bin=ffprobe_bin,
+                    )
+                    if has_audio_stream is True:
+                        progress_note = "already_has_audio"
+                        continue
+                    if has_audio_stream is None:
+                        progress_note = "ffprobe_warning"
                         print(
-                            f"[media] {source.id}/{video_id}: primary download failed "
-                            f"({primary_error})",
+                            f"[media] {source.id}/{video_id}: ffprobe warning ({probe_error}); "
+                            "skip audio fallback",
                             file=sys.stderr,
                         )
                         continue
 
-                has_audio_stream, probe_error = detect_audio_stream(
-                    media_path=media_path,
-                    ffprobe_bin=ffprobe_bin,
-                )
-                if has_audio_stream is True:
-                    continue
-                if has_audio_stream is None:
+                    media_path_after, fallback_error = run_media_audio_fallback_merge(video_id, media_path)
+                    if fallback_error is not None:
+                        media_audio_fallback_failures[video_id] = fallback_error
+                        progress_note = "fallback_failed"
+                        print(
+                            f"[media] {source.id}/{video_id}: audio fallback failed "
+                            f"({fallback_error})",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    has_audio_after, probe_error_after = detect_audio_stream(
+                        media_path=media_path_after,
+                        ffprobe_bin=ffprobe_bin,
+                    )
+                    if has_audio_after is True:
+                        media_audio_fallback_repaired += 1
+                        repaired_media_ids.add(video_id)
+                        progress_note = "recovered"
+                        print(
+                            f"[media] {source.id}/{video_id}: recovered audio stream "
+                            "(format=download+mux)"
+                        )
+                        continue
+
+                    if has_audio_after is False:
+                        media_audio_fallback_failures[video_id] = (
+                            "audio fallback still has no audio stream"
+                        )
+                        progress_note = "fallback_no_audio"
+                    else:
+                        media_audio_fallback_failures[video_id] = (
+                            f"audio fallback ffprobe warning: {probe_error_after or 'unknown'}"
+                        )
+                        progress_note = "fallback_probe_warning"
                     print(
-                        f"[media] {source.id}/{video_id}: ffprobe warning ({probe_error}); "
-                        "skip audio fallback",
+                        f"[media] {source.id}/{video_id}: audio fallback did not produce audio",
                         file=sys.stderr,
                     )
-                    continue
-
-                media_path_after, fallback_error = run_media_audio_fallback_merge(video_id, media_path)
-                if fallback_error is not None:
-                    media_audio_fallback_failures[video_id] = fallback_error
-                    print(
-                        f"[media] {source.id}/{video_id}: audio fallback failed "
-                        f"({fallback_error})",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                has_audio_after, probe_error_after = detect_audio_stream(
-                    media_path=media_path_after,
-                    ffprobe_bin=ffprobe_bin,
-                )
-                if has_audio_after is True:
-                    media_audio_fallback_repaired += 1
-                    repaired_media_ids.add(video_id)
-                    print(
-                        f"[media] {source.id}/{video_id}: recovered audio stream "
-                        "(format=download+mux)"
-                    )
-                    continue
-
-                if has_audio_after is False:
-                    media_audio_fallback_failures[video_id] = (
-                        "audio fallback still has no audio stream"
-                    )
-                else:
-                    media_audio_fallback_failures[video_id] = (
-                        f"audio fallback ffprobe warning: {probe_error_after or 'unknown'}"
-                    )
-                print(
-                    f"[media] {source.id}/{video_id}: audio fallback did not produce audio",
-                    file=sys.stderr,
-                )
+                finally:
+                    if connection is not None and media_run_id is not None:
+                        processed_count = len(evaluated_media_ids)
+                        failed_count = len(media_audio_fallback_failures)
+                        success_count = max(0, processed_count - failed_count)
+                        progress_label = (
+                            f"audio_fallback {processed_count}/{len(media_audio_target_ids)}"
+                        )
+                        if progress_note:
+                            progress_label = f"{progress_label} ({progress_note})"
+                        update_download_run_progress(
+                            connection=connection,
+                            run_id=media_run_id,
+                            target_count=len(media_audio_target_ids),
+                            success_count=success_count,
+                            failure_count=failed_count,
+                            error_message=progress_label,
+                        )
+                        connection.commit()
         elif not dry_run and media_audio_target_ids and ffprobe_bin is None:
             print(
                 "[media] ffprobe not found; skipping audio-stream validation for media retries",
                 file=sys.stderr,
             )
+            if connection is not None and media_run_id is not None:
+                update_download_run_progress(
+                    connection=connection,
+                    run_id=media_run_id,
+                    target_count=len(media_audio_target_ids),
+                    success_count=0,
+                    failure_count=0,
+                    error_message="audio_fallback unavailable (ffprobe missing)",
+                )
+                connection.commit()
 
         if connection is not None and not dry_run:
             for video_id in evaluated_media_ids:
@@ -1091,38 +1335,52 @@ def sync_source(
                 f"deferred={len(deferred_sub_ids)})"
             )
         else:
-            subtitle_urls = [build_video_url(source, video_id) for video_id in subtitle_target_ids]
+            subtitle_url_pairs: list[tuple[str, str]] = []
+            unresolved_subtitle_target_ids: list[str] = []
+            for video_id in subtitle_target_ids:
+                video_url = safe_video_url(video_id)
+                if not video_url:
+                    unresolved_subtitle_target_ids.append(video_id)
+                    continue
+                subtitle_url_pairs.append((video_id, video_url))
+            resolved_subtitle_target_ids = [video_id for video_id, _ in subtitle_url_pairs]
+            subtitle_urls = [url for _, url in subtitle_url_pairs]
+
             if dry_run:
                 print(
                     f"subtitle targets (dry-run): {len(subtitle_target_ids)} "
-                    f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
+                    f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
                     f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                     f"deferred={len(deferred_sub_ids)})"
                 )
-            else:
+            elif subtitle_urls:
                 write_urls_file(source.urls_file, subtitle_urls)
 
-            subs_command = [
-                source.ytdlp_bin,
-                *cookie_flags,
-                "--download-archive",
-                str(source.subs_archive),
-                "--continue",
-                "--no-overwrites",
-                *retry_flags,
-                "--skip-download",
-                "--write-subs",
-                "--write-auto-subs",
-                "--sub-langs",
-                source.sub_langs,
-                "--sub-format",
-                source.sub_format,
-                "-o",
-                str(source.subs_dir / source.subs_output_template),
-                "--no-playlist",
-                "-a",
-                str(source.urls_file),
-            ]
+            subs_command: list[str] | None = None
+            if resolved_subtitle_target_ids:
+                subs_command = [
+                    source.ytdlp_bin,
+                    *cookie_flags,
+                    "--download-archive",
+                    str(source.subs_archive),
+                    "--continue",
+                    "--no-overwrites",
+                    *retry_flags,
+                    "--skip-download",
+                    "--write-subs",
+                    "--write-auto-subs",
+                    "--sub-langs",
+                    source.sub_langs,
+                    "--sub-format",
+                    source.sub_format,
+                    "-o",
+                    str(source.subs_dir / source.subs_output_template),
+                    "--no-playlist",
+                    "-a",
+                    str(source.urls_file),
+                ]
+
             subs_started_at = now_utc_iso()
             subs_run_id: int | None = None
             if connection is not None and not dry_run:
@@ -1131,33 +1389,35 @@ def sync_source(
                     source_id=source.id,
                     stage="subs",
                     command=subs_command,
-                    target_count=len(subtitle_target_ids),
+                    target_count=len(resolved_subtitle_target_ids),
                     started_at=subs_started_at,
                 )
                 connection.commit()
 
             subs_exit_code = 0
             subs_error: str | None = None
-            try:
-                subs_exit_code = run_command(subs_command, dry_run=dry_run, raise_on_error=False)
-            except Exception as exc:
-                subs_exit_code = 1
-                subs_error = str(exc)
-                print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
+            if subs_command is not None:
+                try:
+                    subs_exit_code = run_command(subs_command, dry_run=dry_run, raise_on_error=False)
+                except Exception as exc:
+                    subs_exit_code = 1
+                    subs_error = str(exc)
+                    print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
 
             if not dry_run:
                 subs_after_ids = set(read_archive_ids(source.subs_archive))
                 local_sub_after_ids = set(scan_subtitles(source).keys())
                 success_sub_ids = [
                     video_id
-                    for video_id in subtitle_target_ids
+                    for video_id in resolved_subtitle_target_ids
                     if video_id in subs_after_ids or video_id in local_sub_after_ids
                 ]
                 failed_sub_ids = [
                     video_id
-                    for video_id in subtitle_target_ids
+                    for video_id in resolved_subtitle_target_ids
                     if video_id not in subs_after_ids and video_id not in local_sub_after_ids
                 ]
+                failed_sub_ids.extend(unresolved_subtitle_target_ids)
 
                 if connection is not None:
                     for video_id in success_sub_ids:
@@ -1185,11 +1445,14 @@ def sync_source(
                             (source.id, "subs", video_id),
                         ).fetchone()
                         next_retry_count = (int(current[0]) if current else 0) + 1
-                        failure_reason = subs_error or (
-                            f"command exit code {subs_exit_code}"
-                            if subs_exit_code != 0
-                            else "subtitle file missing after download attempt"
-                        )
+                        if video_id in unresolved_subtitle_target_ids:
+                            failure_reason = "cannot build video URL for subtitle download target"
+                        else:
+                            failure_reason = subs_error or (
+                                f"command exit code {subs_exit_code}"
+                                if subs_exit_code != 0
+                                else "subtitle file missing after download attempt"
+                            )
                         upsert_download_state(
                             connection=connection,
                             source_id=source.id,
@@ -1213,10 +1476,14 @@ def sync_source(
                         success_count=len(success_sub_ids),
                         failure_count=len(failed_sub_ids),
                         error_message=None if not failed_sub_ids else (
-                            subs_error or (
-                                f"command exit code {subs_exit_code}"
-                                if subs_exit_code != 0
-                                else "some subtitle items are still missing"
+                            "cannot build URL for some subtitle targets"
+                            if unresolved_subtitle_target_ids and subs_error is None and subs_exit_code == 0
+                            else (
+                                subs_error or (
+                                    f"command exit code {subs_exit_code}"
+                                    if subs_exit_code != 0
+                                    else "some subtitle items are still missing"
+                                )
                             )
                         ),
                     )
@@ -1225,7 +1492,8 @@ def sync_source(
                 print(
                     f"subtitle targets={len(subtitle_target_ids)} "
                     f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
-                    f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+                    f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
+                    f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
                     f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                     f"deferred={len(deferred_sub_ids)})"
                 )
@@ -1295,31 +1563,43 @@ def sync_source(
         print("metadata already up to date")
         return
 
-    urls = [build_video_url(source, video_id) for video_id in metadata_target_ids]
+    metadata_url_pairs: list[tuple[str, str]] = []
+    unresolved_metadata_target_ids: list[str] = []
+    for video_id in metadata_target_ids:
+        video_url = safe_video_url(video_id)
+        if not video_url:
+            unresolved_metadata_target_ids.append(video_id)
+            continue
+        metadata_url_pairs.append((video_id, video_url))
+    resolved_metadata_target_ids = [video_id for video_id, _ in metadata_url_pairs]
+    urls = [url for _, url in metadata_url_pairs]
     if dry_run:
         print(
             f"metadata target IDs (dry-run): {len(metadata_target_ids)} "
-            f"(new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
+            f"(resolved={len(resolved_metadata_target_ids)}, unresolved={len(unresolved_metadata_target_ids)}, "
+            f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
             f"deferred={len(deferred_missing_ids)})"
         )
-    else:
+    elif urls:
         write_urls_file(source.urls_file, urls)
 
-    metadata_command = [
-        source.ytdlp_bin,
-        *cookie_flags,
-        "--skip-download",
-        "--write-info-json",
-        "--write-description",
-        "--continue",
-        "--no-overwrites",
-        *retry_flags,
-        "-o",
-        str(source.meta_dir / source.meta_output_template),
-        "--no-playlist",
-        "-a",
-        str(source.urls_file),
-    ]
+    metadata_command: list[str] | None = None
+    if resolved_metadata_target_ids:
+        metadata_command = [
+            source.ytdlp_bin,
+            *cookie_flags,
+            "--skip-download",
+            "--write-info-json",
+            "--write-description",
+            "--continue",
+            "--no-overwrites",
+            *retry_flags,
+            "-o",
+            str(source.meta_dir / source.meta_output_template),
+            "--no-playlist",
+            "-a",
+            str(source.urls_file),
+        ]
     meta_started_at = now_utc_iso()
     meta_run_id: int | None = None
     if connection is not None and not dry_run:
@@ -1328,26 +1608,30 @@ def sync_source(
             source_id=source.id,
             stage="meta",
             command=metadata_command,
-            target_count=len(metadata_target_ids),
+            target_count=len(resolved_metadata_target_ids),
             started_at=meta_started_at,
         )
         connection.commit()
 
     meta_exit_code = 0
     meta_error: str | None = None
-    try:
-        meta_exit_code = run_command(metadata_command, dry_run=dry_run, raise_on_error=False)
-    except Exception as exc:
-        meta_exit_code = 1
-        meta_error = str(exc)
-        print(f"[sync] {source.id} metadata command failed: {exc}", file=sys.stderr)
+    if metadata_command is not None:
+        try:
+            meta_exit_code = run_command(metadata_command, dry_run=dry_run, raise_on_error=False)
+        except Exception as exc:
+            meta_exit_code = 1
+            meta_error = str(exc)
+            print(f"[sync] {source.id} metadata command failed: {exc}", file=sys.stderr)
 
     if dry_run:
         return
 
     post_meta_ids = list_meta_ids(source.meta_dir)
-    success_meta_ids = [video_id for video_id in metadata_target_ids if video_id in post_meta_ids]
-    failed_meta_ids = [video_id for video_id in metadata_target_ids if video_id not in post_meta_ids]
+    success_meta_ids = [video_id for video_id in resolved_metadata_target_ids if video_id in post_meta_ids]
+    failed_meta_ids = [
+        video_id for video_id in resolved_metadata_target_ids if video_id not in post_meta_ids
+    ]
+    failed_meta_ids.extend(unresolved_metadata_target_ids)
 
     if connection is not None:
         for video_id in success_meta_ids:
@@ -1375,11 +1659,14 @@ def sync_source(
                 (source.id, "meta", video_id),
             ).fetchone()
             next_retry_count = (int(current[0]) if current else 0) + 1
-            failure_reason = meta_error or (
-                f"command exit code {meta_exit_code}"
-                if meta_exit_code != 0
-                else "metadata file missing after download attempt"
-            )
+            if video_id in unresolved_metadata_target_ids:
+                failure_reason = "cannot build video URL for metadata download target"
+            else:
+                failure_reason = meta_error or (
+                    f"command exit code {meta_exit_code}"
+                    if meta_exit_code != 0
+                    else "metadata file missing after download attempt"
+                )
             upsert_download_state(
                 connection=connection,
                 source_id=source.id,
@@ -1403,10 +1690,14 @@ def sync_source(
             success_count=len(success_meta_ids),
             failure_count=len(failed_meta_ids),
             error_message=None if not failed_meta_ids else (
-                meta_error or (
-                    f"command exit code {meta_exit_code}"
-                    if meta_exit_code != 0
-                    else "some metadata items are still missing"
+                "cannot build URL for some metadata targets"
+                if unresolved_metadata_target_ids and meta_error is None and meta_exit_code == 0
+                else (
+                    meta_error or (
+                        f"command exit code {meta_exit_code}"
+                        if meta_exit_code != 0
+                        else "some metadata items are still missing"
+                    )
                 )
             ),
         )
@@ -1415,7 +1706,8 @@ def sync_source(
     print(
         f"metadata targets={len(metadata_target_ids)} "
         f"success={len(success_meta_ids)} failed={len(failed_meta_ids)} "
-        f"(new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
+        f"(resolved={len(resolved_metadata_target_ids)}, unresolved={len(unresolved_metadata_target_ids)}, "
+        f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
         f"deferred={len(deferred_missing_ids)})"
     )
 
@@ -2825,6 +3117,34 @@ def finish_download_run(
             status,
             finished_at,
             exit_code,
+            success_count,
+            failure_count,
+            error_message,
+            run_id,
+        ),
+    )
+
+
+def update_download_run_progress(
+    connection: sqlite3.Connection,
+    run_id: int,
+    target_count: int | None = None,
+    success_count: int | None = None,
+    failure_count: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    connection.execute(
+        """
+        UPDATE download_runs
+        SET target_count = COALESCE(?, target_count),
+            success_count = COALESCE(?, success_count),
+            failure_count = COALESCE(?, failure_count),
+            error_message = COALESCE(?, error_message)
+        WHERE run_id = ?
+          AND status = 'running'
+        """,
+        (
+            target_count,
             success_count,
             failure_count,
             error_message,
@@ -6756,13 +7076,83 @@ def collect_workspace_import_monitor(
     }
 
 
+def read_managed_targets_payload(config_path: Path) -> tuple[Path, dict[str, Any], list[dict[str, Any]]]:
+    managed_path = resolve_managed_targets_path(config_path)
+    default_payload: dict[str, Any] = {
+        "version": MANAGED_TARGETS_FORMAT_VERSION,
+        "targets": [],
+    }
+    if not managed_path.exists():
+        return managed_path, default_payload, []
+    try:
+        parsed = json.loads(managed_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return managed_path, default_payload, []
+    if not isinstance(parsed, dict):
+        return managed_path, default_payload, []
+    raw_targets = parsed.get("targets")
+    if not isinstance(raw_targets, list):
+        raw_targets = []
+    normalized_targets: list[dict[str, Any]] = []
+    for raw_item in raw_targets:
+        if not isinstance(raw_item, dict):
+            continue
+        source_id = str(raw_item.get("id", "")).strip()
+        if not source_id:
+            continue
+        normalized_targets.append(dict(raw_item))
+    payload = dict(parsed)
+    try:
+        payload_version = int(payload.get("version") or MANAGED_TARGETS_FORMAT_VERSION)
+    except (TypeError, ValueError):
+        payload_version = MANAGED_TARGETS_FORMAT_VERSION
+    payload["version"] = payload_version
+    payload["targets"] = normalized_targets
+    return managed_path, payload, normalized_targets
+
+
+def write_managed_targets_payload(managed_path: Path, payload: dict[str, Any]) -> None:
+    managed_path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    temp_path = managed_path.with_name(f"{managed_path.name}.tmp")
+    temp_path.write_text(serialized, encoding="utf-8")
+    temp_path.replace(managed_path)
+
+
+def normalize_source_target_id(raw_value: Any) -> str:
+    source_id = str(raw_value or "").strip()
+    if not source_id:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", source_id):
+        return ""
+    return source_id
+
+
+def serialize_source_target(source: SourceConfig, video_count: int = 0) -> dict[str, Any]:
+    return {
+        "id": source.id,
+        "platform": source.platform,
+        "enabled": bool(source.enabled),
+        "watch_kind": source.watch_kind,
+        "target_handle": source.target_handle or "",
+        "handle": source.handle or "",
+        "url": source.url,
+        "data_dir": str(source.data_dir),
+        "origin": source.origin,
+        "video_count": max(0, int(video_count)),
+    }
+
+
 def build_web_handler(
     db_path: Path,
     static_dir: Path,
     allowed_source_ids: set[str],
+    config_path: Path = DEFAULT_CONFIG,
+    restrict_to_source_ids: bool = False,
 ) -> type[BaseHTTPRequestHandler]:
     static_root = static_dir.resolve()
     workspace_root = db_path.resolve().parent.parent
+    web_config_path = config_path
 
     class SubstudyWebHandler(BaseHTTPRequestHandler):
         server_version = "SubstudyWeb/0.1"
@@ -6955,10 +7345,30 @@ def build_web_handler(
             self.end_headers()
             self.wfile.write(payload)
 
+        def _load_all_config_sources(self) -> list[SourceConfig]:
+            _, sources = load_config(web_config_path)
+            return sources
+
+        def _resolve_effective_source_scope(self) -> set[str] | None:
+            try:
+                configured_sources = self._load_all_config_sources()
+            except (FileNotFoundError, ValueError, KeyError):
+                if restrict_to_source_ids:
+                    return set(allowed_source_ids)
+                if allowed_source_ids:
+                    return set(allowed_source_ids)
+                return None
+
+            enabled_source_ids = {source.id for source in configured_sources if source.enabled}
+            if restrict_to_source_ids:
+                return enabled_source_ids & set(allowed_source_ids)
+            return enabled_source_ids
+
         def _is_source_allowed(self, source_id: str) -> bool:
-            if not allowed_source_ids:
+            scope = self._resolve_effective_source_scope()
+            if scope is None:
                 return True
-            return source_id in allowed_source_ids
+            return source_id in scope
 
         def _normalize_source(self, source_id: Any) -> str | None:
             if source_id in (None, ""):
@@ -6967,6 +7377,155 @@ def build_web_handler(
             if not normalized:
                 return None
             return normalized
+
+        def _handle_api_source_targets_get(self) -> None:
+            try:
+                configured_sources = self._load_all_config_sources()
+            except (FileNotFoundError, ValueError, KeyError) as exc:
+                self._send_error_json(500, f"Failed to read config: {exc}")
+                return
+
+            video_count_by_source: dict[str, int] = {}
+            with self._open_connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT source_id, COUNT(*) AS video_count
+                    FROM videos
+                    GROUP BY source_id
+                    """
+                ).fetchall()
+                for row in rows:
+                    source_id = str(row["source_id"] or "")
+                    video_count_by_source[source_id] = int(row["video_count"] or 0)
+
+            effective_scope = self._resolve_effective_source_scope()
+            targets: list[dict[str, Any]] = []
+            for source in configured_sources:
+                item = serialize_source_target(
+                    source,
+                    video_count=video_count_by_source.get(source.id, 0),
+                )
+                if effective_scope is None:
+                    item["active_in_web"] = True
+                else:
+                    item["active_in_web"] = source.id in effective_scope
+                targets.append(item)
+            self._send_json(
+                {
+                    "targets": targets,
+                    "managed_path": str(resolve_managed_targets_path(web_config_path)),
+                }
+            )
+
+        def _handle_api_source_targets_upsert(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+
+            source_id = normalize_source_target_id(payload.get("id"))
+            if not source_id:
+                self._send_error_json(
+                    400,
+                    "id is required and must match [A-Za-z0-9][A-Za-z0-9._-]{0,79}.",
+                )
+                return
+            platform = str(payload.get("platform", "tiktok") or "tiktok").strip().lower()
+            if platform != "tiktok":
+                self._send_error_json(400, "Only `tiktok` platform is supported for managed targets.")
+                return
+            watch_kind = normalize_source_watch_kind(payload.get("watch_kind"))
+            target_handle = normalize_tiktok_handle(
+                payload.get("target_handle")
+                if payload.get("target_handle") not in (None, "")
+                else payload.get("handle")
+            )
+            url = str(payload.get("url", "")).strip()
+            if not url and target_handle:
+                url = build_tiktok_source_url(target_handle, watch_kind)
+            if not url:
+                self._send_error_json(400, "target_handle or url is required.")
+                return
+
+            managed_entry: dict[str, Any] = {
+                "id": source_id,
+                "platform": platform,
+                "watch_kind": watch_kind,
+                "enabled": parse_bool_like(payload.get("enabled"), default=True),
+                "url": url,
+            }
+            if target_handle:
+                managed_entry["target_handle"] = target_handle
+                if watch_kind == SOURCE_WATCH_KIND_POSTS:
+                    managed_entry["handle"] = target_handle
+            data_dir = str(payload.get("data_dir", "")).strip()
+            if data_dir:
+                managed_entry["data_dir"] = data_dir
+            video_url_template = str(payload.get("video_url_template", "")).strip()
+            if video_url_template:
+                managed_entry["video_url_template"] = video_url_template
+
+            managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
+            updated = False
+            for index, row in enumerate(managed_targets):
+                if str(row.get("id", "")).strip() != source_id:
+                    continue
+                managed_targets[index] = managed_entry
+                updated = True
+                break
+            if not updated:
+                managed_targets.append(managed_entry)
+            managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
+            managed_payload["targets"] = managed_targets
+            try:
+                write_managed_targets_payload(managed_path, managed_payload)
+            except OSError as exc:
+                self._send_error_json(500, f"Failed to write managed targets file: {exc}")
+                return
+
+            self._send_json(
+                {
+                    "status": "updated" if updated else "created",
+                    "id": source_id,
+                    "managed_path": str(managed_path),
+                }
+            )
+
+        def _handle_api_source_targets_remove(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = normalize_source_target_id(payload.get("id"))
+            if not source_id:
+                self._send_error_json(400, "id is required.")
+                return
+
+            managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
+            filtered_targets = [
+                row for row in managed_targets
+                if str(row.get("id", "")).strip() != source_id
+            ]
+            if len(filtered_targets) == len(managed_targets):
+                self._send_error_json(404, f"No managed override found for source id: {source_id}")
+                return
+            managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
+            managed_payload["targets"] = filtered_targets
+            try:
+                write_managed_targets_payload(managed_path, managed_payload)
+            except OSError as exc:
+                self._send_error_json(500, f"Failed to write managed targets file: {exc}")
+                return
+
+            self._send_json(
+                {
+                    "status": "removed",
+                    "id": source_id,
+                    "managed_path": str(managed_path),
+                }
+            )
 
         def _fetch_bookmark_by_id(
             self,
@@ -7052,6 +7611,18 @@ def build_web_handler(
 
             limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
             offset = clamp_int(query.get("offset", [None])[0], default=0, minimum=0, maximum=20000)
+            effective_scope = self._resolve_effective_source_scope()
+            configured_source_ids = sorted(effective_scope) if effective_scope is not None else []
+            if effective_scope is not None and not effective_scope:
+                self._send_json(
+                    {
+                        "videos": [],
+                        "count": 0,
+                        "sources": [],
+                        "translation_filter": translation_filter,
+                    }
+                )
+                return
 
             def ja_subtitle_exists_clause(video_alias: str) -> str:
                 return f"""
@@ -7073,10 +7644,10 @@ def build_web_handler(
                 "v.media_path IS NOT NULL",
             ]
             params: list[Any] = []
-            if allowed_source_ids:
-                placeholders = ",".join("?" for _ in sorted(allowed_source_ids))
+            if effective_scope is not None:
+                placeholders = ",".join("?" for _ in sorted(effective_scope))
                 where_clauses.append(f"v.source_id IN ({placeholders})")
-                params.extend(sorted(allowed_source_ids))
+                params.extend(sorted(effective_scope))
             if source_filter:
                 where_clauses.append("v.source_id = ?")
                 params.append(source_filter)
@@ -7128,10 +7699,10 @@ def build_web_handler(
                     "media_path IS NOT NULL",
                 ]
                 source_params: list[Any] = []
-                if allowed_source_ids:
-                    placeholders = ",".join("?" for _ in sorted(allowed_source_ids))
+                if effective_scope is not None:
+                    placeholders = ",".join("?" for _ in sorted(effective_scope))
                     source_where_clauses.append(f"source_id IN ({placeholders})")
-                    source_params.extend(sorted(allowed_source_ids))
+                    source_params.extend(sorted(effective_scope))
                 if translation_filter == "ja_only":
                     source_where_clauses.append(ja_subtitle_exists_clause("videos"))
                 elif translation_filter == "ja_missing":
@@ -7145,7 +7716,22 @@ def build_web_handler(
                     """,
                     tuple(source_params),
                 ).fetchall()
-                source_ids = [str(row["source_id"]) for row in source_rows]
+                source_ids: list[str] = []
+                source_seen: set[str] = set()
+                for row in source_rows:
+                    source_id_value = str(row["source_id"])
+                    if source_id_value in source_seen:
+                        continue
+                    source_seen.add(source_id_value)
+                    source_ids.append(source_id_value)
+                for source_id_value in configured_source_ids:
+                    if source_id_value in source_seen:
+                        continue
+                    source_seen.add(source_id_value)
+                    source_ids.append(source_id_value)
+                if source_filter and source_filter not in source_seen:
+                    source_ids.append(source_filter)
+                    source_seen.add(source_filter)
 
                 videos: list[dict[str, Any]] = []
                 for row in rows:
@@ -7489,11 +8075,12 @@ def build_web_handler(
                 maximum=240,
             )
 
+            effective_scope = self._resolve_effective_source_scope()
             source_scope: list[str] = []
             if source_filter:
                 source_scope = [source_filter]
-            elif allowed_source_ids:
-                source_scope = sorted(allowed_source_ids)
+            elif effective_scope is not None:
+                source_scope = sorted(effective_scope)
 
             with self._open_connection() as connection:
                 review_cards, missing_entries = collect_workspace_review_and_missing_rows(
@@ -8063,6 +8650,9 @@ def build_web_handler(
                     force_download = parse_bool_flag(query.get("download", [None])[0], default=False)
                     self._serve_workspace_artifact_file(token, force_download=force_download)
                     return
+                if path == "/api/source-targets":
+                    self._handle_api_source_targets_get()
+                    return
                 if path == "/api/feed":
                     self._handle_api_feed(query)
                     return
@@ -8106,6 +8696,12 @@ def build_web_handler(
                 if path == "/api/dictionary-bookmarks/toggle":
                     self._handle_api_toggle_dictionary_bookmark()
                     return
+                if path == "/api/source-targets/upsert":
+                    self._handle_api_source_targets_upsert()
+                    return
+                if path == "/api/source-targets/remove":
+                    self._handle_api_source_targets_remove()
+                    return
                 note_match = re.fullmatch(r"/api/bookmarks/(\d+)/note", path)
                 if note_match:
                     self._handle_api_update_bookmark_note(int(note_match.group(1)))
@@ -8136,8 +8732,10 @@ def build_web_handler(
 def run_web_ui(
     db_path: Path,
     source_ids: list[str],
+    config_path: Path,
     host: str,
     port: int,
+    restrict_to_source_ids: bool = False,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(str(db_path)) as bootstrap_connection:
@@ -8151,6 +8749,8 @@ def run_web_ui(
         db_path=db_path,
         static_dir=WEB_STATIC_DIR,
         allowed_source_ids=set(source_ids),
+        config_path=config_path,
+        restrict_to_source_ids=restrict_to_source_ids,
     )
     server = ThreadingHTTPServer((host, port), handler_cls)
     print(f"[web] serving on http://{host}:{port}")
@@ -8802,8 +9402,10 @@ def main() -> int:
         run_web_ui(
             db_path=ledger_db_path,
             source_ids=[source.id for source in sources],
+            config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
             host=str(args.host),
             port=max(1, min(65535, int(args.port))),
+            restrict_to_source_ids=bool(args.sources),
         )
         return 0
 

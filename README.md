@@ -91,6 +91,7 @@ Notification note (macOS):
   - missing-entry status (`LLM補完待ち / 補完済み / 要再確認`)
   - import result monitor (`inserted/updated/skipped/errors`)
   - recent artifact browser with `open` / `download`
+  - source target manager (投稿監視/いいね欄監視の追加・有効/無効管理)
 
 SQLite learning tables:
 
