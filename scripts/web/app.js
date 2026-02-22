@@ -122,6 +122,7 @@ const state = {
   rangeStartMs: null,
   wheelLockUntil: 0,
   touchStartY: null,
+  touchStartIgnoreNavigation: false,
   metaExpanded: false,
   controlsExpanded: localStorage.getItem("substudy.controls_expanded") === "true",
   controlsFadeTimer: null,
@@ -671,6 +672,7 @@ function setVideoMetaFallback(messagePrimary, messageSecondary = "") {
   elements.metaPrimaryLine.textContent = messagePrimary;
   elements.metaSecondaryLine.textContent = messageSecondary;
   elements.metaTabBtn.textContent = shortenForTab(messagePrimary);
+  elements.metaPanel.scrollTop = 0;
 }
 
 function toggleMetaDrawer(forceValue = null) {
@@ -1249,6 +1251,7 @@ function renderVideoMeta(video) {
   elements.metaPrimaryLine.textContent = descriptionLike || "(説明なし)";
   elements.metaSecondaryLine.textContent = secondaryLine;
   elements.metaTabBtn.textContent = shortenForTab(descriptionLike || "description");
+  elements.metaPanel.scrollTop = 0;
 }
 
 function renderTrackOptions(video) {
@@ -7730,6 +7733,15 @@ function handleWheel(event) {
     clearDictionaryPopupHideTimer();
     return;
   }
+  if (state.metaExpanded && target && target.closest("#metaPanel")) {
+    event.preventDefault();
+    event.stopPropagation();
+    elements.metaPanel.scrollTop += event.deltaY;
+    if (event.deltaX !== 0) {
+      elements.metaPanel.scrollLeft += event.deltaX;
+    }
+    return;
+  }
 
   const canUseLyricReel = state.lyricReelActive || state.cues.length > 0;
   if (canUseLyricReel) {
@@ -7961,6 +7973,14 @@ function bindTouchNavigation() {
   elements.phoneShell.addEventListener(
     "touchstart",
     (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      state.touchStartIgnoreNavigation = Boolean(
+        state.metaExpanded && target && target.closest("#metaPanel")
+      );
+      if (state.touchStartIgnoreNavigation) {
+        state.touchStartY = null;
+        return;
+      }
       if (event.changedTouches.length === 0) {
         return;
       }
@@ -7972,6 +7992,12 @@ function bindTouchNavigation() {
   elements.phoneShell.addEventListener(
     "touchend",
     (event) => {
+      const ignoreNavigation = state.touchStartIgnoreNavigation;
+      state.touchStartIgnoreNavigation = false;
+      if (ignoreNavigation) {
+        state.touchStartY = null;
+        return;
+      }
       if (state.touchStartY === null || event.changedTouches.length === 0) {
         state.touchStartY = null;
         return;
@@ -7998,7 +8024,7 @@ function bindEvents() {
     const clickedElement = event.target instanceof Element ? event.target : null;
     if (
       clickedElement &&
-      clickedElement.closest("button, input, select, textarea, a, label, .subtitle-word, .subtitle-dict-popup, .subtitle-dict-bridge")
+      clickedElement.closest("button, input, select, textarea, a, label, #metaPanel, .subtitle-word, .subtitle-dict-popup, .subtitle-dict-bridge")
     ) {
       return;
     }

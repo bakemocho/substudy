@@ -564,6 +564,8 @@ body {
 .meta-panel {
   max-height: 0;
   overflow: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   opacity: 0;
   transform: translateY(10px);
   border-radius: 13px;
@@ -579,6 +581,7 @@ body {
 
 .video-meta-drawer.open .meta-panel {
   max-height: 98px;
+  overflow-y: auto;
   opacity: 1;
   transform: translateY(0);
   padding: 10px 12px;
