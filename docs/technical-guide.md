@@ -19,8 +19,8 @@ via `.github/workflows/privacy-check.yml`.
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
-- `scripts/run_daily_sync.sh`: daily incremental wrapper (`sync`/`backfill`/`ledger`/`loudness`/`asr`)
-- `scripts/run_weekly_full_sync.sh`: weekly full wrapper (includes `brew upgrade yt-dlp` + `loudness`)
+- `scripts/run_daily_sync.sh`: daily 3-lane wrapper (network: `sync` + `backfill`, CPU: `asr`/`loudness`, memory: `translate-local`)
+- `scripts/run_weekly_full_sync.sh`: weekly 3-lane wrapper (includes `brew upgrade yt-dlp`, then network/CPU/memory lanes + final full `ledger`)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
 - `docs/roadmap.md`: implementation roadmap and status
