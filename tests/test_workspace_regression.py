@@ -297,6 +297,76 @@ enabled = true
         by_id_after = {row["id"]: row for row in list_payload_after.get("targets", [])}
         self.assertNotIn("storiesofcz_likes", by_id_after)
 
+    def test_build_media_audio_fallback_format_selector_prefers_download_then_audio(self):
+        selector = self.mod.build_media_audio_fallback_format_selector("bv*+ba/best")
+        self.assertEqual(selector, "download/best*[acodec!=none]/bv*+ba/best")
+
+        blank_selector = self.mod.build_media_audio_fallback_format_selector("  ")
+        self.assertEqual(blank_selector, "download/best*[acodec!=none]/best")
+
+    def test_build_media_audio_fallback_format_candidates_include_audio_safe_fallbacks(self):
+        candidates = self.mod.build_media_audio_fallback_format_candidates("bv*+ba/best")
+        self.assertEqual(candidates[0], "download/best*[acodec!=none]/bv*+ba/best")
+        self.assertIn("best*[acodec!=none][format_id*=h264]/best*[acodec!=none]", candidates)
+        self.assertIn("best*[acodec!=none]/best", candidates)
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+        preferred = "best*[acodec!=none][format_id*=h264]/best*[acodec!=none]"
+        preferred_candidates = self.mod.build_media_audio_fallback_format_candidates(
+            "bv*+ba/best",
+            preferred_format=preferred,
+        )
+        self.assertEqual(preferred_candidates[0], preferred)
+        self.assertEqual(len(preferred_candidates), len(set(preferred_candidates)))
+
+    def test_media_fallback_preferred_format_state_roundtrip(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+
+            self.assertIsNone(
+                self.mod.get_media_fallback_preferred_format(connection, "storiesofcz")
+            )
+
+            self.mod.record_media_fallback_preferred_format(
+                connection=connection,
+                source_id="storiesofcz",
+                preferred_format="fmt_a",
+                updated_at="2026-02-22T12:00:00+00:00",
+            )
+            self.assertEqual(
+                self.mod.get_media_fallback_preferred_format(connection, "storiesofcz"),
+                "fmt_a",
+            )
+
+            self.mod.record_media_fallback_preferred_format(
+                connection=connection,
+                source_id="storiesofcz",
+                preferred_format="fmt_a",
+                updated_at="2026-02-22T12:01:00+00:00",
+            )
+            row_same = connection.execute(
+                "SELECT preferred_format, success_count FROM media_fallback_format_state WHERE source_id = ?",
+                ("storiesofcz",),
+            ).fetchone()
+            self.assertEqual(row_same[0], "fmt_a")
+            self.assertEqual(int(row_same[1]), 2)
+
+            self.mod.record_media_fallback_preferred_format(
+                connection=connection,
+                source_id="storiesofcz",
+                preferred_format="fmt_b",
+                updated_at="2026-02-22T12:02:00+00:00",
+            )
+            row_new = connection.execute(
+                "SELECT preferred_format, success_count FROM media_fallback_format_state WHERE source_id = ?",
+                ("storiesofcz",),
+            ).fetchone()
+            self.assertEqual(row_new[0], "fmt_b")
+            self.assertEqual(int(row_new[1]), 1)
+        finally:
+            connection.close()
+
     def test_feed_sources_include_configured_sources_without_media(self):
         config_dir = self.workspace_root / "config"
         config_dir.mkdir(parents=True, exist_ok=True)

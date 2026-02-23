@@ -1,4 +1,5 @@
 config/sources.toml
+config/source_targets.json
 data/
 logs/
 __pycache__/

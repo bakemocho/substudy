@@ -137,6 +137,36 @@ def parse_iso_datetime_utc(raw_value: Any) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def build_media_audio_fallback_format_selector(primary_video_format: str) -> str:
+    normalized = str(primary_video_format or "").strip()
+    if not normalized:
+        normalized = "best"
+    # Prefer TikTok's dedicated "download" format when available, otherwise
+    # require an audio-capable format before falling back to the primary selector.
+    return f"download/best*[acodec!=none]/{normalized}"
+
+
+def build_media_audio_fallback_format_candidates(
+    primary_video_format: str,
+    preferred_format: str | None = None,
+) -> list[str]:
+    candidates = [
+        str(preferred_format or "").strip(),
+        build_media_audio_fallback_format_selector(primary_video_format),
+        "best*[acodec!=none][format_id*=h264]/best*[acodec!=none]",
+        "best*[acodec!=none]/best",
+    ]
+    unique_candidates: list[str] = []
+    seen_candidates: set[str] = set()
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value or value in seen_candidates:
+            continue
+        seen_candidates.add(value)
+        unique_candidates.append(value)
+    return unique_candidates
+
+
 def compute_review_priority_score(
     bookmark_count: int,
     video_count: int,
@@ -870,6 +900,19 @@ def sync_source(
         ffprobe_bin = shutil.which("ffprobe")
         ffmpeg_bin = shutil.which("ffmpeg")
         media_fallback_work_dir = source.media_dir / ".audio_fallback"
+        media_audio_preferred_format: str | None = None
+        if connection is not None and not dry_run:
+            media_audio_preferred_format = get_media_fallback_preferred_format(
+                connection=connection,
+                source_id=source.id,
+            )
+        media_audio_fallback_format = build_media_audio_fallback_format_selector(
+            source.video_format
+        )
+        media_audio_fallback_format_candidates = build_media_audio_fallback_format_candidates(
+            source.video_format,
+            preferred_format=media_audio_preferred_format,
+        )
 
         def run_media_primary_download(
             video_id: str,
@@ -916,13 +959,13 @@ def sync_source(
         def run_media_audio_fallback_merge(
             video_id: str,
             media_path: Path,
-        ) -> tuple[Path | None, str | None]:
+        ) -> tuple[Path | None, str | None, str | None, str | None]:
             if ffmpeg_bin is None:
-                return None, "ffmpeg not found for audio fallback merge"
+                return None, "ffmpeg not found for audio fallback merge", None, None
 
             video_url = safe_video_url(video_id)
             if video_url is None:
-                return None, "cannot build video URL for audio fallback"
+                return None, "cannot build video URL for audio fallback", None, None
 
             media_fallback_work_dir.mkdir(parents=True, exist_ok=True)
             donor_media_path = media_fallback_work_dir / f"{video_id}.donor.mp4"
@@ -933,36 +976,146 @@ def sync_source(
                 else media_path.with_suffix(".mp4")
             )
 
-            fallback_command = [
-                source.ytdlp_bin,
-                *cookie_flags,
-                "--continue",
-                "--force-overwrites",
-                *retry_flags,
-                "-f",
-                "download",
-                "-o",
-                str(donor_media_path),
-                "--no-playlist",
-                video_url,
-            ]
-
+            donor_source = "download"
+            donor_format = media_audio_fallback_format
+            cleanup_donor_file = False
+            selected_download_format: str | None = None
             try:
+                donor_is_usable = False
                 try:
-                    fallback_exit_code = run_command(
-                        fallback_command,
-                        dry_run=False,
-                        raise_on_error=False,
+                    donor_is_usable = donor_media_path.exists() and donor_media_path.stat().st_size > 0
+                except OSError:
+                    donor_is_usable = False
+
+                if donor_is_usable and ffprobe_bin is not None:
+                    cached_has_audio, cached_probe_error = detect_audio_stream(
+                        media_path=donor_media_path,
+                        ffprobe_bin=ffprobe_bin,
                     )
-                except Exception as exc:
-                    return None, f"audio fallback command exception: {exc}"
+                    if cached_has_audio is False:
+                        donor_is_usable = False
+                        try:
+                            donor_media_path.unlink()
+                        except OSError:
+                            pass
+                    elif cached_has_audio is None:
+                        print(
+                            f"[media] {source.id}/{video_id}: donor ffprobe warning "
+                            f"({cached_probe_error}); use cached donor",
+                            file=sys.stderr,
+                        )
 
-                if fallback_exit_code != 0:
-                    return None, f"audio fallback command exit code {fallback_exit_code}"
-                if not donor_media_path.exists():
-                    return None, "audio fallback donor file missing after download"
+                if donor_is_usable:
+                    donor_source = "cache"
+                    donor_format = "cached"
+                else:
+                    download_errors: list[str] = []
+                    selected_download_format = None
+                    for candidate_format in media_audio_fallback_format_candidates:
+                        if donor_media_path.exists():
+                            try:
+                                donor_media_path.unlink()
+                            except OSError:
+                                pass
 
-                merge_command = [
+                        fallback_command = [
+                            source.ytdlp_bin,
+                            *cookie_flags,
+                            "--continue",
+                            "--force-overwrites",
+                            *retry_flags,
+                            "-f",
+                            candidate_format,
+                            "-o",
+                            str(donor_media_path),
+                            "--no-playlist",
+                            video_url,
+                        ]
+                        try:
+                            fallback_exit_code = run_command(
+                                fallback_command,
+                                dry_run=False,
+                                raise_on_error=False,
+                            )
+                        except Exception as exc:
+                            download_errors.append(
+                                f"{candidate_format}: command exception ({exc})"
+                            )
+                            continue
+
+                        if fallback_exit_code != 0:
+                            download_errors.append(
+                                f"{candidate_format}: exit code {fallback_exit_code}"
+                            )
+                            continue
+                        if not donor_media_path.exists():
+                            download_errors.append(
+                                f"{candidate_format}: donor file missing after download"
+                            )
+                            continue
+                        try:
+                            donor_size = donor_media_path.stat().st_size
+                        except OSError:
+                            donor_size = 0
+                        if donor_size <= 0:
+                            download_errors.append(
+                                f"{candidate_format}: donor file is empty"
+                            )
+                            try:
+                                donor_media_path.unlink()
+                            except OSError:
+                                pass
+                            continue
+
+                        if ffprobe_bin is not None:
+                            donor_has_audio, donor_probe_error = detect_audio_stream(
+                                media_path=donor_media_path,
+                                ffprobe_bin=ffprobe_bin,
+                            )
+                            if donor_has_audio is False:
+                                download_errors.append(
+                                    f"{candidate_format}: donor has no audio stream"
+                                )
+                                try:
+                                    donor_media_path.unlink()
+                                except OSError:
+                                    pass
+                                continue
+                            if donor_has_audio is None:
+                                print(
+                                    f"[media] {source.id}/{video_id}: donor ffprobe warning "
+                                    f"({donor_probe_error}); continue with downloaded donor",
+                                    file=sys.stderr,
+                                )
+
+                        selected_download_format = candidate_format
+                        break
+
+                    if selected_download_format is None:
+                        cleanup_donor_file = True
+                        if download_errors:
+                            detail = "; ".join(download_errors[-3:])
+                            return (
+                                None,
+                                f"audio fallback donor has no usable audio ({detail})",
+                                None,
+                                None,
+                            )
+                        return None, "audio fallback donor has no usable audio", None, None
+
+                    donor_source = "download"
+                    donor_format = selected_download_format
+
+                def summarize_ffmpeg_failure(
+                    completed: subprocess.CompletedProcess[str],
+                ) -> str:
+                    merged_output = f"{completed.stderr}\n{completed.stdout}".strip()
+                    lines = [line.strip() for line in merged_output.splitlines() if line.strip()]
+                    if lines:
+                        return " | ".join(lines[-3:])
+                    return f"ffmpeg exited with code {completed.returncode}"
+
+                merge_command_copy = [
                     ffmpeg_bin,
                     "-y",
                     "-i",
@@ -982,16 +1135,57 @@ def sync_source(
                     "+faststart",
                     str(merged_temp_path),
                 ]
-                completed = subprocess.run(
-                    merge_command,
+                completed_copy = subprocess.run(
+                    merge_command_copy,
                     check=False,
                     capture_output=True,
                     text=True,
                 )
-                if completed.returncode != 0:
-                    merged_output = f"{completed.stderr}\n{completed.stdout}".strip()
-                    message = merged_output.splitlines()[-1].strip() if merged_output else ""
-                    return None, message or f"ffmpeg exited with code {completed.returncode}"
+                merge_mode = "copy"
+                if completed_copy.returncode != 0:
+                    merge_command_reencode = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-i",
+                        str(media_path),
+                        "-i",
+                        str(donor_media_path),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "veryfast",
+                        "-crf",
+                        "23",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-shortest",
+                        "-movflags",
+                        "+faststart",
+                        str(merged_temp_path),
+                    ]
+                    completed_reencode = subprocess.run(
+                        merge_command_reencode,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if completed_reencode.returncode != 0:
+                        copy_message = summarize_ffmpeg_failure(completed_copy)
+                        reencode_message = summarize_ffmpeg_failure(completed_reencode)
+                        return (
+                            None,
+                            "ffmpeg merge failed "
+                            f"(copy={copy_message}; reencode={reencode_message})",
+                            None,
+                            None,
+                        )
+                    merge_mode = "reencode"
 
                 try:
                     if merged_output_path != media_path and merged_output_path.exists():
@@ -1000,13 +1194,19 @@ def sync_source(
                     if merged_output_path != media_path and media_path.exists():
                         media_path.unlink()
                 except OSError as exc:
-                    return None, f"failed to replace merged media file: {exc}"
+                    return None, f"failed to replace merged media file: {exc}", None, None
 
                 if not merged_output_path.exists():
-                    return None, "merged media file missing after audio fallback merge"
-                return merged_output_path, None
+                    return None, "merged media file missing after audio fallback merge", None, None
+                cleanup_donor_file = True
+                return (
+                    merged_output_path,
+                    None,
+                    f"{merge_mode}/{donor_source}:{donor_format}",
+                    selected_download_format,
+                )
             finally:
-                if donor_media_path.exists():
+                if cleanup_donor_file and donor_media_path.exists():
                     try:
                         donor_media_path.unlink()
                     except OSError:
@@ -1070,7 +1270,12 @@ def sync_source(
                         )
                         continue
 
-                    media_path_after, fallback_error = run_media_audio_fallback_merge(video_id, media_path)
+                    (
+                        media_path_after,
+                        fallback_error,
+                        fallback_merge_mode,
+                        fallback_selected_format,
+                    ) = run_media_audio_fallback_merge(video_id, media_path)
                     if fallback_error is not None:
                         media_audio_fallback_failures[video_id] = fallback_error
                         progress_note = "fallback_failed"
@@ -1088,10 +1293,21 @@ def sync_source(
                     if has_audio_after is True:
                         media_audio_fallback_repaired += 1
                         repaired_media_ids.add(video_id)
+                        if (
+                            connection is not None
+                            and fallback_selected_format is not None
+                        ):
+                            record_media_fallback_preferred_format(
+                                connection=connection,
+                                source_id=source.id,
+                                preferred_format=fallback_selected_format,
+                            )
+                            connection.commit()
                         progress_note = "recovered"
                         print(
                             f"[media] {source.id}/{video_id}: recovered audio stream "
-                            "(format=download+mux)"
+                            f"(format={media_audio_fallback_format}+mux/"
+                            f"{fallback_merge_mode or 'unknown'})"
                         )
                         continue
 
@@ -2076,6 +2292,17 @@ def create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_download_runs_time ON download_runs(started_at, source_id, stage);
         CREATE INDEX IF NOT EXISTS idx_download_state_retry ON download_state(stage, status, next_retry_at);
 
+        CREATE TABLE IF NOT EXISTS media_fallback_format_state (
+            source_id TEXT PRIMARY KEY,
+            preferred_format TEXT NOT NULL,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_media_fallback_format_state_updated_at
+            ON media_fallback_format_state(updated_at);
+
         CREATE TABLE IF NOT EXISTS backfill_state (
             source_id TEXT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -2635,6 +2862,59 @@ def upsert_source(connection: sqlite3.Connection, source: SourceConfig, updated_
             updated_at = excluded.updated_at
         """,
         (source.id, source.platform, source.url, str(source.data_dir), updated_at),
+    )
+
+
+def get_media_fallback_preferred_format(
+    connection: sqlite3.Connection,
+    source_id: str,
+) -> str | None:
+    row = connection.execute(
+        """
+        SELECT preferred_format
+        FROM media_fallback_format_state
+        WHERE source_id = ?
+        """,
+        (source_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    value = str(row[0] or "").strip()
+    return value or None
+
+
+def record_media_fallback_preferred_format(
+    connection: sqlite3.Connection,
+    source_id: str,
+    preferred_format: str,
+    updated_at: str | None = None,
+) -> None:
+    value = str(preferred_format or "").strip()
+    if not value:
+        return
+    timestamp = updated_at or now_utc_iso()
+    connection.execute(
+        """
+        INSERT INTO media_fallback_format_state (
+            source_id,
+            preferred_format,
+            success_count,
+            updated_at
+        ) VALUES (?, ?, 1, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            preferred_format = excluded.preferred_format,
+            success_count = CASE
+                WHEN media_fallback_format_state.preferred_format = excluded.preferred_format
+                THEN media_fallback_format_state.success_count + 1
+                ELSE 1
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            source_id,
+            value,
+            timestamp,
+        ),
     )
 
 
