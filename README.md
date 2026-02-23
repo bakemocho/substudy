@@ -49,6 +49,7 @@ Open `http://127.0.0.1:8876`.
 ## Core commands
 
 - `python3 scripts/substudy.py sync`
+- `python3 scripts/substudy.py sync --network-profile auto` (weak network -> meta/subs only, strong -> media+subs+meta)
 - `python3 scripts/substudy.py backfill`
 - `python3 scripts/substudy.py ledger`
 - `python3 scripts/substudy.py asr`
@@ -58,6 +59,7 @@ Open `http://127.0.0.1:8876`.
 - `python3 scripts/substudy.py dict-bookmarks-import --input exports/dictionary_bookmarks_missing_*.jsonl --on-duplicate upsert`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset frequent_terms --format csv --limit 200`
 - `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200`
+- `python3 scripts/substudy.py translate-local --source storiesofcz --limit 1 --video-id <video_id>`
 - `scripts/run_llm_pipeline.sh missing-export --limit 200`
 - `scripts/run_llm_pipeline.sh missing-import`
 - `scripts/run_llm_pipeline.sh review-cards-export --limit 200`

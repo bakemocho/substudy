@@ -16,11 +16,14 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 import zlib
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
@@ -63,6 +66,15 @@ DEFAULT_NOTIFY_LLM_LOOKBACK_HOURS = 24
 DEFAULT_NOTIFY_MACOS_LABEL = "com.substudy.notify"
 DEFAULT_NOTIFY_INTERVAL_MINUTES = 90
 DEFAULT_NOTIFY_COOLDOWN_MINUTES = 15
+DEFAULT_LOCAL_LLM_ENDPOINT = "http://127.0.0.1:11435/v1/chat/completions"
+DEFAULT_LOCAL_TRANSLATE_DRAFT_MODEL = "gpt-oss:20b"
+DEFAULT_LOCAL_TRANSLATE_REFINE_MODEL = "gpt-oss:120b"
+DEFAULT_LOCAL_TRANSLATE_GLOBAL_MODEL = "gpt-oss:120b"
+DEFAULT_NETWORK_PROBE_URL = "https://www.tiktok.com/robots.txt"
+DEFAULT_NETWORK_PROBE_TIMEOUT_SEC = 8
+DEFAULT_NETWORK_PROBE_BYTES = 131072
+DEFAULT_WEAK_NET_MIN_KBPS = 900.0
+DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 
 
 @dataclass
@@ -116,6 +128,52 @@ class SourceConfig:
     subs_output_template: str
     meta_output_template: str
     origin: str
+
+
+@dataclass
+class SubtitleCueBlock:
+    cue_id: int
+    block_index: int
+    header_lines: list[str]
+    timing_line: str
+    text_lines: list[str]
+    start_ms: int
+    end_ms: int
+
+
+@dataclass
+class ParsedSubtitleDocument:
+    path: Path
+    format_hint: str
+    blocks: list[dict[str, Any]]
+    cues: list[SubtitleCueBlock]
+
+
+@dataclass
+class TranslationStageMetrics:
+    stage_name: str
+    model: str
+    input_cue_count: int
+    changed_cue_count: int = 0
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    elapsed_ms: int = 0
+    status: str = "completed"
+    error_message: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+
+
+@dataclass
+class NetworkProfileDecision:
+    profile: str
+    reason: str
+    probe_url: str
+    rtt_ms: float | None = None
+    kbps: float | None = None
+    bytes_read: int = 0
 
 
 def now_utc_iso() -> str:
@@ -663,6 +721,142 @@ def run_command(command: list[str], dry_run: bool, raise_on_error: bool = True) 
     if completed.returncode != 0 and raise_on_error:
         raise RuntimeError(f"Command failed with exit code {completed.returncode}")
     return completed.returncode
+
+
+def probe_network_quality(
+    probe_url: str,
+    timeout_sec: int,
+    probe_bytes: int,
+) -> tuple[float, float, int]:
+    safe_url = str(probe_url).strip()
+    if not safe_url:
+        raise ValueError("probe_url is required")
+    safe_timeout = max(2, int(timeout_sec))
+    safe_bytes = max(1024, int(probe_bytes))
+    request = urllib_request.Request(
+        safe_url,
+        headers={
+            "User-Agent": "substudy-network-probe/1.0",
+            "Range": f"bytes=0-{safe_bytes - 1}",
+            "Cache-Control": "no-cache",
+        },
+        method="GET",
+    )
+    started = time.perf_counter()
+    with urllib_request.urlopen(request, timeout=safe_timeout) as response:
+        first_byte_at = time.perf_counter()
+        payload = response.read(safe_bytes)
+    finished = time.perf_counter()
+    bytes_read = len(payload)
+    rtt_ms = max(0.0, (first_byte_at - started) * 1000.0)
+    transfer_sec = max(0.001, finished - first_byte_at)
+    kbps = (bytes_read * 8.0) / 1000.0 / transfer_sec
+    return (rtt_ms, kbps, bytes_read)
+
+
+def decide_network_profile(
+    profile_mode: str,
+    probe_url: str,
+    timeout_sec: int,
+    probe_bytes: int,
+    weak_net_min_kbps: float,
+    weak_net_max_rtt_ms: float,
+    probe_func: Callable[[str, int, int], tuple[float, float, int]] | None = None,
+) -> NetworkProfileDecision:
+    mode = str(profile_mode or "normal").strip().lower()
+    if mode not in {"normal", "weak", "auto"}:
+        mode = "normal"
+    safe_probe_url = str(probe_url or DEFAULT_NETWORK_PROBE_URL).strip() or DEFAULT_NETWORK_PROBE_URL
+    if mode == "normal":
+        return NetworkProfileDecision(
+            profile="normal",
+            reason="manual profile=normal",
+            probe_url=safe_probe_url,
+        )
+    if mode == "weak":
+        return NetworkProfileDecision(
+            profile="weak",
+            reason="manual profile=weak",
+            probe_url=safe_probe_url,
+        )
+
+    checker = probe_func or probe_network_quality
+    safe_min_kbps = max(50.0, float(weak_net_min_kbps))
+    safe_max_rtt_ms = max(50.0, float(weak_net_max_rtt_ms))
+    try:
+        rtt_ms, kbps, bytes_read = checker(
+            safe_probe_url,
+            max(2, int(timeout_sec)),
+            max(1024, int(probe_bytes)),
+        )
+    except Exception as exc:
+        return NetworkProfileDecision(
+            profile="weak",
+            reason=f"probe failed ({exc}); fallback=weak",
+            probe_url=safe_probe_url,
+        )
+
+    weak_by_rtt = rtt_ms > safe_max_rtt_ms
+    weak_by_kbps = kbps < safe_min_kbps
+    weak_by_empty_payload = bytes_read <= 0
+    if weak_by_rtt or weak_by_kbps or weak_by_empty_payload:
+        reason_parts: list[str] = []
+        if weak_by_rtt:
+            reason_parts.append(f"rtt_ms={rtt_ms:.1f}>{safe_max_rtt_ms:.1f}")
+        if weak_by_kbps:
+            reason_parts.append(f"kbps={kbps:.1f}<{safe_min_kbps:.1f}")
+        if weak_by_empty_payload:
+            reason_parts.append("bytes=0")
+        return NetworkProfileDecision(
+            profile="weak",
+            reason="auto probe: " + ", ".join(reason_parts),
+            probe_url=safe_probe_url,
+            rtt_ms=rtt_ms,
+            kbps=kbps,
+            bytes_read=max(0, int(bytes_read)),
+        )
+    return NetworkProfileDecision(
+        profile="normal",
+        reason=f"auto probe: rtt_ms={rtt_ms:.1f}, kbps={kbps:.1f}",
+        probe_url=safe_probe_url,
+        rtt_ms=rtt_ms,
+        kbps=kbps,
+        bytes_read=max(0, int(bytes_read)),
+    )
+
+
+def resolve_skip_media_with_network_profile(
+    command_name: str,
+    explicit_skip_media: bool,
+    network_profile: str,
+    network_probe_url: str,
+    network_probe_timeout_sec: int,
+    network_probe_bytes: int,
+    weak_net_min_kbps: float,
+    weak_net_max_rtt_ms: float,
+) -> tuple[bool, NetworkProfileDecision | None]:
+    if explicit_skip_media:
+        print(f"[{command_name}] skip-media enabled by explicit flag.")
+        return (True, None)
+    decision = decide_network_profile(
+        profile_mode=network_profile,
+        probe_url=network_probe_url,
+        timeout_sec=network_probe_timeout_sec,
+        probe_bytes=network_probe_bytes,
+        weak_net_min_kbps=weak_net_min_kbps,
+        weak_net_max_rtt_ms=weak_net_max_rtt_ms,
+    )
+    print(
+        f"[{command_name}] network profile={decision.profile} "
+        f"probe_url={decision.probe_url} reason={decision.reason}"
+    )
+    if decision.profile == "weak":
+        print(
+            f"[{command_name}] weak network detected: force --skip-media "
+            "(download metadata + subtitles only)."
+        )
+        return (True, decision)
+    return (False, decision)
 
 
 def read_archive_ids(archive_path: Path) -> list[str]:
@@ -2393,6 +2587,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     ensure_videos_loudness_columns(connection)
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
+    ensure_translation_stage_runs_table(connection)
     ensure_dictionary_bookmarks_schema(connection)
     ensure_dictionary_import_runs_table(connection)
 
@@ -2477,6 +2672,174 @@ def ensure_translation_runs_table(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_translation_runs_video
             ON translation_runs(source_id, video_id, target_lang, status);
         """
+    )
+
+
+def ensure_translation_stage_runs_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS translation_stage_runs (
+            stage_run_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            translation_run_id INTEGER,
+            source_id         TEXT NOT NULL,
+            video_id          TEXT NOT NULL,
+            stage_name        TEXT NOT NULL,
+            model             TEXT NOT NULL,
+            input_cue_count   INTEGER NOT NULL DEFAULT 0,
+            changed_cue_count INTEGER NOT NULL DEFAULT 0,
+            request_count     INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens     INTEGER,
+            completion_tokens INTEGER,
+            total_tokens      INTEGER,
+            elapsed_ms        INTEGER,
+            status            TEXT NOT NULL DEFAULT 'completed',
+            error_message     TEXT,
+            started_at        TEXT,
+            finished_at       TEXT,
+            created_at        TEXT NOT NULL,
+            FOREIGN KEY (translation_run_id) REFERENCES translation_runs(run_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_translation_stage_runs_lookup
+            ON translation_stage_runs(source_id, video_id, stage_name, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_translation_stage_runs_run_id
+            ON translation_stage_runs(translation_run_id, stage_run_id);
+        """
+    )
+
+
+def record_translation_run(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+    source_path: Path,
+    output_path: Path,
+    cue_count: int,
+    cue_match: bool,
+    agent: str,
+    method: str,
+    method_version: str,
+    summary: str,
+    source_lang: str = "en",
+    target_lang: str = "ja",
+    status: str = "active",
+    started_at: str | None = None,
+    finished_at: str | None = None,
+) -> int:
+    safe_source_id = str(source_id).strip()
+    safe_video_id = str(video_id).strip()
+    safe_source_lang = str(source_lang or "en").strip().lower() or "en"
+    safe_target_lang = str(target_lang or "ja").strip().lower() or "ja"
+    safe_status = str(status or "active").strip().lower() or "active"
+    now_iso = now_utc_iso()
+    started_iso = str(started_at or now_iso)
+    finished_iso = str(finished_at or now_iso)
+    created_iso = now_iso
+
+    if safe_status == "active":
+        connection.execute(
+            """
+            UPDATE translation_runs
+            SET status = 'superseded'
+            WHERE source_id = ?
+              AND video_id = ?
+              AND target_lang = ?
+              AND status = 'active'
+            """,
+            (safe_source_id, safe_video_id, safe_target_lang),
+        )
+
+    cursor = connection.execute(
+        """
+        INSERT INTO translation_runs (
+            source_id,
+            video_id,
+            source_lang,
+            target_lang,
+            source_path,
+            output_path,
+            cue_count,
+            cue_match,
+            agent,
+            method,
+            method_version,
+            summary,
+            status,
+            started_at,
+            finished_at,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            safe_source_id,
+            safe_video_id,
+            safe_source_lang,
+            safe_target_lang,
+            str(source_path),
+            str(output_path),
+            max(0, int(cue_count)),
+            1 if cue_match else 0,
+            str(agent or "").strip(),
+            str(method or "").strip(),
+            str(method_version or "").strip(),
+            str(summary or "").strip(),
+            safe_status,
+            started_iso,
+            finished_iso,
+            created_iso,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def record_translation_stage_metrics(
+    connection: sqlite3.Connection,
+    translation_run_id: int,
+    source_id: str,
+    video_id: str,
+    stage_metrics: TranslationStageMetrics,
+) -> None:
+    created_iso = now_utc_iso()
+    connection.execute(
+        """
+        INSERT INTO translation_stage_runs (
+            translation_run_id,
+            source_id,
+            video_id,
+            stage_name,
+            model,
+            input_cue_count,
+            changed_cue_count,
+            request_count,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            elapsed_ms,
+            status,
+            error_message,
+            started_at,
+            finished_at,
+            created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(translation_run_id),
+            str(source_id),
+            str(video_id),
+            str(stage_metrics.stage_name),
+            str(stage_metrics.model),
+            max(0, int(stage_metrics.input_cue_count)),
+            max(0, int(stage_metrics.changed_cue_count)),
+            max(0, int(stage_metrics.request_count)),
+            max(0, int(stage_metrics.prompt_tokens)),
+            max(0, int(stage_metrics.completion_tokens)),
+            max(0, int(stage_metrics.total_tokens)),
+            max(0, int(stage_metrics.elapsed_ms)),
+            str(stage_metrics.status or "completed"),
+            str(stage_metrics.error_message or ""),
+            str(stage_metrics.started_at or ""),
+            str(stage_metrics.finished_at or ""),
+            created_iso,
+        ),
     )
 
 
@@ -6529,6 +6892,371 @@ def parse_subtitle_cues(subtitle_path: Path) -> list[dict[str, Any]]:
     return cues
 
 
+def strip_subtitle_markup(raw_text: str) -> str:
+    text = str(raw_text or "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\{[^}]+\}", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def parse_subtitle_document(subtitle_path: Path) -> ParsedSubtitleDocument:
+    raw_text = subtitle_path.read_text(encoding="utf-8", errors="ignore")
+    lines = raw_text.replace("\ufeff", "").splitlines()
+
+    block_lines: list[list[str]] = []
+    current_block: list[str] = []
+    for raw_line in lines:
+        if raw_line.strip() == "":
+            if current_block:
+                block_lines.append(current_block)
+                current_block = []
+            continue
+        current_block.append(raw_line)
+    if current_block:
+        block_lines.append(current_block)
+
+    blocks: list[dict[str, Any]] = []
+    cues: list[SubtitleCueBlock] = []
+    cue_id = 1
+    for block_index, lines_in_block in enumerate(block_lines):
+        timing_index = -1
+        for idx, line in enumerate(lines_in_block):
+            if "-->" in line:
+                timing_index = idx
+                break
+        if timing_index < 0:
+            blocks.append({"type": "raw", "lines": list(lines_in_block)})
+            continue
+
+        timing_line = lines_in_block[timing_index]
+        start_raw, end_raw = [part.strip() for part in timing_line.split("-->", 1)]
+        start_token = start_raw.split()[0] if start_raw else ""
+        end_token = end_raw.split()[0] if end_raw else ""
+        start_ms = parse_subtitle_timestamp_ms(start_token)
+        end_ms = parse_subtitle_timestamp_ms(end_token)
+        if start_ms is None or end_ms is None:
+            blocks.append({"type": "raw", "lines": list(lines_in_block)})
+            continue
+        if end_ms < start_ms:
+            start_ms, end_ms = end_ms, start_ms
+
+        cue = SubtitleCueBlock(
+            cue_id=cue_id,
+            block_index=block_index,
+            header_lines=list(lines_in_block[:timing_index]),
+            timing_line=timing_line,
+            text_lines=list(lines_in_block[timing_index + 1 :]),
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        cues.append(cue)
+        blocks.append({"type": "cue", "cue_id": cue_id})
+        cue_id += 1
+
+    format_hint = subtitle_path.suffix.lower().lstrip(".")
+    return ParsedSubtitleDocument(
+        path=subtitle_path,
+        format_hint=format_hint if format_hint in {"srt", "vtt"} else "",
+        blocks=blocks,
+        cues=cues,
+    )
+
+
+def normalize_subtitle_output_lines(text: str, fallback_lines: list[str]) -> list[str]:
+    cleaned = str(text or "").replace("\r", "").strip()
+    if cleaned:
+        lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
+        if lines:
+            return lines
+    fallback = [line.strip() for line in fallback_lines if line.strip()]
+    if fallback:
+        return fallback
+    return [""]
+
+
+def render_subtitle_document(
+    document: ParsedSubtitleDocument,
+    translated_text_by_cue_id: dict[int, str],
+) -> str:
+    cue_lookup = {cue.cue_id: cue for cue in document.cues}
+    rendered_blocks: list[str] = []
+    for block in document.blocks:
+        block_type = str(block.get("type") or "")
+        if block_type == "raw":
+            lines = [str(line) for line in block.get("lines", [])]
+            rendered_blocks.append("\n".join(lines).rstrip("\n"))
+            continue
+        if block_type != "cue":
+            continue
+        cue_id = int(block.get("cue_id") or 0)
+        cue = cue_lookup.get(cue_id)
+        if cue is None:
+            continue
+        translated_value = translated_text_by_cue_id.get(cue_id, "")
+        text_lines = normalize_subtitle_output_lines(translated_value, cue.text_lines)
+        cue_lines = [*cue.header_lines, cue.timing_line, *text_lines]
+        rendered_blocks.append("\n".join(cue_lines).rstrip("\n"))
+    if not rendered_blocks:
+        return ""
+    return "\n\n".join(rendered_blocks).rstrip() + "\n"
+
+
+def build_ja_subtitle_output_path(source_subtitle_path: Path, target_lang: str = "ja") -> Path:
+    file_name = source_subtitle_path.name
+    parts = file_name.split(".")
+    safe_lang = str(target_lang or "ja").strip().lower() or "ja"
+
+    if len(parts) >= 3:
+        video_id = parts[0]
+        extension = parts[-1]
+        return source_subtitle_path.with_name(f"{video_id}.{safe_lang}.{extension}")
+    if len(parts) == 2:
+        video_id, extension = parts
+        return source_subtitle_path.with_name(f"{video_id}.{safe_lang}.{extension}")
+    extension = source_subtitle_path.suffix.lstrip(".") or "vtt"
+    video_id = source_subtitle_path.stem
+    return source_subtitle_path.with_name(f"{video_id}.{safe_lang}.{extension}")
+
+
+def parse_json_loose(raw_text: str) -> Any | None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text).strip()
+        text = re.sub(r"\s*```$", "", text).strip()
+    candidates = [text]
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start >= 0 and end > start:
+            candidates.append(text[start : end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def extract_translation_text_fallback(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text).strip()
+        text = re.sub(r"\s*```$", "", text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
+def is_translation_placeholder(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return True
+    known_placeholders = {
+        "[empty completion]",
+        "empty completion",
+        "[no output]",
+        "no output",
+        "[unavailable]",
+        "unavailable",
+        "n/a",
+    }
+    if normalized in known_placeholders:
+        return True
+    if re.fullmatch(r"\[(empty|no|unavailable)[^]]*\]", normalized):
+        return True
+    return False
+
+
+def parse_llm_usage_counts(payload: Any) -> tuple[int, int, int]:
+    if not isinstance(payload, dict):
+        return (0, 0, 0)
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return (0, 0, 0)
+    try:
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    except (TypeError, ValueError):
+        prompt_tokens = 0
+    try:
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        completion_tokens = 0
+    try:
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    except (TypeError, ValueError):
+        total_tokens = prompt_tokens + completion_tokens
+    return (max(0, prompt_tokens), max(0, completion_tokens), max(0, total_tokens))
+
+
+def call_local_chat_completion(
+    endpoint: str,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_sec: int,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "model": str(model),
+        "messages": messages,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_tokens": max(1, int(max_tokens)),
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"content-type": "application/json"}
+    safe_api_key = str(api_key or "").strip()
+    if safe_api_key:
+        headers["authorization"] = f"Bearer {safe_api_key}"
+    request = urllib_request.Request(
+        str(endpoint),
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+
+    started = time.perf_counter()
+    try:
+        with urllib_request.urlopen(request, timeout=max(3, int(timeout_sec))) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            details = ""
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        raise RuntimeError(
+            f"LLM request failed: HTTP {exc.code} elapsed={elapsed_ms}ms body={details[:500]}"
+        ) from exc
+    except urllib_error.URLError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        raise RuntimeError(f"LLM request failed: {exc.reason} elapsed={elapsed_ms}ms") from exc
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"LLM response is not valid JSON: elapsed={elapsed_ms}ms body={response_body[:500]}"
+        ) from exc
+
+    content = ""
+    if isinstance(parsed, dict):
+        choices = parsed.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            message = first.get("message") if isinstance(first, dict) else {}
+            if isinstance(message, dict):
+                content = str(message.get("content") or "")
+
+    prompt_tokens, completion_tokens, total_tokens = parse_llm_usage_counts(parsed)
+    return {
+        "content": content,
+        "raw": parsed,
+        "elapsed_ms": elapsed_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def extract_patch_map_from_llm_output(raw_text: str) -> dict[int, str]:
+    parsed = parse_json_loose(raw_text)
+    rows: list[Any] = []
+    if isinstance(parsed, list):
+        rows = parsed
+    elif isinstance(parsed, dict):
+        cues_value = parsed.get("cues")
+        if isinstance(cues_value, list):
+            rows = cues_value
+        elif isinstance(parsed.get("items"), list):
+            rows = parsed.get("items") or []
+        else:
+            single_cue_id = parsed.get("cue_id")
+            single_text = parsed.get("ja")
+            if single_cue_id is not None and single_text not in (None, ""):
+                rows = [{"cue_id": single_cue_id, "ja": single_text}]
+    patch_map: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cue_id_raw = row.get("cue_id")
+        if cue_id_raw in (None, ""):
+            continue
+        try:
+            cue_id = int(cue_id_raw)
+        except (TypeError, ValueError):
+            continue
+        ja_text = str(row.get("ja") or "").strip()
+        if not ja_text:
+            continue
+        patch_map[cue_id] = ja_text
+    return patch_map
+
+
+def apply_patch_map_to_translations(
+    current_translations: dict[int, str],
+    patch_map: dict[int, str],
+    allowed_cue_ids: set[int],
+) -> int:
+    changed = 0
+    for cue_id, raw_text in patch_map.items():
+        if cue_id not in allowed_cue_ids:
+            continue
+        normalized = extract_translation_text_fallback(raw_text)
+        if is_translation_placeholder(normalized):
+            continue
+        if not normalized:
+            continue
+        previous = str(current_translations.get(cue_id) or "")
+        if normalized == previous:
+            continue
+        current_translations[cue_id] = normalized
+        changed += 1
+    return changed
+
+
+def chunk_items(items: list[Any], chunk_size: int) -> list[list[Any]]:
+    safe_size = max(1, int(chunk_size))
+    return [items[index : index + safe_size] for index in range(0, len(items), safe_size)]
+
+
+def build_local_translation_summary(
+    source_id: str,
+    video_id: str,
+    cue_count: int,
+    translations: dict[int, str],
+) -> str:
+    preview: list[str] = []
+    for cue_id in sorted(translations):
+        text = str(translations.get(cue_id) or "").strip()
+        if not text:
+            continue
+        preview.append(text)
+        if len(preview) >= 2:
+            break
+    preview_text = " / ".join(preview)
+    if len(preview_text) > 120:
+        preview_text = preview_text[:117].rstrip() + "..."
+    if preview_text:
+        return (
+            f"local-llm multi-stage translation "
+            f"({source_id}/{video_id}, cues={max(0, int(cue_count))}): {preview_text}"
+        )
+    return (
+        f"local-llm multi-stage translation "
+        f"({source_id}/{video_id}, cues={max(0, int(cue_count))})"
+    )
+
+
 def find_best_subtitle_text_for_range(
     cues: list[dict[str, Any]],
     start_ms: int,
@@ -9043,6 +9771,640 @@ def run_web_ui(
         server.server_close()
 
 
+def language_rank_for_translation_source(language: str, target_lang: str) -> int:
+    normalized = str(language or "").strip().lower()
+    safe_target = str(target_lang or "ja").strip().lower()
+    if not normalized:
+        return 30
+    if normalized == safe_target or normalized.startswith(f"{safe_target}-"):
+        return 1000
+    if normalized == "en":
+        return 0
+    if normalized.startswith("en-"):
+        return 1
+    if normalized in {"und", "na"}:
+        return 2
+    return 10
+
+
+def collect_local_translation_targets(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    target_lang: str,
+    video_ids: list[str] | None,
+    limit: int,
+    include_translated: bool,
+    overwrite: bool,
+) -> list[dict[str, Any]]:
+    safe_target = str(target_lang or "ja").strip().lower() or "ja"
+    video_filter_set = {str(video_id).strip() for video_id in (video_ids or []) if str(video_id).strip()}
+
+    rows = connection.execute(
+        """
+        SELECT
+            s.source_id,
+            s.video_id,
+            COALESCE(s.language, '') AS language,
+            s.subtitle_path,
+            LOWER(COALESCE(s.ext, '')) AS ext
+        FROM subtitles s
+        JOIN videos v
+          ON v.source_id = s.source_id
+         AND v.video_id = s.video_id
+        WHERE v.has_media = 1
+          AND s.subtitle_path IS NOT NULL
+          AND s.subtitle_path <> ''
+          AND LOWER(COALESCE(s.ext, '')) IN ('srt', 'vtt')
+        ORDER BY s.source_id ASC, s.video_id ASC, s.subtitle_path ASC
+        """
+    ).fetchall()
+
+    best_by_video: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        source_id = str(row["source_id"])
+        if source_id not in source_ids:
+            continue
+        video_id = str(row["video_id"])
+        if video_filter_set and video_id not in video_filter_set:
+            continue
+        language = str(row["language"] or "").strip().lower()
+        rank = language_rank_for_translation_source(language, safe_target)
+        if rank >= 1000:
+            continue
+        subtitle_path = Path(str(row["subtitle_path"]))
+        if not subtitle_path.exists() or not subtitle_path.is_file():
+            continue
+        target_key = (source_id, video_id)
+        existing = best_by_video.get(target_key)
+        candidate = {
+            "source_id": source_id,
+            "video_id": video_id,
+            "source_lang": language or "en",
+            "subtitle_path": subtitle_path,
+            "ext": str(row["ext"] or "").strip().lower(),
+            "rank": rank,
+        }
+        if existing is None:
+            best_by_video[target_key] = candidate
+            continue
+        if int(candidate["rank"]) < int(existing["rank"]):
+            best_by_video[target_key] = candidate
+            continue
+        if int(candidate["rank"]) == int(existing["rank"]) and str(candidate["subtitle_path"]) < str(existing["subtitle_path"]):
+            best_by_video[target_key] = candidate
+
+    selected: list[dict[str, Any]] = []
+    for key in sorted(best_by_video):
+        candidate = best_by_video[key]
+        source_id = str(candidate["source_id"])
+        video_id = str(candidate["video_id"])
+        subtitle_path = Path(str(candidate["subtitle_path"]))
+        output_path = build_ja_subtitle_output_path(subtitle_path, safe_target)
+
+        if output_path.exists() and output_path.is_file() and not overwrite:
+            continue
+        if not include_translated:
+            active_row = connection.execute(
+                """
+                SELECT 1
+                FROM translation_runs
+                WHERE source_id = ?
+                  AND video_id = ?
+                  AND target_lang = ?
+                  AND status = 'active'
+                LIMIT 1
+                """,
+                (source_id, video_id, safe_target),
+            ).fetchone()
+            if active_row is not None:
+                continue
+
+        candidate["output_path"] = output_path
+        selected.append(candidate)
+        if limit > 0 and len(selected) >= limit:
+            break
+    return selected
+
+
+def run_translation_stage_draft(
+    document: ParsedSubtitleDocument,
+    endpoint: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_sec: int,
+    api_key: str | None,
+) -> tuple[dict[int, str], TranslationStageMetrics]:
+    cue_count = len(document.cues)
+    metrics = TranslationStageMetrics(
+        stage_name="draft",
+        model=str(model),
+        input_cue_count=cue_count,
+        started_at=now_utc_iso(),
+    )
+    translations: dict[int, str] = {}
+    plain_texts = [strip_subtitle_markup(" ".join(cue.text_lines)) for cue in document.cues]
+
+    for index, cue in enumerate(document.cues):
+        current_text = plain_texts[index]
+        if not current_text:
+            translations[cue.cue_id] = ""
+            continue
+        prev_text = plain_texts[index - 1] if index > 0 else ""
+        next_text = plain_texts[index + 1] if index + 1 < cue_count else ""
+        payload = {
+            "task": "translate subtitle cue en->ja",
+            "cue_id": cue.cue_id,
+            "prev_en": prev_text,
+            "en": current_text,
+            "next_en": next_text,
+            "constraints": [
+                "keep original meaning",
+                "conversational Japanese for subtitles",
+                "no explanations",
+                "avoid overlong wording",
+            ],
+            "output_schema": {"ja": "string", "confidence": "high|medium|low"},
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a subtitle translator. "
+                    "Return only JSON without markdown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ]
+        result = call_local_chat_completion(
+            endpoint=endpoint,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            api_key=api_key,
+        )
+        metrics.request_count += 1
+        metrics.elapsed_ms += int(result["elapsed_ms"])
+        metrics.prompt_tokens += int(result["prompt_tokens"])
+        metrics.completion_tokens += int(result["completion_tokens"])
+        metrics.total_tokens += int(result["total_tokens"])
+
+        parsed = parse_json_loose(str(result["content"]))
+        translated_text = ""
+        if isinstance(parsed, dict):
+            translated_text = str(parsed.get("ja") or "").strip()
+        elif isinstance(parsed, str):
+            translated_text = parsed.strip()
+        if not translated_text:
+            translated_text = extract_translation_text_fallback(str(result["content"]))
+        if is_translation_placeholder(translated_text):
+            translated_text = ""
+        if not translated_text:
+            translated_text = current_text
+        translations[cue.cue_id] = translated_text
+        if translated_text != current_text:
+            metrics.changed_cue_count += 1
+
+    metrics.finished_at = now_utc_iso()
+    return translations, metrics
+
+
+def run_translation_stage_refine_chunks(
+    document: ParsedSubtitleDocument,
+    current_translations: dict[int, str],
+    endpoint: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    chunk_size: int,
+    timeout_sec: int,
+    api_key: str | None,
+) -> TranslationStageMetrics:
+    metrics = TranslationStageMetrics(
+        stage_name="refine",
+        model=str(model),
+        input_cue_count=len(document.cues),
+        started_at=now_utc_iso(),
+    )
+    if not document.cues:
+        metrics.finished_at = now_utc_iso()
+        return metrics
+
+    for chunk in chunk_items(document.cues, chunk_size=max(1, int(chunk_size))):
+        chunk_payload: list[dict[str, Any]] = []
+        for cue in chunk:
+            en_text = strip_subtitle_markup(" ".join(cue.text_lines))
+            chunk_payload.append(
+                {
+                    "cue_id": cue.cue_id,
+                    "en": en_text,
+                    "ja": str(current_translations.get(cue.cue_id) or ""),
+                }
+            )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Refine Japanese subtitle drafts with local context. "
+                    "Return only JSON as {\"cues\":[{\"cue_id\":1,\"ja\":\"...\"}]}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": "refine subtitle wording",
+                        "constraints": [
+                            "preserve cue boundaries",
+                            "keep meaning aligned with EN",
+                            "avoid notes and annotations",
+                        ],
+                        "cues": chunk_payload,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+        try:
+            result = call_local_chat_completion(
+                endpoint=endpoint,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                timeout_sec=timeout_sec,
+                api_key=api_key,
+            )
+        except RuntimeError as exc:
+            metrics.status = "failed"
+            metrics.error_message = str(exc)
+            break
+
+        metrics.request_count += 1
+        metrics.elapsed_ms += int(result["elapsed_ms"])
+        metrics.prompt_tokens += int(result["prompt_tokens"])
+        metrics.completion_tokens += int(result["completion_tokens"])
+        metrics.total_tokens += int(result["total_tokens"])
+        patch_map = extract_patch_map_from_llm_output(str(result["content"]))
+        allowed_ids = {cue.cue_id for cue in chunk}
+        metrics.changed_cue_count += apply_patch_map_to_translations(
+            current_translations=current_translations,
+            patch_map=patch_map,
+            allowed_cue_ids=allowed_ids,
+        )
+
+    metrics.finished_at = now_utc_iso()
+    return metrics
+
+
+def run_translation_stage_global(
+    document: ParsedSubtitleDocument,
+    current_translations: dict[int, str],
+    endpoint: str,
+    model: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    timeout_sec: int,
+    global_max_cues: int,
+    api_key: str | None,
+) -> TranslationStageMetrics:
+    metrics = TranslationStageMetrics(
+        stage_name="global",
+        model=str(model),
+        input_cue_count=len(document.cues),
+        started_at=now_utc_iso(),
+    )
+    cue_count = len(document.cues)
+    if cue_count == 0:
+        metrics.finished_at = now_utc_iso()
+        return metrics
+    if cue_count > max(1, int(global_max_cues)):
+        metrics.status = "skipped"
+        metrics.error_message = (
+            f"cue_count={cue_count} exceeds global_max_cues={max(1, int(global_max_cues))}"
+        )
+        metrics.finished_at = now_utc_iso()
+        return metrics
+
+    payload_cues: list[dict[str, Any]] = []
+    for cue in document.cues:
+        payload_cues.append(
+            {
+                "cue_id": cue.cue_id,
+                "en": strip_subtitle_markup(" ".join(cue.text_lines)),
+                "ja": str(current_translations.get(cue.cue_id) or ""),
+            }
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Perform final consistency pass for Japanese subtitle cues. "
+                "Return JSON only as {\"cues\":[{\"cue_id\":1,\"ja\":\"...\"}]}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "task": "global consistency pass",
+                    "constraints": [
+                        "keep each cue independent",
+                        "harmonize wording and tone across the file",
+                        "keep proper nouns consistent",
+                    ],
+                    "cues": payload_cues,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    ]
+    try:
+        result = call_local_chat_completion(
+            endpoint=endpoint,
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            api_key=api_key,
+        )
+    except RuntimeError as exc:
+        metrics.status = "failed"
+        metrics.error_message = str(exc)
+        metrics.finished_at = now_utc_iso()
+        return metrics
+
+    metrics.request_count = 1
+    metrics.elapsed_ms = int(result["elapsed_ms"])
+    metrics.prompt_tokens = int(result["prompt_tokens"])
+    metrics.completion_tokens = int(result["completion_tokens"])
+    metrics.total_tokens = int(result["total_tokens"])
+    patch_map = extract_patch_map_from_llm_output(str(result["content"]))
+    allowed_ids = {cue.cue_id for cue in document.cues}
+    metrics.changed_cue_count = apply_patch_map_to_translations(
+        current_translations=current_translations,
+        patch_map=patch_map,
+        allowed_cue_ids=allowed_ids,
+    )
+    metrics.finished_at = now_utc_iso()
+    return metrics
+
+
+def validate_subtitle_timing_match(source_path: Path, output_path: Path) -> tuple[int, bool]:
+    source_cues = parse_subtitle_cues(source_path)
+    output_cues = parse_subtitle_cues(output_path)
+    if len(source_cues) != len(output_cues):
+        return (len(source_cues), False)
+    for source_cue, output_cue in zip(source_cues, output_cues):
+        if int(source_cue.get("start_ms") or 0) != int(output_cue.get("start_ms") or 0):
+            return (len(source_cues), False)
+        if int(source_cue.get("end_ms") or 0) != int(output_cue.get("end_ms") or 0):
+            return (len(source_cues), False)
+    return (len(source_cues), True)
+
+
+def run_translate_local(
+    db_path: Path,
+    source_ids: list[str],
+    endpoint: str,
+    api_key: str | None,
+    source_lang: str,
+    target_lang: str,
+    draft_model: str,
+    refine_model: str,
+    global_model: str,
+    draft_max_tokens: int,
+    refine_max_tokens: int,
+    global_max_tokens: int,
+    temperature: float,
+    top_p: float,
+    chunk_size: int,
+    global_max_cues: int,
+    timeout_sec: int,
+    limit: int,
+    include_translated: bool,
+    overwrite: bool,
+    dry_run: bool,
+    agent: str,
+    method: str,
+    method_version: str,
+    video_ids: list[str] | None = None,
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        create_schema(connection)
+        connection.commit()
+
+        targets = collect_local_translation_targets(
+            connection=connection,
+            source_ids=source_ids,
+            target_lang=target_lang,
+            video_ids=video_ids,
+            limit=max(0, int(limit)),
+            include_translated=bool(include_translated),
+            overwrite=bool(overwrite),
+        )
+        if not targets:
+            print("[translate-local] no targets found")
+            return
+
+        print(
+            "[translate-local] targets="
+            f"{len(targets)} source_lang={source_lang} target_lang={target_lang}"
+        )
+
+        success_count = 0
+        failed_count = 0
+        skipped_count = 0
+
+        for target in targets:
+            source_id = str(target["source_id"])
+            video_id = str(target["video_id"])
+            source_path = Path(str(target["subtitle_path"]))
+            output_path = Path(str(target["output_path"]))
+            started_at = now_utc_iso()
+            stage_metrics: list[TranslationStageMetrics] = []
+
+            print(f"[translate-local] start {source_id}/{video_id} input={source_path.name}")
+            try:
+                document = parse_subtitle_document(source_path)
+                cue_count = len(document.cues)
+                if cue_count == 0:
+                    print(f"[translate-local] skip {source_id}/{video_id}: no cue blocks")
+                    skipped_count += 1
+                    continue
+
+                translations, draft_metrics = run_translation_stage_draft(
+                    document=document,
+                    endpoint=endpoint,
+                    model=draft_model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max(1, int(draft_max_tokens)),
+                    timeout_sec=timeout_sec,
+                    api_key=api_key,
+                )
+                stage_metrics.append(draft_metrics)
+
+                refine_metrics = run_translation_stage_refine_chunks(
+                    document=document,
+                    current_translations=translations,
+                    endpoint=endpoint,
+                    model=refine_model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max(1, int(refine_max_tokens)),
+                    chunk_size=max(1, int(chunk_size)),
+                    timeout_sec=timeout_sec,
+                    api_key=api_key,
+                )
+                stage_metrics.append(refine_metrics)
+
+                global_metrics = run_translation_stage_global(
+                    document=document,
+                    current_translations=translations,
+                    endpoint=endpoint,
+                    model=global_model,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max(1, int(global_max_tokens)),
+                    timeout_sec=timeout_sec,
+                    global_max_cues=max(1, int(global_max_cues)),
+                    api_key=api_key,
+                )
+                stage_metrics.append(global_metrics)
+
+                rendered_text = render_subtitle_document(document, translations)
+                if not rendered_text.strip():
+                    raise RuntimeError("rendered subtitle is empty")
+
+                cue_match = True
+                if dry_run:
+                    cue_count = len(document.cues)
+                else:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(rendered_text, encoding="utf-8", newline="\n")
+                    cue_count, cue_match = validate_subtitle_timing_match(
+                        source_path=source_path,
+                        output_path=output_path,
+                    )
+
+                finished_at = now_utc_iso()
+                summary = build_local_translation_summary(
+                    source_id=source_id,
+                    video_id=video_id,
+                    cue_count=cue_count,
+                    translations=translations,
+                )
+
+                if dry_run:
+                    success_count += 1
+                    print(
+                        f"[translate-local] dry-run ok {source_id}/{video_id} "
+                        f"cues={cue_count} output={output_path.name}"
+                    )
+                    continue
+
+                status = "active" if cue_match else "failed"
+                run_id = record_translation_run(
+                    connection=connection,
+                    source_id=source_id,
+                    video_id=video_id,
+                    source_path=source_path,
+                    output_path=output_path,
+                    cue_count=cue_count,
+                    cue_match=cue_match,
+                    agent=agent,
+                    method=method,
+                    method_version=method_version,
+                    summary=summary,
+                    source_lang=str(source_lang or "en"),
+                    target_lang=str(target_lang or "ja"),
+                    status=status,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+                for metric in stage_metrics:
+                    record_translation_stage_metrics(
+                        connection=connection,
+                        translation_run_id=run_id,
+                        source_id=source_id,
+                        video_id=video_id,
+                        stage_metrics=metric,
+                    )
+                connection.commit()
+
+                if cue_match:
+                    success_count += 1
+                    print(
+                        f"[translate-local] ok {source_id}/{video_id} "
+                        f"cues={cue_count} output={output_path}"
+                    )
+                else:
+                    failed_count += 1
+                    print(
+                        f"[translate-local] NG timing mismatch {source_id}/{video_id} "
+                        f"cues={cue_count} output={output_path}"
+                    )
+            except Exception as exc:
+                failed_count += 1
+                finished_at = now_utc_iso()
+                error_summary = (
+                    "local-llm multi-stage translation failed "
+                    f"({source_id}/{video_id}): {exc}"
+                )
+                if not dry_run:
+                    run_id = record_translation_run(
+                        connection=connection,
+                        source_id=source_id,
+                        video_id=video_id,
+                        source_path=source_path,
+                        output_path=output_path,
+                        cue_count=0,
+                        cue_match=False,
+                        agent=agent,
+                        method=method,
+                        method_version=method_version,
+                        summary=error_summary,
+                        source_lang=str(source_lang or "en"),
+                        target_lang=str(target_lang or "ja"),
+                        status="failed",
+                        started_at=started_at,
+                        finished_at=finished_at,
+                    )
+                    for metric in stage_metrics:
+                        record_translation_stage_metrics(
+                            connection=connection,
+                            translation_run_id=run_id,
+                            source_id=source_id,
+                            video_id=video_id,
+                            stage_metrics=metric,
+                        )
+                    connection.commit()
+                print(f"[translate-local] failed {source_id}/{video_id}: {exc}", file=sys.stderr)
+
+        print(
+            "[translate-local] done "
+            f"success={success_count} skipped={skipped_count} failed={failed_count}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Substudy sync and ledger tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -9057,6 +10419,44 @@ def parse_args() -> argparse.Namespace:
     sync_parser.add_argument("--skip-media", action="store_true")
     sync_parser.add_argument("--skip-subs", action="store_true")
     sync_parser.add_argument("--skip-meta", action="store_true")
+    sync_parser.add_argument(
+        "--network-profile",
+        choices=["normal", "weak", "auto"],
+        default="normal",
+        help=(
+            "Media download behavior by network condition: "
+            "normal=download media, weak=skip media, auto=probe and decide."
+        ),
+    )
+    sync_parser.add_argument(
+        "--network-probe-url",
+        default=DEFAULT_NETWORK_PROBE_URL,
+        help=f"Probe URL for --network-profile auto (default: {DEFAULT_NETWORK_PROBE_URL})",
+    )
+    sync_parser.add_argument(
+        "--network-probe-timeout-sec",
+        type=int,
+        default=DEFAULT_NETWORK_PROBE_TIMEOUT_SEC,
+        help=f"Probe timeout seconds for auto network profile (default: {DEFAULT_NETWORK_PROBE_TIMEOUT_SEC})",
+    )
+    sync_parser.add_argument(
+        "--network-probe-bytes",
+        type=int,
+        default=DEFAULT_NETWORK_PROBE_BYTES,
+        help=f"Probe byte size for throughput estimation (default: {DEFAULT_NETWORK_PROBE_BYTES})",
+    )
+    sync_parser.add_argument(
+        "--weak-net-min-kbps",
+        type=float,
+        default=DEFAULT_WEAK_NET_MIN_KBPS,
+        help=f"Auto profile threshold: below this kbps is weak (default: {DEFAULT_WEAK_NET_MIN_KBPS})",
+    )
+    sync_parser.add_argument(
+        "--weak-net-max-rtt-ms",
+        type=float,
+        default=DEFAULT_WEAK_NET_MAX_RTT_MS,
+        help=f"Auto profile threshold: above this RTT is weak (default: {DEFAULT_WEAK_NET_MAX_RTT_MS})",
+    )
     sync_parser.add_argument("--skip-ledger", action="store_true")
     sync_parser.add_argument(
         "--full-ledger",
@@ -9076,6 +10476,44 @@ def parse_args() -> argparse.Namespace:
     backfill_parser.add_argument("--skip-media", action="store_true")
     backfill_parser.add_argument("--skip-subs", action="store_true")
     backfill_parser.add_argument("--skip-meta", action="store_true")
+    backfill_parser.add_argument(
+        "--network-profile",
+        choices=["normal", "weak", "auto"],
+        default="normal",
+        help=(
+            "Media download behavior by network condition: "
+            "normal=download media, weak=skip media, auto=probe and decide."
+        ),
+    )
+    backfill_parser.add_argument(
+        "--network-probe-url",
+        default=DEFAULT_NETWORK_PROBE_URL,
+        help=f"Probe URL for --network-profile auto (default: {DEFAULT_NETWORK_PROBE_URL})",
+    )
+    backfill_parser.add_argument(
+        "--network-probe-timeout-sec",
+        type=int,
+        default=DEFAULT_NETWORK_PROBE_TIMEOUT_SEC,
+        help=f"Probe timeout seconds for auto network profile (default: {DEFAULT_NETWORK_PROBE_TIMEOUT_SEC})",
+    )
+    backfill_parser.add_argument(
+        "--network-probe-bytes",
+        type=int,
+        default=DEFAULT_NETWORK_PROBE_BYTES,
+        help=f"Probe byte size for throughput estimation (default: {DEFAULT_NETWORK_PROBE_BYTES})",
+    )
+    backfill_parser.add_argument(
+        "--weak-net-min-kbps",
+        type=float,
+        default=DEFAULT_WEAK_NET_MIN_KBPS,
+        help=f"Auto profile threshold: below this kbps is weak (default: {DEFAULT_WEAK_NET_MIN_KBPS})",
+    )
+    backfill_parser.add_argument(
+        "--weak-net-max-rtt-ms",
+        type=float,
+        default=DEFAULT_WEAK_NET_MAX_RTT_MS,
+        help=f"Auto profile threshold: above this RTT is weak (default: {DEFAULT_WEAK_NET_MAX_RTT_MS})",
+    )
     backfill_parser.add_argument("--skip-ledger", action="store_true")
     backfill_parser.add_argument(
         "--full-ledger",
@@ -9446,6 +10884,135 @@ def parse_args() -> argparse.Namespace:
         help="Optional custom LaunchAgent plist path",
     )
 
+    translate_local_parser = subparsers.add_parser(
+        "translate-local",
+        help="Translate subtitles with local multi-stage LLM pipeline (20b draft + 120b refinements)",
+    )
+    translate_local_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    translate_local_parser.add_argument("--source", action="append", dest="sources")
+    translate_local_parser.add_argument("--ledger-db", type=Path)
+    translate_local_parser.add_argument(
+        "--video-id",
+        action="append",
+        dest="video_ids",
+        help="Optional video_id filter (repeatable).",
+    )
+    translate_local_parser.add_argument(
+        "--limit",
+        type=int,
+        default=1,
+        help="Max subtitle files to process in this run (default: 1).",
+    )
+    translate_local_parser.add_argument(
+        "--include-translated",
+        action="store_true",
+        help="Include files that already have active translation_runs rows.",
+    )
+    translate_local_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing target subtitle files.",
+    )
+    translate_local_parser.add_argument(
+        "--source-lang",
+        default="en",
+        help="Source language label stored in translation_runs (default: en).",
+    )
+    translate_local_parser.add_argument(
+        "--target-lang",
+        default="ja",
+        help="Target language label stored in translation_runs (default: ja).",
+    )
+    translate_local_parser.add_argument(
+        "--endpoint",
+        default=os.environ.get("SUBSTUDY_LOCAL_LLM_ENDPOINT", DEFAULT_LOCAL_LLM_ENDPOINT),
+        help=f"OpenAI-compatible endpoint (default: {DEFAULT_LOCAL_LLM_ENDPOINT})",
+    )
+    translate_local_parser.add_argument(
+        "--api-key",
+        default=os.environ.get("SUBSTUDY_LOCAL_LLM_API_KEY", ""),
+        help="Optional API key for endpoint auth.",
+    )
+    translate_local_parser.add_argument(
+        "--draft-model",
+        default=DEFAULT_LOCAL_TRANSLATE_DRAFT_MODEL,
+        help=f"Stage1 cue-level model (default: {DEFAULT_LOCAL_TRANSLATE_DRAFT_MODEL})",
+    )
+    translate_local_parser.add_argument(
+        "--refine-model",
+        default=DEFAULT_LOCAL_TRANSLATE_REFINE_MODEL,
+        help=f"Stage2 chunk-level model (default: {DEFAULT_LOCAL_TRANSLATE_REFINE_MODEL})",
+    )
+    translate_local_parser.add_argument(
+        "--global-model",
+        default=DEFAULT_LOCAL_TRANSLATE_GLOBAL_MODEL,
+        help=f"Stage3 global-pass model (default: {DEFAULT_LOCAL_TRANSLATE_GLOBAL_MODEL})",
+    )
+    translate_local_parser.add_argument(
+        "--draft-max-tokens",
+        type=int,
+        default=160,
+        help="Stage1 max_tokens (default: 160).",
+    )
+    translate_local_parser.add_argument(
+        "--refine-max-tokens",
+        type=int,
+        default=480,
+        help="Stage2 max_tokens (default: 480).",
+    )
+    translate_local_parser.add_argument(
+        "--global-max-tokens",
+        type=int,
+        default=1200,
+        help="Stage3 max_tokens (default: 1200).",
+    )
+    translate_local_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.1,
+        help="Sampling temperature (default: 0.1).",
+    )
+    translate_local_parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.9,
+        help="Nucleus sampling top_p (default: 0.9).",
+    )
+    translate_local_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=12,
+        help="Cues per refine request (default: 12).",
+    )
+    translate_local_parser.add_argument(
+        "--global-max-cues",
+        type=int,
+        default=240,
+        help="Skip stage3 when cue count exceeds this (default: 240).",
+    )
+    translate_local_parser.add_argument(
+        "--timeout-sec",
+        type=int,
+        default=60,
+        help="HTTP timeout per request (default: 60).",
+    )
+    translate_local_parser.add_argument(
+        "--agent",
+        default="local-llm",
+        help="translation_runs.agent value (default: local-llm).",
+    )
+    translate_local_parser.add_argument(
+        "--method",
+        default="multi-stage",
+        help="translation_runs.method value (default: multi-stage).",
+    )
+    translate_local_parser.add_argument(
+        "--method-version",
+        default="20b-draft+120b-refine+120b-global-v1",
+        help="translation_runs.method_version value.",
+    )
+    translate_local_parser.add_argument("--dry-run", action="store_true")
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -9484,6 +11051,16 @@ def main() -> int:
     ledger_csv_path = resolve_output_path(getattr(args, "ledger_csv", None), global_config.ledger_csv)
 
     if args.command == "sync":
+        effective_skip_media, _network_decision = resolve_skip_media_with_network_profile(
+            command_name="sync",
+            explicit_skip_media=bool(args.skip_media),
+            network_profile=str(args.network_profile or "normal"),
+            network_probe_url=str(args.network_probe_url or DEFAULT_NETWORK_PROBE_URL),
+            network_probe_timeout_sec=max(2, int(args.network_probe_timeout_sec)),
+            network_probe_bytes=max(1024, int(args.network_probe_bytes)),
+            weak_net_min_kbps=max(50.0, float(args.weak_net_min_kbps)),
+            weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
+        )
         sync_connection: sqlite3.Connection | None = None
         if not args.dry_run:
             ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -9494,7 +11071,7 @@ def main() -> int:
                 sync_source(
                     source=source,
                     dry_run=args.dry_run,
-                    skip_media=args.skip_media,
+                    skip_media=effective_skip_media,
                     skip_subs=args.skip_subs,
                     skip_meta=args.skip_meta,
                     connection=sync_connection,
@@ -9515,12 +11092,22 @@ def main() -> int:
         return 0
 
     if args.command == "backfill":
+        effective_skip_media, _network_decision = resolve_skip_media_with_network_profile(
+            command_name="backfill",
+            explicit_skip_media=bool(args.skip_media),
+            network_profile=str(args.network_profile or "normal"),
+            network_probe_url=str(args.network_probe_url or DEFAULT_NETWORK_PROBE_URL),
+            network_probe_timeout_sec=max(2, int(args.network_probe_timeout_sec)),
+            network_probe_bytes=max(1024, int(args.network_probe_bytes)),
+            weak_net_min_kbps=max(50.0, float(args.weak_net_min_kbps)),
+            weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
+        )
         run_backfill(
             sources=sources,
             db_path=ledger_db_path,
             csv_path=ledger_csv_path,
             dry_run=args.dry_run,
-            skip_media=args.skip_media,
+            skip_media=effective_skip_media,
             skip_subs=args.skip_subs,
             skip_meta=args.skip_meta,
             skip_ledger=args.skip_ledger,
@@ -9677,6 +11264,36 @@ def main() -> int:
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
+
+    if args.command == "translate-local":
+        run_translate_local(
+            db_path=ledger_db_path,
+            source_ids=[source.id for source in sources],
+            endpoint=str(args.endpoint),
+            api_key=str(args.api_key or "").strip() or None,
+            source_lang=str(args.source_lang or "en").strip().lower(),
+            target_lang=str(args.target_lang or "ja").strip().lower(),
+            draft_model=str(args.draft_model),
+            refine_model=str(args.refine_model),
+            global_model=str(args.global_model),
+            draft_max_tokens=max(1, int(args.draft_max_tokens)),
+            refine_max_tokens=max(1, int(args.refine_max_tokens)),
+            global_max_tokens=max(1, int(args.global_max_tokens)),
+            temperature=float(args.temperature),
+            top_p=float(args.top_p),
+            chunk_size=max(1, int(args.chunk_size)),
+            global_max_cues=max(1, int(args.global_max_cues)),
+            timeout_sec=max(3, int(args.timeout_sec)),
+            limit=max(0, int(args.limit)),
+            include_translated=bool(args.include_translated),
+            overwrite=bool(args.overwrite),
+            dry_run=bool(args.dry_run),
+            agent=str(args.agent),
+            method=str(args.method),
+            method_version=str(args.method_version),
+            video_ids=args.video_ids,
+        )
+        return 0
 
     if args.command == "web":
         run_web_ui(
