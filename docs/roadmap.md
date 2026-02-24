@@ -258,6 +258,7 @@ Ticket TODO (execution order):
 - [x] `4.6-06` 4.6回帰テスト: review/qa join・artifact open/download・import monitor の軽量テストを追加（`tests/test_workspace_regression.py`）
 - [ ] `4.6-07` TikTok likes監視ガードレール: `/@handle/liked` が `foryou` へリダイレクトされるケースを明示エラー化し、workspace monitor に原因（cookie/権限/URL種別）を表示
 - [ ] `4.6-08` likes取得のフォールバック運用: `yt-dlp` 単体で likes 列挙不可時の代替入力（URLリスト投入）を運用フローとして文書化し、`sync` 側に手順リンクを追加
+- [ ] `4.6-09` 翻訳トラック選択UI: 再生画面で `ja` / `ja-local` / `ja-asr-local` を切り替え可能にし、source単位で選択状態を保持する
 
 Known issue (2026-02-20):
 
@@ -355,9 +356,28 @@ Acceptance:
 
 ## 8) Translation pipeline hardening
 
-- Add helper command for translation target extraction (video-present subtitle set).
-- Add DB write helper for `translation_runs` (active/superseded transaction pattern).
-- Keep translation automation opt-in until quality/cost metrics stabilize.
+Goal: run multiple translation variants safely (`claude`/`local`) and make them comparable in UI.
+
+Status:
+
+- [x] Add helper command for translation target extraction (video-present subtitle set).
+- [x] Add DB write helper for `translation_runs` (active/superseded transaction pattern).
+- [x] Add local multi-stage translation runner + stage metrics (`translation_stage_runs`).
+- [x] Add ASR-source local translation mode:
+  - allow local translation to use ASR subtitle tracks as source (`*.asr.srt` / `*.asr.vtt`)
+  - keep outputs isolated by variant language tag (`ja-asr-local`) to avoid mixing with `ja`/`ja-local`
+  - store source track kind in `method_version`/summary for auditability
+- [x] Add UI-side translation variant selector:
+  - expose available JA-family tracks (`ja`, `ja-local`, `ja-asr-local`) in player/subtitle UI
+  - persist preferred translation variant per source (URL/query + local storage)
+  - keep fallback deterministic when preferred variant is missing
+- [ ] Keep translation automation opt-in until quality/cost metrics stabilize.
+
+Acceptance:
+
+- ASR-only videos can produce local JA translations without manual subtitle preprocessing.
+- Same video can retain multiple JA variants (`ja`, `ja-local`, `ja-asr-local`) without clobbering.
+- UI lets users switch translation variant explicitly and keeps selection stable across reloads.
 
 ## 9) Next: extension-based ingest migration (`yt-dlp` dependency reduction)
 
