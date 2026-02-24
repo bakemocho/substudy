@@ -38,8 +38,11 @@ const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
 const PLAYER_CARD_SNAP_NUDGE_PX = 3.2;
 const PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH = 920;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
+const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
+const TRANSLATION_VARIANT_STORAGE_KEY = "substudy.translation_variant_by_source";
+const TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY = "substudy.translation_variant_default";
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -179,6 +182,37 @@ const state = {
     }
     return "all";
   })(),
+  translationVariant: (() => {
+    const stored = String(localStorage.getItem(TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY) || "").trim().toLowerCase();
+    if (TRANSLATION_VARIANT_VALUES.has(stored)) {
+      return stored;
+    }
+    return "auto";
+  })(),
+  translationVariantBySource: (() => {
+    const raw = localStorage.getItem(TRANSLATION_VARIANT_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      const sanitized = {};
+      for (const [sourceId, variant] of Object.entries(parsed)) {
+        const safeSourceId = String(sourceId || "").trim();
+        const safeVariant = String(variant || "").trim().toLowerCase();
+        if (!safeSourceId || !TRANSLATION_VARIANT_VALUES.has(safeVariant)) {
+          continue;
+        }
+        sanitized[safeSourceId] = safeVariant;
+      }
+      return sanitized;
+    } catch (_error) {
+      return {};
+    }
+  })(),
   workspaceReviewCards: [],
   workspaceMissingEntries: [],
   workspaceDownloadMonitor: null,
@@ -194,6 +228,7 @@ const elements = {
   appShell: document.querySelector(".app-shell"),
   sourceSelect: document.getElementById("sourceSelect"),
   translationFilterSelect: document.getElementById("translationFilterSelect"),
+  translationVariantSelect: document.getElementById("translationVariantSelect"),
   jumpOpenBtn: document.getElementById("jumpOpenBtn"),
   autoplayToggle: document.getElementById("autoplayToggle"),
   shuffleToggle: document.getElementById("shuffleToggle"),
@@ -758,6 +793,70 @@ function normalizeTranslationFilter(value, fallback = "all") {
     : "all";
 }
 
+function normalizeTranslationVariant(value, fallback = "auto") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (TRANSLATION_VARIANT_VALUES.has(normalized)) {
+    return normalized;
+  }
+  return TRANSLATION_VARIANT_VALUES.has(String(fallback || "").trim().toLowerCase())
+    ? String(fallback).trim().toLowerCase()
+    : "auto";
+}
+
+function getSourceIdForTranslationVariantPreference(preferredSourceId = "") {
+  const safePreferredSourceId = String(preferredSourceId || "").trim();
+  if (safePreferredSourceId) {
+    return safePreferredSourceId;
+  }
+  const currentSource = String(currentVideo()?.source_id || "").trim();
+  if (currentSource) {
+    return currentSource;
+  }
+  return String(elements.sourceSelect?.value || "").trim();
+}
+
+function getTranslationVariantPreferenceForSource(sourceId = "") {
+  const safeSourceId = String(sourceId || "").trim();
+  if (safeSourceId) {
+    return normalizeTranslationVariant(state.translationVariantBySource[safeSourceId], state.translationVariant);
+  }
+  return normalizeTranslationVariant(state.translationVariant, "auto");
+}
+
+function persistTranslationVariantPreferences() {
+  localStorage.setItem(
+    TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY,
+    normalizeTranslationVariant(state.translationVariant, "auto")
+  );
+  try {
+    localStorage.setItem(
+      TRANSLATION_VARIANT_STORAGE_KEY,
+      JSON.stringify(state.translationVariantBySource || {})
+    );
+  } catch (_error) {
+    return;
+  }
+}
+
+function setTranslationVariantPreference(variant, sourceId = "", options = {}) {
+  const normalizedVariant = normalizeTranslationVariant(variant, state.translationVariant);
+  const safeSourceId = getSourceIdForTranslationVariantPreference(sourceId);
+  const {
+    persist = true,
+    updateSelect = true,
+  } = options;
+  state.translationVariant = normalizedVariant;
+  if (safeSourceId) {
+    state.translationVariantBySource[safeSourceId] = normalizedVariant;
+  }
+  if (persist) {
+    persistTranslationVariantPreferences();
+  }
+  if (updateSelect) {
+    updateTranslationVariantSelect(safeSourceId);
+  }
+}
+
 function normalizeSubtitlePanelMode(value, fallback = "en_ja") {
   const normalized = String(value || "").trim().toLowerCase();
   if (SUBTITLE_PANEL_MODES.has(normalized)) {
@@ -813,6 +912,16 @@ function updateTranslationFilterSelect() {
   elements.translationFilterSelect.value = normalizeTranslationFilter(state.translationFilter, "all");
 }
 
+function updateTranslationVariantSelect(preferredSourceId = "") {
+  if (!elements.translationVariantSelect) {
+    return;
+  }
+  const safeSourceId = getSourceIdForTranslationVariantPreference(preferredSourceId);
+  const variant = getTranslationVariantPreferenceForSource(safeSourceId);
+  state.translationVariant = variant;
+  elements.translationVariantSelect.value = variant;
+}
+
 function parseInitialVideoSelectionFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
@@ -829,12 +938,19 @@ function parseInitialVideoSelectionFromUrl() {
       params.get("translation_filter"),
       state.translationFilter
     );
+    const hasTranslationVariant = params.has("translation_variant");
+    const translationVariant = normalizeTranslationVariant(
+      params.get("translation_variant"),
+      getTranslationVariantPreferenceForSource(sourceId)
+    );
     return {
       sourceId,
       videoId,
       playbackTimeSec,
       translationFilter,
       hasTranslationFilter,
+      translationVariant,
+      hasTranslationVariant,
     };
   } catch (_error) {
     return {
@@ -843,6 +959,8 @@ function parseInitialVideoSelectionFromUrl() {
       playbackTimeSec: null,
       translationFilter: state.translationFilter,
       hasTranslationFilter: false,
+      translationVariant: state.translationVariant,
+      hasTranslationVariant: false,
     };
   }
 }
@@ -851,7 +969,8 @@ function updateUrlVideoSelection(
   sourceId = "",
   videoId = "",
   translationFilter = state.translationFilter,
-  playbackTimeSec = null
+  playbackTimeSec = null,
+  translationVariant = state.translationVariant
 ) {
   try {
     const url = new URL(window.location.href);
@@ -870,6 +989,12 @@ function updateUrlVideoSelection(
       url.searchParams.set("translation_filter", normalizedTranslationFilter);
     } else {
       url.searchParams.delete("translation_filter");
+    }
+    const normalizedTranslationVariant = normalizeTranslationVariant(translationVariant, "auto");
+    if (normalizedTranslationVariant !== "auto") {
+      url.searchParams.set("translation_variant", normalizedTranslationVariant);
+    } else {
+      url.searchParams.delete("translation_variant");
     }
     const safePlaybackTimeSec = Number(playbackTimeSec);
     if (Number.isFinite(safePlaybackTimeSec) && safePlaybackTimeSec > 0) {
@@ -899,7 +1024,14 @@ function syncUrlPlaybackPosition(force = false) {
     return;
   }
   state.urlPlaybackTimeSecond = second;
-  updateUrlVideoSelection(video.source_id, video.video_id, state.translationFilter, second);
+  const sourceId = String(video?.source_id || "").trim();
+  updateUrlVideoSelection(
+    sourceId,
+    video.video_id,
+    state.translationFilter,
+    second,
+    getTranslationVariantPreferenceForSource(sourceId)
+  );
 }
 
 function applyInitialPlaybackTime(playbackTimeSec) {
@@ -1254,8 +1386,94 @@ function renderVideoMeta(video) {
   elements.metaPanel.scrollTop = 0;
 }
 
+function normalizedTrackKind(track) {
+  return String(track?.kind || "").trim().toLowerCase();
+}
+
+function normalizedTrackLabel(track) {
+  return String(track?.label || "").trim().toLowerCase();
+}
+
+function getJaTrackVariant(track) {
+  if (normalizedTrackKind(track) !== "subtitle") {
+    return "";
+  }
+  const label = normalizedTrackLabel(track);
+  if (!label) {
+    return "";
+  }
+  if (label === "ja-asr-local" || label.startsWith("ja-asr-local-")) {
+    return "ja-asr-local";
+  }
+  if (label === "ja-local" || label.startsWith("ja-local-")) {
+    return "ja-local";
+  }
+  if (label === "ja" || label.startsWith("ja-") || label.includes("japanese")) {
+    return "ja";
+  }
+  return "";
+}
+
+function findTrackIdByJaVariant(video, variant) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  const safeVariant = normalizeTranslationVariant(variant, "auto");
+  if (!tracks.length || safeVariant === "auto") {
+    return null;
+  }
+  const exactMatch = tracks.find((track) => getJaTrackVariant(track) === safeVariant) || null;
+  if (exactMatch?.track_id) {
+    return String(exactMatch.track_id);
+  }
+  return null;
+}
+
+function resolveTranslationVariantFallbackOrder(variant) {
+  const safeVariant = normalizeTranslationVariant(variant, "auto");
+  if (safeVariant === "ja-local") {
+    return ["ja-local", "ja", "ja-asr-local"];
+  }
+  if (safeVariant === "ja-asr-local") {
+    return ["ja-asr-local", "ja-local", "ja"];
+  }
+  if (safeVariant === "ja") {
+    return ["ja", "ja-local", "ja-asr-local"];
+  }
+  return [];
+}
+
+function resolveTrackIdFromTranslationVariant(video, variant) {
+  const variantOrder = resolveTranslationVariantFallbackOrder(variant);
+  for (const candidateVariant of variantOrder) {
+    const trackId = findTrackIdByJaVariant(video, candidateVariant);
+    if (trackId) {
+      return trackId;
+    }
+  }
+  return null;
+}
+
+function resolveTrackIdForVideo(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  if (!tracks.length) {
+    return null;
+  }
+  const sourceId = String(video?.source_id || "").trim();
+  const preferredVariant = getTranslationVariantPreferenceForSource(sourceId);
+  const variantTrackId = resolveTrackIdFromTranslationVariant(video, preferredVariant);
+  if (variantTrackId) {
+    return variantTrackId;
+  }
+  const defaultTrackId = String(video.default_track || "");
+  if (defaultTrackId && tracks.some((track) => String(track?.track_id || "") === defaultTrackId)) {
+    return defaultTrackId;
+  }
+  const firstTrackId = String(tracks[0]?.track_id || "");
+  return firstTrackId || null;
+}
+
 function renderTrackOptions(video) {
   elements.trackSelect.textContent = "";
+  updateTranslationVariantSelect(String(video?.source_id || ""));
 
   if (!video.tracks.length) {
     const option = document.createElement("option");
@@ -1268,10 +1486,10 @@ function renderTrackOptions(video) {
   }
 
   elements.trackSelect.disabled = false;
-  const stillValid = video.tracks.some((track) => track.track_id === state.currentTrackId);
+  const stillValid = video.tracks.some((track) => String(track?.track_id || "") === String(state.currentTrackId));
   state.currentTrackId = stillValid
     ? state.currentTrackId
-    : video.default_track || video.tracks[0].track_id;
+    : resolveTrackIdForVideo(video);
 
   for (const track of video.tracks) {
     const option = document.createElement("option");
@@ -1281,14 +1499,6 @@ function renderTrackOptions(video) {
   }
 
   elements.trackSelect.value = state.currentTrackId;
-}
-
-function normalizedTrackKind(track) {
-  return String(track?.kind || "").trim().toLowerCase();
-}
-
-function normalizedTrackLabel(track) {
-  return String(track?.label || "").trim().toLowerCase();
 }
 
 function isJapaneseTrack(track) {
@@ -1370,7 +1580,21 @@ function resolveSubtitlePanelTrackIds(video) {
   }
 
   const currentTrack = tracks.find((track) => track.track_id === state.currentTrackId) || null;
-  const jaTrack = tracks.find((track) => isJapaneseTrack(track)) || null;
+  let jaTrack = null;
+  if (currentTrack && getJaTrackVariant(currentTrack)) {
+    jaTrack = currentTrack;
+  }
+  if (!jaTrack) {
+    const sourceId = String(video?.source_id || "").trim();
+    const preferredVariant = getTranslationVariantPreferenceForSource(sourceId);
+    const preferredJaTrackId = resolveTrackIdFromTranslationVariant(video, preferredVariant);
+    if (preferredJaTrackId) {
+      jaTrack = tracks.find((track) => String(track?.track_id || "") === preferredJaTrackId) || null;
+    }
+  }
+  if (!jaTrack) {
+    jaTrack = tracks.find((track) => isJapaneseTrack(track)) || null;
+  }
 
   let primaryTrack = null;
   if (currentTrack && !isJapaneseTrack(currentTrack)) {
@@ -7334,12 +7558,21 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   }
 
   const video = currentVideo();
+  const videoSourceId = String(video?.source_id || "").trim();
+  state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
+  updateTranslationVariantSelect(videoSourceId);
   elements.videoPlayer.src = video.media_url;
   elements.videoPlayer.load();
   const initialSeekPromise = applyInitialPlaybackTime(startTimeSec);
   updateVideoProgressTimer();
   state.urlPlaybackTimeSecond = -1;
-  updateUrlVideoSelection(video.source_id, video.video_id, state.translationFilter, null);
+  updateUrlVideoSelection(
+    video.source_id,
+    video.video_id,
+    state.translationFilter,
+    null,
+    state.translationVariant
+  );
 
   renderVideoMeta(video);
   updateFavoriteButton();
@@ -7383,6 +7616,9 @@ async function loadFeed(
   state.translationFilter = normalizeTranslationFilter(translationFilter, state.translationFilter);
   localStorage.setItem("substudy.translation_filter", state.translationFilter);
   updateTranslationFilterSelect();
+  const variantSourceId = String(sourceId || "").trim();
+  state.translationVariant = getTranslationVariantPreferenceForSource(variantSourceId);
+  updateTranslationVariantSelect(variantSourceId);
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
@@ -7429,7 +7665,13 @@ async function loadFeed(
     elements.videoPlayer.load();
     updateVideoProgressTimer();
     releasePlayerCardSnapLock(false);
-    updateUrlVideoSelection(sourceId, "");
+    updateUrlVideoSelection(
+      sourceId,
+      "",
+      state.translationFilter,
+      null,
+      getTranslationVariantPreferenceForSource(sourceId)
+    );
     state.playbackHistory = [];
     state.historyPointer = -1;
     state.shuffleQueue = [];
@@ -8253,6 +8495,35 @@ function bindEvents() {
       resetControlsToggleFade();
     });
   }
+  if (elements.translationVariantSelect) {
+    elements.translationVariantSelect.addEventListener("change", () => {
+      const sourceId = getSourceIdForTranslationVariantPreference(elements.sourceSelect.value);
+      const selectedVariant = normalizeTranslationVariant(elements.translationVariantSelect.value, "auto");
+      setTranslationVariantPreference(selectedVariant, sourceId, { persist: true, updateSelect: true });
+
+      const video = currentVideo();
+      if (video && String(video?.source_id || "").trim() === sourceId) {
+        const nextTrackId = resolveTrackIdFromTranslationVariant(video, selectedVariant);
+        if (nextTrackId && nextTrackId !== state.currentTrackId) {
+          state.currentTrackId = nextTrackId;
+          elements.trackSelect.value = nextTrackId;
+          loadTrackCues().catch((error) => setStatus(error.message, "error"));
+        }
+      }
+
+      const current = currentVideo();
+      const playbackTimeSec = state.urlPlaybackTimeSecond >= 0 ? state.urlPlaybackTimeSecond : null;
+      updateUrlVideoSelection(
+        current?.source_id || sourceId,
+        current?.video_id || "",
+        state.translationFilter,
+        playbackTimeSec,
+        selectedVariant
+      );
+      elements.translationVariantSelect.blur();
+      resetControlsToggleFade();
+    });
+  }
   if (elements.workspaceRefreshBtn) {
     elements.workspaceRefreshBtn.addEventListener("click", () => {
       loadWorkspaceData({ silent: false })
@@ -8398,6 +8669,29 @@ function bindEvents() {
 
   elements.trackSelect.addEventListener("change", () => {
     state.currentTrackId = elements.trackSelect.value || null;
+    const video = currentVideo();
+    if (video) {
+      const selectedTrack = (
+        Array.isArray(video?.tracks)
+          ? video.tracks.find((track) => String(track?.track_id || "") === String(state.currentTrackId))
+          : null
+      ) || null;
+      const selectedVariant = getJaTrackVariant(selectedTrack);
+      if (selectedVariant) {
+        setTranslationVariantPreference(selectedVariant, String(video?.source_id || ""), {
+          persist: true,
+          updateSelect: true,
+        });
+        const playbackTimeSec = state.urlPlaybackTimeSecond >= 0 ? state.urlPlaybackTimeSecond : null;
+        updateUrlVideoSelection(
+          video.source_id,
+          video.video_id,
+          state.translationFilter,
+          playbackTimeSec,
+          selectedVariant
+        );
+      }
+    }
     elements.trackSelect.blur();
     loadTrackCues().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
@@ -8519,6 +8813,7 @@ async function initialize() {
   updateNormalizationToggle();
   updateDictHoverLoopToggle();
   updateTranslationFilterSelect();
+  updateTranslationVariantSelect();
   updateSubtitlePanelModeButtons();
   loadVolumeSettings();
   updateVideoProgressTimer();
@@ -8535,6 +8830,15 @@ async function initialize() {
       state.translationFilter = normalizeTranslationFilter(initialSelection.translationFilter, "all");
       localStorage.setItem("substudy.translation_filter", state.translationFilter);
       updateTranslationFilterSelect();
+    }
+    if (initialSelection.hasTranslationVariant) {
+      setTranslationVariantPreference(
+        initialSelection.translationVariant,
+        initialSelection.sourceId,
+        { persist: true, updateSelect: true }
+      );
+    } else {
+      updateTranslationVariantSelect(initialSelection.sourceId);
     }
     await loadFeed(
       initialSelection.sourceId,
