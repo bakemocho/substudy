@@ -7232,9 +7232,11 @@ def chunk_items(items: list[Any], chunk_size: int) -> list[list[Any]]:
 def build_local_translation_summary(
     source_id: str,
     video_id: str,
+    source_track_kind: str,
     cue_count: int,
     translations: dict[int, str],
 ) -> str:
+    safe_source_track_kind = normalize_translation_source_track(source_track_kind, "subtitle")
     preview: list[str] = []
     for cue_id in sorted(translations):
         text = str(translations.get(cue_id) or "").strip()
@@ -7249,12 +7251,25 @@ def build_local_translation_summary(
     if preview_text:
         return (
             f"local-llm multi-stage translation "
-            f"({source_id}/{video_id}, cues={max(0, int(cue_count))}): {preview_text}"
+            f"({source_id}/{video_id}, source_track={safe_source_track_kind}, "
+            f"cues={max(0, int(cue_count))}): {preview_text}"
         )
     return (
         f"local-llm multi-stage translation "
-        f"({source_id}/{video_id}, cues={max(0, int(cue_count))})"
+        f"({source_id}/{video_id}, source_track={safe_source_track_kind}, "
+        f"cues={max(0, int(cue_count))})"
     )
+
+
+def append_source_track_to_method_version(method_version: str, source_track_kind: str) -> str:
+    safe_method_version = str(method_version or "").strip()
+    safe_source_track = normalize_translation_source_track(source_track_kind, "subtitle")
+    marker = f"source-track={safe_source_track}"
+    if marker in safe_method_version:
+        return safe_method_version
+    if not safe_method_version:
+        return marker
+    return f"{safe_method_version}|{marker}"
 
 
 def find_best_subtitle_text_for_range(
@@ -9784,74 +9799,179 @@ def language_rank_for_translation_source(language: str, target_lang: str) -> int
         return 1
     if normalized in {"und", "na"}:
         return 2
+    normalized_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", normalized)
+        if token
+    }
+    if normalized_tokens & {"en", "eng", "english"}:
+        return 1
     return 10
+
+
+def normalize_translation_source_track(value: str | None, default: str = "subtitle") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"subtitle", "asr", "auto"}:
+        return normalized
+    safe_default = str(default or "subtitle").strip().lower()
+    return safe_default if safe_default in {"subtitle", "asr", "auto"} else "subtitle"
+
+
+def infer_translation_source_lang(language: str, fallback: str = "en") -> str:
+    normalized = str(language or "").strip().lower()
+    safe_fallback = str(fallback or "en").strip().lower() or "en"
+    if not normalized:
+        return safe_fallback
+    if normalized in {"und", "na"}:
+        return safe_fallback
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", normalized)
+        if token
+    }
+    if tokens & {"en", "eng", "english"}:
+        return "en"
+    return normalized
 
 
 def collect_local_translation_targets(
     connection: sqlite3.Connection,
     source_ids: list[str],
     target_lang: str,
+    source_track: str,
     video_ids: list[str] | None,
     limit: int,
     include_translated: bool,
     overwrite: bool,
 ) -> list[dict[str, Any]]:
     safe_target = str(target_lang or "ja").strip().lower() or "ja"
+    safe_source_track = normalize_translation_source_track(source_track, "subtitle")
     video_filter_set = {str(video_id).strip() for video_id in (video_ids or []) if str(video_id).strip()}
 
-    rows = connection.execute(
-        """
-        SELECT
-            s.source_id,
-            s.video_id,
-            COALESCE(s.language, '') AS language,
-            s.subtitle_path,
-            LOWER(COALESCE(s.ext, '')) AS ext
-        FROM subtitles s
-        JOIN videos v
-          ON v.source_id = s.source_id
-         AND v.video_id = s.video_id
-        WHERE v.has_media = 1
-          AND s.subtitle_path IS NOT NULL
-          AND s.subtitle_path <> ''
-          AND LOWER(COALESCE(s.ext, '')) IN ('srt', 'vtt')
-        ORDER BY s.source_id ASC, s.video_id ASC, s.subtitle_path ASC
-        """
-    ).fetchall()
+    subtitle_candidates_by_video: dict[tuple[str, str], dict[str, Any]] = {}
+    if safe_source_track in {"subtitle", "auto"}:
+        subtitle_rows = connection.execute(
+            """
+            SELECT
+                s.source_id,
+                s.video_id,
+                COALESCE(s.language, '') AS language,
+                s.subtitle_path,
+                LOWER(COALESCE(s.ext, '')) AS ext
+            FROM subtitles s
+            JOIN videos v
+              ON v.source_id = s.source_id
+             AND v.video_id = s.video_id
+            WHERE v.has_media = 1
+              AND s.subtitle_path IS NOT NULL
+              AND s.subtitle_path <> ''
+              AND LOWER(COALESCE(s.ext, '')) IN ('srt', 'vtt')
+            ORDER BY s.source_id ASC, s.video_id ASC, s.subtitle_path ASC
+            """
+        ).fetchall()
+        for row in subtitle_rows:
+            source_id = str(row["source_id"])
+            if source_id not in source_ids:
+                continue
+            video_id = str(row["video_id"])
+            if video_filter_set and video_id not in video_filter_set:
+                continue
+            language = str(row["language"] or "").strip().lower()
+            rank = language_rank_for_translation_source(language, safe_target)
+            if rank >= 1000:
+                continue
+            subtitle_path = Path(str(row["subtitle_path"]))
+            if not subtitle_path.exists() or not subtitle_path.is_file():
+                continue
+            target_key = (source_id, video_id)
+            existing = subtitle_candidates_by_video.get(target_key)
+            candidate = {
+                "source_id": source_id,
+                "video_id": video_id,
+                "source_lang": infer_translation_source_lang(language, "en"),
+                "subtitle_path": subtitle_path,
+                "ext": str(row["ext"] or "").strip().lower(),
+                "rank": rank,
+                "source_track_kind": "subtitle",
+            }
+            if existing is None:
+                subtitle_candidates_by_video[target_key] = candidate
+                continue
+            if int(candidate["rank"]) < int(existing["rank"]):
+                subtitle_candidates_by_video[target_key] = candidate
+                continue
+            if (
+                int(candidate["rank"]) == int(existing["rank"])
+                and str(candidate["subtitle_path"]) < str(existing["subtitle_path"])
+            ):
+                subtitle_candidates_by_video[target_key] = candidate
+
+    asr_candidates_by_video: dict[tuple[str, str], dict[str, Any]] = {}
+    if safe_source_track in {"asr", "auto"}:
+        asr_rows = connection.execute(
+            """
+            SELECT
+                a.source_id,
+                a.video_id,
+                a.output_path
+            FROM asr_runs a
+            JOIN videos v
+              ON v.source_id = a.source_id
+             AND v.video_id = a.video_id
+            WHERE v.has_media = 1
+              AND a.status = 'success'
+              AND a.output_path IS NOT NULL
+              AND a.output_path <> ''
+            ORDER BY a.source_id ASC, a.video_id ASC, a.updated_at DESC
+            """
+        ).fetchall()
+        for row in asr_rows:
+            source_id = str(row["source_id"])
+            if source_id not in source_ids:
+                continue
+            video_id = str(row["video_id"])
+            if video_filter_set and video_id not in video_filter_set:
+                continue
+            target_key = (source_id, video_id)
+            if target_key in asr_candidates_by_video:
+                continue
+            subtitle_path = Path(str(row["output_path"]))
+            if not subtitle_path.exists() or not subtitle_path.is_file():
+                continue
+            ext = subtitle_path.suffix.lstrip(".").lower()
+            if ext not in {"srt", "vtt"}:
+                continue
+            asr_candidates_by_video[target_key] = {
+                "source_id": source_id,
+                "video_id": video_id,
+                "source_lang": "en",
+                "subtitle_path": subtitle_path,
+                "ext": ext,
+                "rank": 0,
+                "source_track_kind": "asr",
+            }
 
     best_by_video: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in rows:
-        source_id = str(row["source_id"])
-        if source_id not in source_ids:
-            continue
-        video_id = str(row["video_id"])
-        if video_filter_set and video_id not in video_filter_set:
-            continue
-        language = str(row["language"] or "").strip().lower()
-        rank = language_rank_for_translation_source(language, safe_target)
-        if rank >= 1000:
-            continue
-        subtitle_path = Path(str(row["subtitle_path"]))
-        if not subtitle_path.exists() or not subtitle_path.is_file():
-            continue
-        target_key = (source_id, video_id)
-        existing = best_by_video.get(target_key)
-        candidate = {
-            "source_id": source_id,
-            "video_id": video_id,
-            "source_lang": language or "en",
-            "subtitle_path": subtitle_path,
-            "ext": str(row["ext"] or "").strip().lower(),
-            "rank": rank,
-        }
-        if existing is None:
-            best_by_video[target_key] = candidate
-            continue
-        if int(candidate["rank"]) < int(existing["rank"]):
-            best_by_video[target_key] = candidate
-            continue
-        if int(candidate["rank"]) == int(existing["rank"]) and str(candidate["subtitle_path"]) < str(existing["subtitle_path"]):
-            best_by_video[target_key] = candidate
+    if safe_source_track == "subtitle":
+        best_by_video = subtitle_candidates_by_video
+    elif safe_source_track == "asr":
+        best_by_video = asr_candidates_by_video
+    else:
+        all_keys = sorted(set(subtitle_candidates_by_video) | set(asr_candidates_by_video))
+        for key in all_keys:
+            subtitle_candidate = subtitle_candidates_by_video.get(key)
+            asr_candidate = asr_candidates_by_video.get(key)
+            if subtitle_candidate is None and asr_candidate is None:
+                continue
+            if subtitle_candidate is None:
+                best_by_video[key] = asr_candidate
+                continue
+            if asr_candidate is None:
+                best_by_video[key] = subtitle_candidate
+                continue
+            subtitle_sort_key = (0, int(subtitle_candidate["rank"]), str(subtitle_candidate["subtitle_path"]))
+            asr_sort_key = (1, int(asr_candidate["rank"]), str(asr_candidate["subtitle_path"]))
+            best_by_video[key] = subtitle_candidate if subtitle_sort_key <= asr_sort_key else asr_candidate
 
     selected: list[dict[str, Any]] = []
     for key in sorted(best_by_video):
@@ -10197,6 +10317,7 @@ def run_translate_local(
     global_max_cues: int,
     timeout_sec: int,
     limit: int,
+    source_track: str,
     include_translated: bool,
     overwrite: bool,
     dry_run: bool,
@@ -10215,6 +10336,7 @@ def run_translate_local(
             connection=connection,
             source_ids=source_ids,
             target_lang=target_lang,
+            source_track=source_track,
             video_ids=video_ids,
             limit=max(0, int(limit)),
             include_translated=bool(include_translated),
@@ -10226,7 +10348,8 @@ def run_translate_local(
 
         print(
             "[translate-local] targets="
-            f"{len(targets)} source_lang={source_lang} target_lang={target_lang}"
+            f"{len(targets)} source_lang={source_lang} target_lang={target_lang} "
+            f"source_track={normalize_translation_source_track(source_track, 'subtitle')}"
         )
 
         success_count = 0
@@ -10238,10 +10361,19 @@ def run_translate_local(
             video_id = str(target["video_id"])
             source_path = Path(str(target["subtitle_path"]))
             output_path = Path(str(target["output_path"]))
+            source_track_kind = normalize_translation_source_track(
+                str(target.get("source_track_kind") or source_track),
+                "subtitle",
+            )
+            run_source_lang = str(target.get("source_lang") or source_lang or "en").strip().lower() or "en"
+            run_method_version = append_source_track_to_method_version(method_version, source_track_kind)
             started_at = now_utc_iso()
             stage_metrics: list[TranslationStageMetrics] = []
 
-            print(f"[translate-local] start {source_id}/{video_id} input={source_path.name}")
+            print(
+                f"[translate-local] start {source_id}/{video_id} "
+                f"input={source_path.name} source_track={source_track_kind}"
+            )
             try:
                 document = parse_subtitle_document(source_path)
                 cue_count = len(document.cues)
@@ -10309,6 +10441,7 @@ def run_translate_local(
                 summary = build_local_translation_summary(
                     source_id=source_id,
                     video_id=video_id,
+                    source_track_kind=source_track_kind,
                     cue_count=cue_count,
                     translations=translations,
                 )
@@ -10332,9 +10465,9 @@ def run_translate_local(
                     cue_match=cue_match,
                     agent=agent,
                     method=method,
-                    method_version=method_version,
+                    method_version=run_method_version,
                     summary=summary,
-                    source_lang=str(source_lang or "en"),
+                    source_lang=run_source_lang,
                     target_lang=str(target_lang or "ja"),
                     status=status,
                     started_at=started_at,
@@ -10367,7 +10500,7 @@ def run_translate_local(
                 finished_at = now_utc_iso()
                 error_summary = (
                     "local-llm multi-stage translation failed "
-                    f"({source_id}/{video_id}): {exc}"
+                    f"({source_id}/{video_id}, source_track={source_track_kind}): {exc}"
                 )
                 if not dry_run:
                     run_id = record_translation_run(
@@ -10380,9 +10513,9 @@ def run_translate_local(
                         cue_match=False,
                         agent=agent,
                         method=method,
-                        method_version=method_version,
+                        method_version=run_method_version,
                         summary=error_summary,
-                        source_lang=str(source_lang or "en"),
+                        source_lang=run_source_lang,
                         target_lang=str(target_lang or "ja"),
                         status="failed",
                         started_at=started_at,
@@ -10924,6 +11057,15 @@ def parse_args() -> argparse.Namespace:
         help="Target language label stored in translation_runs (default: ja).",
     )
     translate_local_parser.add_argument(
+        "--source-track",
+        choices=["subtitle", "asr", "auto"],
+        default="subtitle",
+        help=(
+            "Translation input track source: "
+            "subtitle=subtitle table only, asr=asr_runs only, auto=prefer subtitle then ASR."
+        ),
+    )
+    translate_local_parser.add_argument(
         "--endpoint",
         default=os.environ.get("SUBSTUDY_LOCAL_LLM_ENDPOINT", DEFAULT_LOCAL_LLM_ENDPOINT),
         help=f"OpenAI-compatible endpoint (default: {DEFAULT_LOCAL_LLM_ENDPOINT})",
@@ -11285,6 +11427,7 @@ def main() -> int:
             global_max_cues=max(1, int(args.global_max_cues)),
             timeout_sec=max(3, int(args.timeout_sec)),
             limit=max(0, int(args.limit)),
+            source_track=normalize_translation_source_track(str(args.source_track), "subtitle"),
             include_translated=bool(args.include_translated),
             overwrite=bool(args.overwrite),
             dry_run=bool(args.dry_run),

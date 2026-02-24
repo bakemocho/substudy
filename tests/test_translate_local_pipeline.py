@@ -34,6 +34,23 @@ class TranslateLocalPipelineTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def _insert_source_and_video(self, connection, source_id: str, video_id: str) -> None:
+        now_iso = "2026-02-23T00:00:00Z"
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO sources (source_id, platform, url, data_dir, updated_at)
+            VALUES (?, 'tiktok', ?, ?, ?)
+            """,
+            (source_id, f"https://example.com/@{source_id}", str(self.root), now_iso),
+        )
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO videos (source_id, video_id, has_media, synced_at)
+            VALUES (?, ?, 1, ?)
+            """,
+            (source_id, video_id, now_iso),
+        )
+
     def test_record_translation_run_supersedes_previous_active(self):
         connection = sqlite3.connect(str(self.db_path))
         connection.row_factory = sqlite3.Row
@@ -130,6 +147,148 @@ class TranslateLocalPipelineTests(unittest.TestCase):
             self.assertEqual(source_cue["start_ms"], output_cue["start_ms"])
             self.assertEqual(source_cue["end_ms"], output_cue["end_ms"])
         self.assertIn("00:00:01.000 --> 00:00:02.500 align:start", rendered)
+
+    def test_collect_local_translation_targets_supports_subtitle_asr_and_auto(self):
+        source_id = "careervidz"
+        video_id = "7299838852636757281"
+        subtitle_path = self.root / f"{video_id}.NA.eng-US.vtt"
+        asr_path = self.root / f"{video_id}.asr.vtt"
+        subtitle_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+        asr_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello from asr\n", encoding="utf-8")
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            self._insert_source_and_video(connection, source_id, video_id)
+            connection.execute(
+                """
+                INSERT INTO subtitles (source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (source_id, video_id, "NA.eng-US", str(subtitle_path), "vtt"),
+            )
+            connection.execute(
+                """
+                INSERT INTO asr_runs (
+                    source_id, video_id, status, output_path, artifact_dir,
+                    engine, attempts, last_error, started_at, finished_at, updated_at
+                ) VALUES (?, ?, 'success', ?, ?, 'command', 1, NULL, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    video_id,
+                    str(asr_path),
+                    str(self.root / "asr-artifact"),
+                    "2026-02-23T00:00:00Z",
+                    "2026-02-23T00:01:00Z",
+                    "2026-02-23T00:01:00Z",
+                ),
+            )
+            connection.commit()
+
+            subtitle_targets = self.mod.collect_local_translation_targets(
+                connection=connection,
+                source_ids=[source_id],
+                target_lang="ja-local",
+                source_track="subtitle",
+                video_ids=None,
+                limit=10,
+                include_translated=False,
+                overwrite=False,
+            )
+            asr_targets = self.mod.collect_local_translation_targets(
+                connection=connection,
+                source_ids=[source_id],
+                target_lang="ja-asr-local",
+                source_track="asr",
+                video_ids=None,
+                limit=10,
+                include_translated=False,
+                overwrite=False,
+            )
+            auto_targets = self.mod.collect_local_translation_targets(
+                connection=connection,
+                source_ids=[source_id],
+                target_lang="ja-local",
+                source_track="auto",
+                video_ids=None,
+                limit=10,
+                include_translated=False,
+                overwrite=False,
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(len(subtitle_targets), 1)
+        self.assertEqual(subtitle_targets[0]["source_track_kind"], "subtitle")
+        self.assertEqual(Path(subtitle_targets[0]["subtitle_path"]), subtitle_path)
+        self.assertEqual(Path(subtitle_targets[0]["output_path"]).name, f"{video_id}.ja-local.vtt")
+
+        self.assertEqual(len(asr_targets), 1)
+        self.assertEqual(asr_targets[0]["source_track_kind"], "asr")
+        self.assertEqual(Path(asr_targets[0]["subtitle_path"]), asr_path)
+        self.assertEqual(Path(asr_targets[0]["output_path"]).name, f"{video_id}.ja-asr-local.vtt")
+
+        self.assertEqual(len(auto_targets), 1)
+        self.assertEqual(auto_targets[0]["source_track_kind"], "subtitle")
+        self.assertEqual(Path(auto_targets[0]["subtitle_path"]), subtitle_path)
+
+    def test_collect_local_translation_targets_auto_falls_back_to_asr_when_no_subtitle(self):
+        source_id = "careervidz"
+        video_id = "7309803358792060192"
+        asr_path = self.root / f"{video_id}.asr.srt"
+        asr_path.write_text(
+            "\n".join(
+                [
+                    "1",
+                    "00:00:00,000 --> 00:00:01,000",
+                    "fallback asr cue",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            self._insert_source_and_video(connection, source_id, video_id)
+            connection.execute(
+                """
+                INSERT INTO asr_runs (
+                    source_id, video_id, status, output_path, artifact_dir,
+                    engine, attempts, last_error, started_at, finished_at, updated_at
+                ) VALUES (?, ?, 'success', ?, ?, 'command', 1, NULL, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    video_id,
+                    str(asr_path),
+                    str(self.root / "asr-artifact"),
+                    "2026-02-23T00:00:00Z",
+                    "2026-02-23T00:01:00Z",
+                    "2026-02-23T00:01:00Z",
+                ),
+            )
+            connection.commit()
+
+            targets = self.mod.collect_local_translation_targets(
+                connection=connection,
+                source_ids=[source_id],
+                target_lang="ja-asr-local",
+                source_track="auto",
+                video_ids=None,
+                limit=10,
+                include_translated=False,
+                overwrite=False,
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]["source_track_kind"], "asr")
+        self.assertEqual(Path(targets[0]["subtitle_path"]), asr_path)
+        self.assertEqual(Path(targets[0]["output_path"]).name, f"{video_id}.ja-asr-local.srt")
 
 
 if __name__ == "__main__":
