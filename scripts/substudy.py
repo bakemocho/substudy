@@ -3632,7 +3632,7 @@ def build_ledger(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
     synced_at = now_utc_iso()
 
@@ -4304,7 +4304,7 @@ def run_asr(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
     ffprobe_bin = shutil.which("ffprobe")
 
@@ -4705,7 +4705,7 @@ def run_loudness(
         Path(ffprobe_bin).expanduser().is_absolute() and Path(ffprobe_bin).exists()
     )
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
 
     safe_limit = max(1, int(limit))
@@ -4918,7 +4918,7 @@ def run_dict_index(
         raise ValueError(f"Dictionary path is not a file: {dictionary_path}")
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
 
     max_lines_value = None
@@ -5026,7 +5026,7 @@ def run_backfill(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
     any_work = False
 
@@ -5194,7 +5194,7 @@ def show_download_report(
         print(f"[downloads] no ledger DB: {db_path}")
         return
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=since_hours)
     since_iso = since.replace(microsecond=0).isoformat()
@@ -5292,7 +5292,7 @@ def run_dict_bookmarks_export(
         if str(video_id).strip()
     ]
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     connection.row_factory = sqlite3.Row
     try:
         where_clauses: list[str] = []
@@ -5629,7 +5629,7 @@ def run_dict_bookmarks_import(
     allowed_sources = set(source_ids)
     seen_composites: set[tuple[Any, ...]] = set()
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     connection.row_factory = sqlite3.Row
     create_schema(connection)
     connection.commit()
@@ -5969,7 +5969,7 @@ def run_dict_bookmarks_curate(
     safe_min_bookmarks = max(1, int(min_bookmarks))
     safe_min_videos = max(1, int(min_videos))
 
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     connection.row_factory = sqlite3.Row
     try:
         term_stats = collect_dictionary_term_history_stats(connection, source_ids=source_ids)
@@ -6337,7 +6337,7 @@ def run_notify(
     sent_events: list[str] = []
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(db_path))
+    connection = sqlite3.connect(str(db_path), timeout=30)
     connection.row_factory = sqlite3.Row
     try:
         create_schema(connection)
@@ -8186,8 +8186,9 @@ def build_web_handler(
             )
 
         def _open_connection(self) -> sqlite3.Connection:
-            connection = sqlite3.connect(str(db_path))
+            connection = sqlite3.connect(str(db_path), timeout=30)
             connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys = ON")
             return connection
 
@@ -9761,7 +9762,8 @@ def run_web_ui(
     restrict_to_source_ids: bool = False,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(db_path)) as bootstrap_connection:
+    with sqlite3.connect(str(db_path), timeout=30) as bootstrap_connection:
+        bootstrap_connection.execute("PRAGMA journal_mode=WAL")
         create_schema(bootstrap_connection)
         bootstrap_connection.commit()
 
@@ -10327,8 +10329,9 @@ def run_translate_local(
     video_ids: list[str] | None = None,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(db_path)) as connection:
+    with sqlite3.connect(str(db_path), timeout=30) as connection:
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
         create_schema(connection)
         connection.commit()
 
@@ -11206,7 +11209,8 @@ def main() -> int:
         sync_connection: sqlite3.Connection | None = None
         if not args.dry_run:
             ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
-            sync_connection = sqlite3.connect(str(ledger_db_path))
+            sync_connection = sqlite3.connect(str(ledger_db_path), timeout=30)
+            sync_connection.execute("PRAGMA journal_mode=WAL")
             create_schema(sync_connection)
         try:
             for source in sources:
