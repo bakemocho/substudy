@@ -127,15 +127,48 @@ python3 scripts/translation_quality_probe.py \
 - Implication:
   - Quality-only comparison must be run in small units (`limit=1`, short-cue videos) until endpoint stability is improved.
 
-## 9. Next Step (Iteration 02)
+## 9. Iteration 02 (Parameter-only A/B, hard 5 videos)
 
-- 同条件を `careervidz` の複数動画へ拡大（まず `limit=20` 目安）。
-- `translation_quality_probe.py` で次を確認:
-  - `json_fragment_rate <= 0.05`
-  - `unchanged_rate <= 0.30`
-- 未達の場合:
-  - Stage1/Stage2/Stage3 の parse fail と patch apply fail の件数計測を追加し、
-    H1/H3 の検証に進む。
-- ただし現時点では先に運用安定化を優先:
-  - 120b を `refine/global` で使う場合は watchdog/retry を追加
-  - または比較実験は一時的に 20b-only 条件へ寄せる
+- Date: 2026-02-28
+- Target set (baselineで `unchanged` が高かった5本):
+  - `7428319288404053281`
+  - `7359222341664034081`
+  - `7379892278581628193`
+  - `7395572078088375585`
+  - `7311695207592922401`
+- Baseline track:
+  - `ja-local`
+- Iteration track:
+  - `ja-local-exp-iter01-hard5`
+  - params: `draft=320`, `refine=1000`, `global=2200`, `temperature=0`, `top_p=1`, `chunk=8`
+- Result (63 cues total, same 5 videos):
+  - Baseline (`ja-local`):
+    - `unchanged_rate=0.921` (58/63)
+    - `json_fragment_rate=0.222` (14/63)
+    - `english_heavy_rate=0.921` (58/63)
+  - Iteration (`ja-local-exp-iter01-hard5`):
+    - `unchanged_rate=0.048` (3/63)
+    - `json_fragment_rate=0.000` (0/63)
+    - `english_heavy_rate=0.048` (3/63)
+- Interpretation:
+  - `json_fragment` はゼロ化し、英語残存も大幅に減少。
+  - パラメータ変更のみで改善再現性あり（H2を強く支持）。
+- Runtime note (`translation_stage_runs`, iter hard5):
+  - 1動画あたり:
+    - draft (20b): `~72s〜123s`
+    - refine (120b): `~59s〜115s`
+    - global (120b): `~48s〜80s`
+  - 品質は改善したが、処理時間は長い。
+
+## 10. Next Step (Iteration 03)
+
+- 方針A（品質維持 + 安定運用）:
+  - `iter01` パラメータを暫定デフォルト候補にして、`limit` を小さく運用
+  - 120b待ち対策として watchdog/retry を実装（CLI側）
+- 方針B（原因追跡）:
+  - Stage1/2/3 の parse fail / patch apply fail / fallback採用回数をメトリクス化
+  - `translation_stage_runs` か別テーブルに記録して H1/H3 を検証
+- 成功基準:
+  - `json_fragment_rate <= 0.01`
+  - `unchanged_rate <= 0.10`
+  - 実行中断なしで `limit=10` を完走
