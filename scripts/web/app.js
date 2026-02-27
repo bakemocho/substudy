@@ -39,6 +39,7 @@ const PLAYER_CARD_SNAP_NUDGE_PX = 3.2;
 const PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH = 920;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
 const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
+const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const TRANSLATION_VARIANT_STORAGE_KEY = "substudy.translation_variant_by_source";
@@ -905,6 +906,18 @@ function hasJaSubtitleTrack(video) {
   });
 }
 
+function collectAvailableTranslationVariants(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  const variants = new Set();
+  for (const track of tracks) {
+    const variant = getJaTrackVariant(track);
+    if (variant) {
+      variants.add(variant);
+    }
+  }
+  return TRANSLATION_VARIANT_ORDER.filter((variant) => variants.has(variant));
+}
+
 function updateTranslationFilterSelect() {
   if (!elements.translationFilterSelect) {
     return;
@@ -912,14 +925,34 @@ function updateTranslationFilterSelect() {
   elements.translationFilterSelect.value = normalizeTranslationFilter(state.translationFilter, "all");
 }
 
-function updateTranslationVariantSelect(preferredSourceId = "") {
+function updateTranslationVariantSelect(preferredSourceId = "", video = undefined) {
   if (!elements.translationVariantSelect) {
     return;
   }
+  const current = (video === undefined) ? currentVideo() : video;
   const safeSourceId = getSourceIdForTranslationVariantPreference(preferredSourceId);
-  const variant = getTranslationVariantPreferenceForSource(safeSourceId);
-  state.translationVariant = variant;
-  elements.translationVariantSelect.value = variant;
+  const preferredVariant = getTranslationVariantPreferenceForSource(safeSourceId);
+  const variants = collectAvailableTranslationVariants(current);
+  const optionValues = ["auto", ...variants];
+
+  elements.translationVariantSelect.textContent = "";
+  for (const value of optionValues) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value === "auto" ? "自動" : value;
+    elements.translationVariantSelect.appendChild(option);
+  }
+
+  const resolvedVariant = optionValues.includes(preferredVariant) ? preferredVariant : "auto";
+  state.translationVariant = resolvedVariant;
+  if (safeSourceId && current) {
+    const previous = normalizeTranslationVariant(state.translationVariantBySource[safeSourceId], "auto");
+    if (previous !== resolvedVariant) {
+      state.translationVariantBySource[safeSourceId] = resolvedVariant;
+      persistTranslationVariantPreferences();
+    }
+  }
+  elements.translationVariantSelect.value = resolvedVariant;
 }
 
 function parseInitialVideoSelectionFromUrl() {
@@ -1473,7 +1506,7 @@ function resolveTrackIdForVideo(video) {
 
 function renderTrackOptions(video) {
   elements.trackSelect.textContent = "";
-  updateTranslationVariantSelect(String(video?.source_id || ""));
+  updateTranslationVariantSelect(String(video?.source_id || ""), video);
 
   if (!video.tracks.length) {
     const option = document.createElement("option");
@@ -7560,12 +7593,16 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   const video = currentVideo();
   const videoSourceId = String(video?.source_id || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
-  updateTranslationVariantSelect(videoSourceId);
   elements.videoPlayer.src = video.media_url;
   elements.videoPlayer.load();
   const initialSeekPromise = applyInitialPlaybackTime(startTimeSec);
   updateVideoProgressTimer();
   state.urlPlaybackTimeSecond = -1;
+
+  renderVideoMeta(video);
+  updateFavoriteButton();
+  elements.videoNote.value = video.note || "";
+  renderTrackOptions(video);
   updateUrlVideoSelection(
     video.source_id,
     video.video_id,
@@ -7573,11 +7610,6 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
     null,
     state.translationVariant
   );
-
-  renderVideoMeta(video);
-  updateFavoriteButton();
-  elements.videoNote.value = video.note || "";
-  renderTrackOptions(video);
 
   await loadTrackCues();
   await loadBookmarks();
@@ -7618,7 +7650,7 @@ async function loadFeed(
   updateTranslationFilterSelect();
   const variantSourceId = String(sourceId || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(variantSourceId);
-  updateTranslationVariantSelect(variantSourceId);
+  updateTranslationVariantSelect(variantSourceId, null);
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
@@ -8838,7 +8870,7 @@ async function initialize() {
         { persist: true, updateSelect: true }
       );
     } else {
-      updateTranslationVariantSelect(initialSelection.sourceId);
+      updateTranslationVariantSelect(initialSelection.sourceId, null);
     }
     await loadFeed(
       initialSelection.sourceId,
