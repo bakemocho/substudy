@@ -23,6 +23,7 @@ via `.github/workflows/privacy-check.yml`.
 - `scripts/run_weekly_full_sync.sh`: weekly 3-lane wrapper (includes `brew upgrade yt-dlp`, then network/CPU/memory lanes + final full `ledger`)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
+- `docs/local-translation-quality-lab.md`: ローカル翻訳品質の仮説検証ログ
 - `docs/roadmap.md`: implementation roadmap and status
 - `docs/extension-ingest-mvp.md`: browser extension ingest migration plan
 - `config/sources.example.toml`: example config

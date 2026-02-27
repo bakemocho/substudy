@@ -371,6 +371,9 @@ Status:
   - expose available JA-family tracks (`ja`, `ja-local`, `ja-asr-local`) in player/subtitle UI
   - persist preferred translation variant per source (URL/query + local storage)
   - keep fallback deterministic when preferred variant is missing
+- [x] Start quality lab loop docs + probe:
+  - `docs/local-translation-quality-lab.md`
+  - `scripts/translation_quality_probe.py`
 - [ ] Keep translation automation opt-in until quality/cost metrics stabilize.
 
 Acceptance:
