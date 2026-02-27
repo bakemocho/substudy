@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -70,11 +70,21 @@ DEFAULT_LOCAL_LLM_ENDPOINT = "http://127.0.0.1:11435/v1/chat/completions"
 DEFAULT_LOCAL_TRANSLATE_DRAFT_MODEL = "gpt-oss:20b"
 DEFAULT_LOCAL_TRANSLATE_REFINE_MODEL = "gpt-oss:120b"
 DEFAULT_LOCAL_TRANSLATE_GLOBAL_MODEL = "gpt-oss:120b"
+DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MODEL = "gpt-oss:120b"
+DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MODEL = "gpt-oss:120b"
+DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MAX_TOKENS = 900
+DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MAX_TOKENS = 900
+DEFAULT_LOCAL_TRANSLATE_QUALITY_LOOP_MAX_ROUNDS = 0
+DEFAULT_LOCAL_TRANSLATE_QUALITY_JSON_FRAGMENT_THRESHOLD = 0.0
+DEFAULT_LOCAL_TRANSLATE_QUALITY_ENGLISH_HEAVY_THRESHOLD = 0.10
+DEFAULT_LOCAL_TRANSLATE_QUALITY_UNCHANGED_THRESHOLD = 0.15
 DEFAULT_NETWORK_PROBE_URL = "https://www.tiktok.com/robots.txt"
 DEFAULT_NETWORK_PROBE_TIMEOUT_SEC = 8
 DEFAULT_NETWORK_PROBE_BYTES = 131072
 DEFAULT_WEAK_NET_MIN_KBPS = 900.0
 DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
+RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
+RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
 
 
 @dataclass
@@ -164,6 +174,31 @@ class TranslationStageMetrics:
     error_message: str = ""
     started_at: str = ""
     finished_at: str = ""
+
+
+@dataclass
+class TranslationQualityReport:
+    total_cues: int
+    json_fragment_cues: int = 0
+    english_heavy_cues: int = 0
+    unchanged_cues: int = 0
+    empty_cues: int = 0
+    bad_cue_ids: list[int] = field(default_factory=list)
+
+    def json_fragment_rate(self) -> float:
+        if self.total_cues <= 0:
+            return 0.0
+        return float(self.json_fragment_cues) / float(self.total_cues)
+
+    def english_heavy_rate(self) -> float:
+        if self.total_cues <= 0:
+            return 0.0
+        return float(self.english_heavy_cues) / float(self.total_cues)
+
+    def unchanged_rate(self) -> float:
+        if self.total_cues <= 0:
+            return 0.0
+        return float(self.unchanged_cues) / float(self.total_cues)
 
 
 @dataclass
@@ -7072,6 +7107,106 @@ def is_translation_placeholder(text: str) -> bool:
     return False
 
 
+def is_json_fragment_text(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if value.startswith("{") or value.startswith("["):
+        return True
+    if "{\"" in value or "\"ja\"" in value or "\"confidence\"" in value:
+        return True
+    if value.count("{") + value.count("}") >= 2:
+        return True
+    if value.endswith(":") or value.endswith(","):
+        return True
+    return False
+
+
+def is_english_heavy_text(text: str) -> bool:
+    value = str(text or "")
+    ascii_letters = len(RE_TRANSLATION_ASCII.findall(value))
+    ja_chars = len(RE_TRANSLATION_JA.findall(value))
+    return ascii_letters >= max(10, ja_chars * 2)
+
+
+def evaluate_translation_quality(
+    document: ParsedSubtitleDocument,
+    translations: dict[int, str],
+    source_text_by_cue_id: dict[int, str],
+) -> TranslationQualityReport:
+    report = TranslationQualityReport(total_cues=len(document.cues))
+    bad_ids: set[int] = set()
+
+    for cue in document.cues:
+        cue_id = int(cue.cue_id)
+        translated_text = str(translations.get(cue_id) or "").strip()
+        source_text = str(source_text_by_cue_id.get(cue_id) or "").strip()
+
+        if not translated_text:
+            report.empty_cues += 1
+            bad_ids.add(cue_id)
+            continue
+
+        if is_json_fragment_text(translated_text):
+            report.json_fragment_cues += 1
+            bad_ids.add(cue_id)
+        if is_english_heavy_text(translated_text):
+            report.english_heavy_cues += 1
+            bad_ids.add(cue_id)
+        if source_text and translated_text == source_text:
+            report.unchanged_cues += 1
+            bad_ids.add(cue_id)
+
+    report.bad_cue_ids = sorted(bad_ids)
+    return report
+
+
+def quality_report_passes_thresholds(
+    report: TranslationQualityReport,
+    json_fragment_threshold: float,
+    english_heavy_threshold: float,
+    unchanged_threshold: float,
+) -> bool:
+    return (
+        report.json_fragment_rate() <= max(0.0, float(json_fragment_threshold))
+        and report.english_heavy_rate() <= max(0.0, float(english_heavy_threshold))
+        and report.unchanged_rate() <= max(0.0, float(unchanged_threshold))
+    )
+
+
+def format_quality_report_summary(report: TranslationQualityReport) -> str:
+    return (
+        f"total={report.total_cues} bad={len(report.bad_cue_ids)} "
+        f"json={report.json_fragment_cues}({report.json_fragment_rate():.3f}) "
+        f"english_heavy={report.english_heavy_cues}({report.english_heavy_rate():.3f}) "
+        f"unchanged={report.unchanged_cues}({report.unchanged_rate():.3f}) "
+        f"empty={report.empty_cues}"
+    )
+
+
+def build_quality_gate_stage_metrics(
+    stage_name: str,
+    report: TranslationQualityReport,
+    passed: bool,
+) -> TranslationStageMetrics:
+    now_iso = now_utc_iso()
+    return TranslationStageMetrics(
+        stage_name=stage_name,
+        model="rules:v1",
+        input_cue_count=max(0, int(report.total_cues)),
+        changed_cue_count=max(0, int(len(report.bad_cue_ids))),
+        request_count=0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        elapsed_ms=0,
+        status="completed" if passed else "failed",
+        error_message="" if passed else format_quality_report_summary(report),
+        started_at=now_iso,
+        finished_at=now_iso,
+    )
+
+
 def parse_llm_usage_counts(payload: Any) -> tuple[int, int, int]:
     if not isinstance(payload, dict):
         return (0, 0, 0)
@@ -10287,6 +10422,270 @@ def run_translation_stage_global(
     return metrics
 
 
+def build_source_text_by_cue_id(document: ParsedSubtitleDocument) -> dict[int, str]:
+    source_text_by_cue_id: dict[int, str] = {}
+    for cue in document.cues:
+        source_text_by_cue_id[int(cue.cue_id)] = strip_subtitle_markup(" ".join(cue.text_lines)).strip()
+    return source_text_by_cue_id
+
+
+def extract_audit_issue_map_from_llm_output(raw_text: str) -> dict[int, str]:
+    parsed = parse_json_loose(raw_text)
+    rows: list[Any] = []
+    if isinstance(parsed, list):
+        rows = parsed
+    elif isinstance(parsed, dict):
+        cues_value = parsed.get("cues")
+        if isinstance(cues_value, list):
+            rows = cues_value
+        elif isinstance(parsed.get("items"), list):
+            rows = parsed.get("items") or []
+        else:
+            cue_id = parsed.get("cue_id")
+            issue = parsed.get("issue")
+            if cue_id not in (None, "") and issue not in (None, ""):
+                rows = [{"cue_id": cue_id, "issue": issue}]
+
+    issue_map: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cue_id_raw = row.get("cue_id")
+        if cue_id_raw in (None, ""):
+            continue
+        try:
+            cue_id = int(cue_id_raw)
+        except (TypeError, ValueError):
+            continue
+        issue = str(row.get("issue") or "").strip().lower()
+        needs_fix_raw = row.get("needs_fix")
+        needs_fix = False
+        if isinstance(needs_fix_raw, bool):
+            needs_fix = needs_fix_raw
+        elif isinstance(needs_fix_raw, (int, float)):
+            needs_fix = bool(int(needs_fix_raw))
+        elif isinstance(needs_fix_raw, str):
+            needs_fix = needs_fix_raw.strip().lower() in {"1", "true", "yes", "y"}
+
+        if needs_fix or issue:
+            issue_map[cue_id] = issue or "check"
+    return issue_map
+
+
+def run_translation_stage_quality_audit(
+    document: ParsedSubtitleDocument,
+    current_translations: dict[int, str],
+    source_text_by_cue_id: dict[int, str],
+    cue_ids: list[int],
+    endpoint: str,
+    model: str,
+    max_tokens: int,
+    chunk_size: int,
+    timeout_sec: int,
+    api_key: str | None,
+) -> tuple[dict[int, str], TranslationStageMetrics]:
+    metrics = TranslationStageMetrics(
+        stage_name="quality-audit",
+        model=str(model),
+        input_cue_count=max(0, int(len(cue_ids))),
+        started_at=now_utc_iso(),
+    )
+    if not cue_ids:
+        metrics.finished_at = now_utc_iso()
+        return {}, metrics
+
+    cue_lookup = {int(cue.cue_id): cue for cue in document.cues}
+    flagged_ids = sorted({int(cue_id) for cue_id in cue_ids if int(cue_id) in cue_lookup})
+    if not flagged_ids:
+        metrics.finished_at = now_utc_iso()
+        return {}, metrics
+
+    issue_map: dict[int, str] = {}
+    for chunk in chunk_items(flagged_ids, chunk_size=max(1, int(chunk_size))):
+        payload_cues: list[dict[str, Any]] = []
+        for cue_id in chunk:
+            cue = cue_lookup.get(cue_id)
+            if cue is None:
+                continue
+            current_text = str(current_translations.get(cue_id) or "").strip()
+            source_text = str(source_text_by_cue_id.get(cue_id) or "").strip()
+            suspected_issues: list[str] = []
+            if is_json_fragment_text(current_text):
+                suspected_issues.append("json_fragment")
+            if is_english_heavy_text(current_text):
+                suspected_issues.append("english_heavy")
+            if source_text and current_text == source_text:
+                suspected_issues.append("unchanged")
+            payload_cues.append(
+                {
+                    "cue_id": cue_id,
+                    "en": source_text,
+                    "ja": current_text,
+                    "suspected_issues": suspected_issues,
+                }
+            )
+        if not payload_cues:
+            continue
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a subtitle translation quality auditor. "
+                    "Return JSON only as {\"cues\":[{\"cue_id\":1,\"issue\":\"json_fragment|english_heavy|unchanged|other\","
+                    "\"needs_fix\":true}]}. "
+                    "Do not include any markdown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": "audit cue quality and decide repair necessity",
+                        "target_lang": "ja",
+                        "cues": payload_cues,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+        try:
+            result = call_local_chat_completion(
+                endpoint=endpoint,
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max(1, int(max_tokens)),
+                timeout_sec=timeout_sec,
+                api_key=api_key,
+            )
+        except RuntimeError as exc:
+            metrics.status = "failed"
+            metrics.error_message = str(exc)
+            break
+
+        metrics.request_count += 1
+        metrics.elapsed_ms += int(result["elapsed_ms"])
+        metrics.prompt_tokens += int(result["prompt_tokens"])
+        metrics.completion_tokens += int(result["completion_tokens"])
+        metrics.total_tokens += int(result["total_tokens"])
+
+        chunk_issues = extract_audit_issue_map_from_llm_output(str(result["content"]))
+        for cue_id, issue in chunk_issues.items():
+            if cue_id in flagged_ids:
+                issue_map[cue_id] = issue or "check"
+
+    metrics.changed_cue_count = max(0, int(len(issue_map)))
+    metrics.finished_at = now_utc_iso()
+    return issue_map, metrics
+
+
+def run_translation_stage_quality_repair(
+    document: ParsedSubtitleDocument,
+    current_translations: dict[int, str],
+    source_text_by_cue_id: dict[int, str],
+    cue_ids: list[int],
+    endpoint: str,
+    model: str,
+    max_tokens: int,
+    chunk_size: int,
+    timeout_sec: int,
+    api_key: str | None,
+) -> TranslationStageMetrics:
+    metrics = TranslationStageMetrics(
+        stage_name="quality-repair",
+        model=str(model),
+        input_cue_count=max(0, int(len(cue_ids))),
+        started_at=now_utc_iso(),
+    )
+    if not cue_ids:
+        metrics.finished_at = now_utc_iso()
+        return metrics
+
+    cue_lookup = {int(cue.cue_id): cue for cue in document.cues}
+    repair_ids = sorted({int(cue_id) for cue_id in cue_ids if int(cue_id) in cue_lookup})
+    if not repair_ids:
+        metrics.finished_at = now_utc_iso()
+        return metrics
+
+    for chunk in chunk_items(repair_ids, chunk_size=max(1, int(chunk_size))):
+        payload_cues: list[dict[str, Any]] = []
+        for cue_id in chunk:
+            cue = cue_lookup.get(cue_id)
+            if cue is None:
+                continue
+            payload_cues.append(
+                {
+                    "cue_id": cue_id,
+                    "en": str(source_text_by_cue_id.get(cue_id) or ""),
+                    "ja": str(current_translations.get(cue_id) or "").strip(),
+                }
+            )
+        if not payload_cues:
+            continue
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You repair Japanese subtitle cues. "
+                    "Return JSON only as {\"cues\":[{\"cue_id\":1,\"ja\":\"...\"}]}. "
+                    "Keep cue boundaries and avoid explanations."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "task": "repair problematic subtitle cues",
+                        "constraints": [
+                            "preserve meaning",
+                            "natural conversational Japanese",
+                            "no JSON fragments in ja text",
+                            "no English leftovers unless proper noun",
+                        ],
+                        "cues": payload_cues,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+        try:
+            result = call_local_chat_completion(
+                endpoint=endpoint,
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max(1, int(max_tokens)),
+                timeout_sec=timeout_sec,
+                api_key=api_key,
+            )
+        except RuntimeError as exc:
+            metrics.status = "failed"
+            metrics.error_message = str(exc)
+            break
+
+        metrics.request_count += 1
+        metrics.elapsed_ms += int(result["elapsed_ms"])
+        metrics.prompt_tokens += int(result["prompt_tokens"])
+        metrics.completion_tokens += int(result["completion_tokens"])
+        metrics.total_tokens += int(result["total_tokens"])
+
+        patch_map = extract_patch_map_from_llm_output(str(result["content"]))
+        metrics.changed_cue_count += apply_patch_map_to_translations(
+            current_translations=current_translations,
+            patch_map=patch_map,
+            allowed_cue_ids=set(chunk),
+        )
+
+    metrics.finished_at = now_utc_iso()
+    return metrics
+
+
 def validate_subtitle_timing_match(source_path: Path, output_path: Path) -> tuple[int, bool]:
     source_cues = parse_subtitle_cues(source_path)
     output_cues = parse_subtitle_cues(output_path)
@@ -10326,6 +10725,15 @@ def run_translate_local(
     agent: str,
     method: str,
     method_version: str,
+    quality_enforce: bool,
+    quality_loop_max_rounds: int,
+    quality_json_fragment_threshold: float,
+    quality_english_heavy_threshold: float,
+    quality_unchanged_threshold: float,
+    quality_audit_model: str,
+    quality_repair_model: str,
+    quality_audit_max_tokens: int,
+    quality_repair_max_tokens: int,
     video_ids: list[str] | None = None,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10425,6 +10833,102 @@ def run_translate_local(
                 )
                 stage_metrics.append(global_metrics)
 
+                source_text_by_cue_id = build_source_text_by_cue_id(document)
+                quality_report = evaluate_translation_quality(
+                    document=document,
+                    translations=translations,
+                    source_text_by_cue_id=source_text_by_cue_id,
+                )
+                quality_passed = quality_report_passes_thresholds(
+                    report=quality_report,
+                    json_fragment_threshold=quality_json_fragment_threshold,
+                    english_heavy_threshold=quality_english_heavy_threshold,
+                    unchanged_threshold=quality_unchanged_threshold,
+                )
+                stage_metrics.append(
+                    build_quality_gate_stage_metrics(
+                        stage_name="quality-gate-initial",
+                        report=quality_report,
+                        passed=quality_passed,
+                    )
+                )
+                print(
+                    f"[translate-local] quality {source_id}/{video_id} "
+                    f"{format_quality_report_summary(quality_report)}"
+                )
+
+                max_quality_rounds = max(0, int(quality_loop_max_rounds))
+                if not quality_passed and max_quality_rounds > 0:
+                    for round_index in range(max_quality_rounds):
+                        bad_cue_ids = list(quality_report.bad_cue_ids)
+                        if not bad_cue_ids:
+                            break
+
+                        audit_issue_map, audit_metrics = run_translation_stage_quality_audit(
+                            document=document,
+                            current_translations=translations,
+                            source_text_by_cue_id=source_text_by_cue_id,
+                            cue_ids=bad_cue_ids,
+                            endpoint=endpoint,
+                            model=quality_audit_model,
+                            max_tokens=max(1, int(quality_audit_max_tokens)),
+                            chunk_size=max(1, int(chunk_size)),
+                            timeout_sec=timeout_sec,
+                            api_key=api_key,
+                        )
+                        stage_metrics.append(audit_metrics)
+
+                        repair_target_ids = sorted(
+                            set(audit_issue_map.keys()) if audit_issue_map else set(bad_cue_ids)
+                        )
+                        repair_metrics = run_translation_stage_quality_repair(
+                            document=document,
+                            current_translations=translations,
+                            source_text_by_cue_id=source_text_by_cue_id,
+                            cue_ids=repair_target_ids,
+                            endpoint=endpoint,
+                            model=quality_repair_model,
+                            max_tokens=max(1, int(quality_repair_max_tokens)),
+                            chunk_size=max(1, int(chunk_size)),
+                            timeout_sec=timeout_sec,
+                            api_key=api_key,
+                        )
+                        stage_metrics.append(repair_metrics)
+
+                        quality_report = evaluate_translation_quality(
+                            document=document,
+                            translations=translations,
+                            source_text_by_cue_id=source_text_by_cue_id,
+                        )
+                        quality_passed = quality_report_passes_thresholds(
+                            report=quality_report,
+                            json_fragment_threshold=quality_json_fragment_threshold,
+                            english_heavy_threshold=quality_english_heavy_threshold,
+                            unchanged_threshold=quality_unchanged_threshold,
+                        )
+                        stage_metrics.append(
+                            build_quality_gate_stage_metrics(
+                                stage_name=f"quality-gate-r{round_index + 1}",
+                                report=quality_report,
+                                passed=quality_passed,
+                            )
+                        )
+                        print(
+                            f"[translate-local] quality-round {round_index + 1} {source_id}/{video_id} "
+                            f"{format_quality_report_summary(quality_report)}"
+                        )
+                        if quality_passed:
+                            break
+
+                if bool(quality_enforce) and not quality_passed:
+                    raise RuntimeError(
+                        "quality gate failed: "
+                        f"{format_quality_report_summary(quality_report)} "
+                        f"(thresholds: json<={quality_json_fragment_threshold:.3f}, "
+                        f"english_heavy<={quality_english_heavy_threshold:.3f}, "
+                        f"unchanged<={quality_unchanged_threshold:.3f})"
+                    )
+
                 rendered_text = render_subtitle_document(document, translations)
                 if not rendered_text.strip():
                     raise RuntimeError("rendered subtitle is empty")
@@ -10448,6 +10952,7 @@ def run_translate_local(
                     cue_count=cue_count,
                     translations=translations,
                 )
+                summary = f"{summary} | quality={format_quality_report_summary(quality_report)}"
 
                 if dry_run:
                     success_count += 1
@@ -11156,6 +11661,75 @@ def parse_args() -> argparse.Namespace:
         default="20b-draft+120b-refine+120b-global-v1",
         help="translation_runs.method_version value.",
     )
+    translate_local_parser.add_argument(
+        "--quality-enforce",
+        action="store_true",
+        help="Fail this run when quality thresholds are not met after quality loop.",
+    )
+    translate_local_parser.add_argument(
+        "--quality-loop-max-rounds",
+        type=int,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_LOOP_MAX_ROUNDS,
+        help=(
+            "Max rounds for audit->repair->re-audit loop "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_LOOP_MAX_ROUNDS}, 0 disables)."
+        ),
+    )
+    translate_local_parser.add_argument(
+        "--quality-json-fragment-threshold",
+        type=float,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_JSON_FRAGMENT_THRESHOLD,
+        help=(
+            "Allowed json_fragment_rate after quality loop "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_JSON_FRAGMENT_THRESHOLD})."
+        ),
+    )
+    translate_local_parser.add_argument(
+        "--quality-english-heavy-threshold",
+        type=float,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_ENGLISH_HEAVY_THRESHOLD,
+        help=(
+            "Allowed english_heavy_rate after quality loop "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_ENGLISH_HEAVY_THRESHOLD})."
+        ),
+    )
+    translate_local_parser.add_argument(
+        "--quality-unchanged-threshold",
+        type=float,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_UNCHANGED_THRESHOLD,
+        help=(
+            "Allowed unchanged_rate after quality loop "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_UNCHANGED_THRESHOLD})."
+        ),
+    )
+    translate_local_parser.add_argument(
+        "--quality-audit-model",
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MODEL,
+        help=f"Quality audit model (default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MODEL})",
+    )
+    translate_local_parser.add_argument(
+        "--quality-repair-model",
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MODEL,
+        help=f"Quality repair model (default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MODEL})",
+    )
+    translate_local_parser.add_argument(
+        "--quality-audit-max-tokens",
+        type=int,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MAX_TOKENS,
+        help=(
+            "Quality audit max_tokens "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MAX_TOKENS})."
+        ),
+    )
+    translate_local_parser.add_argument(
+        "--quality-repair-max-tokens",
+        type=int,
+        default=DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MAX_TOKENS,
+        help=(
+            "Quality repair max_tokens "
+            f"(default: {DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MAX_TOKENS})."
+        ),
+    )
     translate_local_parser.add_argument("--dry-run", action="store_true")
 
     web_parser = subparsers.add_parser(
@@ -11438,6 +12012,15 @@ def main() -> int:
             agent=str(args.agent),
             method=str(args.method),
             method_version=str(args.method_version),
+            quality_enforce=bool(args.quality_enforce),
+            quality_loop_max_rounds=max(0, int(args.quality_loop_max_rounds)),
+            quality_json_fragment_threshold=max(0.0, float(args.quality_json_fragment_threshold)),
+            quality_english_heavy_threshold=max(0.0, float(args.quality_english_heavy_threshold)),
+            quality_unchanged_threshold=max(0.0, float(args.quality_unchanged_threshold)),
+            quality_audit_model=str(args.quality_audit_model),
+            quality_repair_model=str(args.quality_repair_model),
+            quality_audit_max_tokens=max(1, int(args.quality_audit_max_tokens)),
+            quality_repair_max_tokens=max(1, int(args.quality_repair_max_tokens)),
             video_ids=args.video_ids,
         )
         return 0

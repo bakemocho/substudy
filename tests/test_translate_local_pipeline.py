@@ -290,6 +290,85 @@ class TranslateLocalPipelineTests(unittest.TestCase):
         self.assertEqual(Path(targets[0]["subtitle_path"]), asr_path)
         self.assertEqual(Path(targets[0]["output_path"]).name, f"{video_id}.ja-asr-local.srt")
 
+    def test_evaluate_translation_quality_detects_core_issues(self):
+        source_path = self.root / "quality.en.vtt"
+        source_path.write_text(
+            "\n".join(
+                [
+                    "WEBVTT",
+                    "",
+                    "00:00:00.000 --> 00:00:01.000",
+                    "Hello there.",
+                    "",
+                    "00:00:01.000 --> 00:00:02.000",
+                    "This line remains in English.",
+                    "",
+                    "00:00:02.000 --> 00:00:03.000",
+                    "Done.",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        document = self.mod.parse_subtitle_document(source_path)
+        source_texts = self.mod.build_source_text_by_cue_id(document)
+        translations = {
+            1: '{"ja":"',
+            2: "This line remains in English.",
+            3: "完了。",
+        }
+
+        report = self.mod.evaluate_translation_quality(
+            document=document,
+            translations=translations,
+            source_text_by_cue_id=source_texts,
+        )
+
+        self.assertEqual(report.total_cues, 3)
+        self.assertEqual(report.json_fragment_cues, 1)
+        self.assertEqual(report.unchanged_cues, 1)
+        self.assertGreaterEqual(report.english_heavy_cues, 1)
+        self.assertEqual(report.bad_cue_ids, [1, 2])
+
+    def test_quality_report_threshold_check(self):
+        report = self.mod.TranslationQualityReport(
+            total_cues=10,
+            json_fragment_cues=0,
+            english_heavy_cues=1,
+            unchanged_cues=1,
+            empty_cues=0,
+            bad_cue_ids=[3, 8],
+        )
+        self.assertTrue(
+            self.mod.quality_report_passes_thresholds(
+                report=report,
+                json_fragment_threshold=0.0,
+                english_heavy_threshold=0.20,
+                unchanged_threshold=0.20,
+            )
+        )
+        self.assertFalse(
+            self.mod.quality_report_passes_thresholds(
+                report=report,
+                json_fragment_threshold=0.0,
+                english_heavy_threshold=0.05,
+                unchanged_threshold=0.20,
+            )
+        )
+
+    def test_extract_audit_issue_map_from_llm_output(self):
+        raw = (
+            '{"cues":['
+            '{"cue_id":1,"issue":"json_fragment","needs_fix":true},'
+            '{"cue_id":2,"issue":"","needs_fix":false},'
+            '{"cue_id":"3","issue":"","needs_fix":"yes"}'
+            ']}'
+        )
+        issue_map = self.mod.extract_audit_issue_map_from_llm_output(raw)
+        self.assertEqual(issue_map.get(1), "json_fragment")
+        self.assertNotIn(2, issue_map)
+        self.assertEqual(issue_map.get(3), "check")
+
 
 if __name__ == "__main__":
     unittest.main()
