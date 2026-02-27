@@ -30,6 +30,36 @@ via `.github/workflows/privacy-check.yml`.
 - `data/master_ledger.sqlite`: generated ledger DB
 - `data/master_ledger.csv`: generated ledger CSV
 
+## Local translation quality hardening (opt-in)
+
+Implemented pipeline:
+
+- `translate-local` baseline stages:
+  - `draft` (`20b`)
+  - `refine` (`120b`)
+  - `global` (`120b`)
+- Optional quality loop (new):
+  - rule-based `quality-gate` (`json_fragment`, `english_heavy`, `unchanged`)
+  - `quality-audit` (LLM)
+  - `quality-repair` (LLM targeted patch)
+  - bounded rounds (`audit -> repair -> re-audit`)
+
+Key options:
+
+- `--quality-loop-max-rounds` (`0` disables loop)
+- `--quality-enforce` (treat threshold miss as failure)
+- `--quality-json-fragment-threshold`
+- `--quality-english-heavy-threshold`
+- `--quality-unchanged-threshold`
+- `--quality-audit-model`, `--quality-repair-model`
+- `--quality-audit-max-tokens`, `--quality-repair-max-tokens`
+
+Operator note:
+
+- For unstable 120b endpoints, keep `--limit` small and use conservative params:
+  - `temperature=0`, `top_p=1`
+  - larger token ceilings with smaller `chunk-size`
+
 ## Settings that matter
 
 - `playlist_end`

@@ -172,3 +172,82 @@ python3 scripts/translation_quality_probe.py \
   - `json_fragment_rate <= 0.01`
   - `unchanged_rate <= 0.10`
   - 実行中断なしで `limit=10` を完走
+
+## 11. Current Status Snapshot (2026-02-28)
+
+- 品質傾向:
+  - 既定パラメータ帯（`draft=160/refine=480/global=1200`, `temperature=0.1`, `top_p=0.9`, `chunk=12`）では、`careervidz` の `ja-local` に英語残存・JSON断片混入が目立つ。
+  - `iter01` パラメータ（`draft=320/refine=1000/global=2200`, `temperature=0`, `top_p=1`, `chunk=8`）は hard set でも再現性のある改善を確認済み。
+- 運用上のボトルネック:
+  - `gpt-oss:120b` の応答遅延が大きく、動画本数を増やすと待機時間が不安定。
+- 実装上の未解決点:
+  - 成功判定が現状ほぼ timing 一致中心で、品質NG（英語残存/JSON断片）を失敗として扱えていない。
+  - Stageごとの parse失敗や patch不適用の可視化が不足。
+
+## 12. Iteration 03 Plan (LLM Audit + Targeted Repair)
+
+目的:
+
+- `translate-local` 実行内で品質監査と局所修正を自動化し、英語残存とJSON断片を実運用で抑え込む。
+
+実装方針:
+
+1. ルールベース品質ゲートを追加する。
+   - cue単位で `json_fragment`, `english_heavy`, `unchanged` を判定。
+   - 破損文字列（JSON断片っぽい字幕）を採用しない。
+2. 監査ステージ（local LLM）を追加する。
+   - 品質ゲートでNGになったcueだけを監査対象にする。
+   - 監査出力は `cue_id`, `issue`, `suggested_ja` のJSON固定。
+3. 修正ステージ（local LLM）を追加する。
+   - 監査でNG判定されたcueのみ局所再翻訳する。
+   - 全体再翻訳ではなく targeted patch に限定してコストを制御する。
+4. 有界ループ化する。
+   - `audit -> repair -> re-audit` を最大2回で打ち切る。
+   - 規定回数内で改善しない場合は `failed` 扱いか、理由付きでフォールバックする。
+5. 成功条件を timing + quality に拡張する。
+   - timing一致に加えて、品質率しきい値を満たすことを成功条件にする。
+
+初期しきい値（案）:
+
+- `json_fragment_rate == 0`
+- `english_heavy_rate <= 0.10`
+- `unchanged_rate <= 0.15`（source_track=`subtitle`）
+
+検証計画:
+
+- Step 1: `careervidz` hard 5本で `ja-local-exp-iter03` を作り、Iteration 02 と比較。
+- Step 2: `limit=10` で連続実行し、処理時間と失敗率を観測。
+- Step 3: stableなら `ja-local` 既定パラメータへ段階反映。
+
+## 13. Iteration 03-A (Quality loop prototype implemented)
+
+- Date: 2026-02-28
+- Code changes:
+  - `translate-local` に rule-based quality gate を追加
+  - `quality-audit` / `quality-repair` stage を追加（LLM, cue単位 patch）
+  - `audit -> repair -> re-audit` ループを `--quality-loop-max-rounds` で制御
+  - `--quality-enforce` 指定時のみ、品質しきい値未達を run failure として扱う
+- New CLI options (主要):
+  - `--quality-enforce`
+  - `--quality-loop-max-rounds`
+  - `--quality-json-fragment-threshold`
+  - `--quality-english-heavy-threshold`
+  - `--quality-unchanged-threshold`
+  - `--quality-audit-model`, `--quality-repair-model`
+  - `--quality-audit-max-tokens`, `--quality-repair-max-tokens`
+
+Smoke results:
+
+- Case A (short video, iter01 params):
+  - target: `careervidz/7309803358792060192`
+  - initial quality: `bad=0`
+  - quality loop: not needed
+- Case B (hard video, default-like params + quality loop 1):
+  - target: `careervidz/7428319288404053281`
+  - initial quality: `bad=9`, `json=1`, `english_heavy=9`, `unchanged=9`
+  - after round1: `bad=0`, `json=0`, `english_heavy=0`, `unchanged=0`
+
+Interpretation:
+
+- 品質崩れケースで loop が実際に発火し、1 roundで回復できるケースを確認。
+- 120b待ちの遅延は引き続きボトルネック。`limit` 小さめ運用は継続前提。

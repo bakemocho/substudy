@@ -374,7 +374,21 @@ Status:
 - [x] Start quality lab loop docs + probe:
   - `docs/local-translation-quality-lab.md`
   - `scripts/translation_quality_probe.py`
+- [x] Add in-pipeline quality audit + targeted repair loop for `translate-local`:
+  - rule-based cue quality gate (`json_fragment` / `english_heavy` / `unchanged`)
+  - local-LLM audit stage for failed cues only
+  - local-LLM targeted repair stage (patch-only, no full rerender loop)
+  - bounded `audit -> repair -> re-audit` loop (`max_rounds=2`)
+- [x] Expand translation success criteria:
+  - timing一致だけでなく品質しきい値を必須化
+  - run summaryに quality metrics を残して比較可能にする
+- [x] Add CLI controls for quality loop:
+  - enable/disable, thresholds, max rounds, and audit/repair token budget
 - [ ] Keep translation automation opt-in until quality/cost metrics stabilize.
+
+Note:
+
+- 品質しきい値の必須化は `--quality-enforce` を指定した run で有効（段階導入のため opt-in）。
 
 Acceptance:
 
