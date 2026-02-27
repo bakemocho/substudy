@@ -85,18 +85,57 @@ python3 scripts/translation_quality_probe.py \
   - フォーマット整合は通るが、品質は低い。
   - 優先は `json_fragment_rate` と `unchanged_rate` の同時改善。
 
-## 7. Next Step (Iteration 01)
+## 7. Iteration 01 (Parameter-only A/B, single short video)
 
-- 変更案:
-  - まずパラメータのみ変更して切り分け:
-    - `--temperature 0`
-    - `--top-p 1`
-    - `--refine-max-tokens 1000`
-    - `--global-max-tokens 2200`
-    - `--chunk-size 8`
-- 検証:
-  - 同じ source (`careervidz`) で `--limit 20` 実行
-  - Probe 指標が以下を満たすか確認:
-    - `json_fragment_rate <= 0.05`
-    - `unchanged_rate <= 0.30`
-  - 未達なら、次ループでコード変更に進む。
+- Date: 2026-02-27
+- Target video: `careervidz/7309803358792060192` (`8 cues`)
+- Baseline config:
+  - `draft=160`, `refine=480`, `global=1200`, `temperature=0.1`, `top_p=0.9`, `chunk=12`
+  - output: `ja-local-exp-base`
+- Iteration config:
+  - `draft=320`, `refine=1000`, `global=2200`, `temperature=0`, `top_p=1`, `chunk=8`
+  - output: `ja-local-exp-iter01`
+- Result (same video, cue-level compare):
+  - Baseline:
+    - `unchanged_rate=0.875` (7/8)
+    - `json_fragment_rate=0.375` (3/8)
+    - `english_heavy_rate=0.875` (7/8)
+  - Iteration:
+    - `unchanged_rate=0.000` (0/8)
+    - `json_fragment_rate=0.000` (0/8)
+    - `english_heavy_rate=0.000` (0/8)
+- Interpretation:
+  - パラメータ変更だけで、短尺動画では品質崩れが大きく改善。
+  - H2（出力打ち切り/トークン不足）の寄与が高い可能性。
+- Stage runtime snapshot (`translation_stage_runs`, same video):
+  - Baseline (`ja-local-exp-base`):
+    - draft (`gpt-oss:20b`): `request_count=8`, `elapsed_ms=40253`
+    - refine (`gpt-oss:120b`): `request_count=1`, `elapsed_ms=22513`
+    - global (`gpt-oss:120b`): `request_count=1`, `elapsed_ms=35138`
+  - Iteration (`ja-local-exp-iter01`):
+    - draft (`gpt-oss:20b`): `request_count=8`, `elapsed_ms=40399`
+    - refine (`gpt-oss:120b`): `request_count=1`, `elapsed_ms=36746`
+    - global (`gpt-oss:120b`): `request_count=1`, `elapsed_ms=31533`
+
+## 8. Operational Findings (blocking factor)
+
+- 120b endpoint latency is unstable for batch runs.
+  - Quick health probe sample:
+    - `gpt-oss:20b`: simple request completed in ~`3.74s`
+    - `gpt-oss:120b`: same shape timed out at `30s` in one trial, completed in `25.04s` in another trial
+- Long-running `translate-local` batches frequently stayed in response-wait state and required manual stop.
+- Implication:
+  - Quality-only comparison must be run in small units (`limit=1`, short-cue videos) until endpoint stability is improved.
+
+## 9. Next Step (Iteration 02)
+
+- 同条件を `careervidz` の複数動画へ拡大（まず `limit=20` 目安）。
+- `translation_quality_probe.py` で次を確認:
+  - `json_fragment_rate <= 0.05`
+  - `unchanged_rate <= 0.30`
+- 未達の場合:
+  - Stage1/Stage2/Stage3 の parse fail と patch apply fail の件数計測を追加し、
+    H1/H3 の検証に進む。
+- ただし現時点では先に運用安定化を優先:
+  - 120b を `refine/global` で使う場合は watchdog/retry を追加
+  - または比較実験は一時的に 20b-only 条件へ寄せる
