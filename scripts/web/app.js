@@ -40,10 +40,28 @@ const PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH = 920;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
 const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
 const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
+const TRANSLATION_VARIANT_LABELS = Object.freeze({
+  auto: "自動",
+  ja: "ja（高品質claude和訳）",
+  "ja-local": "ja-local（ローカル和訳）",
+  "ja-asr-local": "ja-asr-local（ASRローカル和訳）",
+});
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
 const TRANSLATION_VARIANT_STORAGE_KEY = "substudy.translation_variant_by_source";
 const TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY = "substudy.translation_variant_default";
+const PLAYBACK_TRACK_PREF_VALUES = new Set([
+  "en-subtitle",
+  "non-ja-subtitle",
+  "asr",
+  "subtitle",
+  "ja",
+  "ja-local",
+  "ja-asr-local",
+  "any",
+]);
+const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source";
+const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -188,7 +206,7 @@ const state = {
     if (TRANSLATION_VARIANT_VALUES.has(stored)) {
       return stored;
     }
-    return "auto";
+    return "ja";
   })(),
   translationVariantBySource: (() => {
     const raw = localStorage.getItem(TRANSLATION_VARIANT_STORAGE_KEY);
@@ -208,6 +226,37 @@ const state = {
           continue;
         }
         sanitized[safeSourceId] = safeVariant;
+      }
+      return sanitized;
+    } catch (_error) {
+      return {};
+    }
+  })(),
+  playbackTrackPreference: (() => {
+    const stored = String(localStorage.getItem(PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY) || "").trim().toLowerCase();
+    if (PLAYBACK_TRACK_PREF_VALUES.has(stored)) {
+      return stored;
+    }
+    return "en-subtitle";
+  })(),
+  playbackTrackPreferenceBySource: (() => {
+    const raw = localStorage.getItem(PLAYBACK_TRACK_PREF_STORAGE_KEY);
+    if (!raw) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      const sanitized = {};
+      for (const [sourceId, preference] of Object.entries(parsed)) {
+        const safeSourceId = String(sourceId || "").trim();
+        const safePreference = String(preference || "").trim().toLowerCase();
+        if (!safeSourceId || !PLAYBACK_TRACK_PREF_VALUES.has(safePreference)) {
+          continue;
+        }
+        sanitized[safeSourceId] = safePreference;
       }
       return sanitized;
     } catch (_error) {
@@ -804,6 +853,16 @@ function normalizeTranslationVariant(value, fallback = "auto") {
     : "auto";
 }
 
+function normalizePlaybackTrackPreference(value, fallback = "en-subtitle") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (PLAYBACK_TRACK_PREF_VALUES.has(normalized)) {
+    return normalized;
+  }
+  return PLAYBACK_TRACK_PREF_VALUES.has(String(fallback || "").trim().toLowerCase())
+    ? String(fallback).trim().toLowerCase()
+    : "en-subtitle";
+}
+
 function getSourceIdForTranslationVariantPreference(preferredSourceId = "") {
   const safePreferredSourceId = String(preferredSourceId || "").trim();
   if (safePreferredSourceId) {
@@ -821,18 +880,44 @@ function getTranslationVariantPreferenceForSource(sourceId = "") {
   if (safeSourceId) {
     return normalizeTranslationVariant(state.translationVariantBySource[safeSourceId], state.translationVariant);
   }
-  return normalizeTranslationVariant(state.translationVariant, "auto");
+  return normalizeTranslationVariant(state.translationVariant, "ja");
+}
+
+function getPlaybackTrackPreferenceForSource(sourceId = "") {
+  const safeSourceId = String(sourceId || "").trim();
+  if (safeSourceId) {
+    return normalizePlaybackTrackPreference(
+      state.playbackTrackPreferenceBySource[safeSourceId],
+      state.playbackTrackPreference
+    );
+  }
+  return normalizePlaybackTrackPreference(state.playbackTrackPreference, "en-subtitle");
 }
 
 function persistTranslationVariantPreferences() {
   localStorage.setItem(
     TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY,
-    normalizeTranslationVariant(state.translationVariant, "auto")
+    normalizeTranslationVariant(state.translationVariant, "ja")
   );
   try {
     localStorage.setItem(
       TRANSLATION_VARIANT_STORAGE_KEY,
       JSON.stringify(state.translationVariantBySource || {})
+    );
+  } catch (_error) {
+    return;
+  }
+}
+
+function persistPlaybackTrackPreferences() {
+  localStorage.setItem(
+    PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY,
+    normalizePlaybackTrackPreference(state.playbackTrackPreference, "en-subtitle")
+  );
+  try {
+    localStorage.setItem(
+      PLAYBACK_TRACK_PREF_STORAGE_KEY,
+      JSON.stringify(state.playbackTrackPreferenceBySource || {})
     );
   } catch (_error) {
     return;
@@ -855,6 +940,21 @@ function setTranslationVariantPreference(variant, sourceId = "", options = {}) {
   }
   if (updateSelect) {
     updateTranslationVariantSelect(safeSourceId);
+  }
+}
+
+function setPlaybackTrackPreference(preference, sourceId = "", options = {}) {
+  const normalizedPreference = normalizePlaybackTrackPreference(preference, state.playbackTrackPreference);
+  const safeSourceId = getSourceIdForTranslationVariantPreference(sourceId);
+  const {
+    persist = true,
+  } = options;
+  state.playbackTrackPreference = normalizedPreference;
+  if (safeSourceId) {
+    state.playbackTrackPreferenceBySource[safeSourceId] = normalizedPreference;
+  }
+  if (persist) {
+    persistPlaybackTrackPreferences();
   }
 }
 
@@ -929,30 +1029,28 @@ function updateTranslationVariantSelect(preferredSourceId = "", video = undefine
   if (!elements.translationVariantSelect) {
     return;
   }
-  const current = (video === undefined) ? currentVideo() : video;
   const safeSourceId = getSourceIdForTranslationVariantPreference(preferredSourceId);
   const preferredVariant = getTranslationVariantPreferenceForSource(safeSourceId);
+  const current = (video === undefined) ? currentVideo() : video;
   const variants = collectAvailableTranslationVariants(current);
-  const optionValues = ["auto", ...variants];
+  const hasJaVariants = variants.length > 0;
+  const optionValues = hasJaVariants ? ["auto", ...variants] : ["auto"];
 
   elements.translationVariantSelect.textContent = "";
   for (const value of optionValues) {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = value === "auto" ? "自動" : value;
+    if (!hasJaVariants && value === "auto") {
+      option.textContent = "和訳トラックなし";
+    } else {
+      option.textContent = TRANSLATION_VARIANT_LABELS[value] || value;
+    }
     elements.translationVariantSelect.appendChild(option);
   }
 
-  const resolvedVariant = optionValues.includes(preferredVariant) ? preferredVariant : "auto";
-  state.translationVariant = resolvedVariant;
-  if (safeSourceId && current) {
-    const previous = normalizeTranslationVariant(state.translationVariantBySource[safeSourceId], "auto");
-    if (previous !== resolvedVariant) {
-      state.translationVariantBySource[safeSourceId] = resolvedVariant;
-      persistTranslationVariantPreferences();
-    }
-  }
-  elements.translationVariantSelect.value = resolvedVariant;
+  const selectedVariant = hasJaVariants && optionValues.includes(preferredVariant) ? preferredVariant : "auto";
+  elements.translationVariantSelect.disabled = !hasJaVariants;
+  elements.translationVariantSelect.value = selectedVariant;
 }
 
 function parseInitialVideoSelectionFromUrl() {
@@ -1491,10 +1589,13 @@ function resolveTrackIdForVideo(video) {
     return null;
   }
   const sourceId = String(video?.source_id || "").trim();
-  const preferredVariant = getTranslationVariantPreferenceForSource(sourceId);
-  const variantTrackId = resolveTrackIdFromTranslationVariant(video, preferredVariant);
-  if (variantTrackId) {
-    return variantTrackId;
+  const preferredTrackPreference = getPlaybackTrackPreferenceForSource(sourceId);
+  const fallbackOrder = resolvePlaybackTrackFallbackOrder(preferredTrackPreference);
+  for (const candidatePreference of fallbackOrder) {
+    const trackId = findTrackIdByPlaybackTrackPreference(video, candidatePreference);
+    if (trackId) {
+      return trackId;
+    }
   }
   const defaultTrackId = String(video.default_track || "");
   if (defaultTrackId && tracks.some((track) => String(track?.track_id || "") === defaultTrackId)) {
@@ -1574,31 +1675,113 @@ function isEnglishSubtitleTrack(track) {
   );
 }
 
-function findFallbackTrackIdForEmptyAsr(video, currentTrackId) {
+function getPlaybackTrackPreferenceFromTrack(track) {
+  const variant = getJaTrackVariant(track);
+  if (variant) {
+    return normalizePlaybackTrackPreference(variant, "en-subtitle");
+  }
+  if (isEnglishSubtitleTrack(track)) {
+    return "en-subtitle";
+  }
+  const kind = normalizedTrackKind(track);
+  if (kind === "asr") {
+    return "asr";
+  }
+  if (kind === "subtitle") {
+    if (isJapaneseTrack(track)) {
+      return "subtitle";
+    }
+    return "non-ja-subtitle";
+  }
+  return "any";
+}
+
+function findTrackIdByPlaybackTrackPreference(video, preference) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  if (!tracks.length) {
+    return null;
+  }
+  const safePreference = normalizePlaybackTrackPreference(preference, "en-subtitle");
+  if (safePreference === "ja" || safePreference === "ja-local" || safePreference === "ja-asr-local") {
+    return findTrackIdByJaVariant(video, safePreference);
+  }
+  if (safePreference === "en-subtitle") {
+    const englishSubtitleTrack = tracks.find((track) => isEnglishSubtitleTrack(track)) || null;
+    return englishSubtitleTrack?.track_id ? String(englishSubtitleTrack.track_id) : null;
+  }
+  if (safePreference === "asr") {
+    const asrTrack = tracks.find((track) => normalizedTrackKind(track) === "asr") || null;
+    return asrTrack?.track_id ? String(asrTrack.track_id) : null;
+  }
+  if (safePreference === "non-ja-subtitle") {
+    const nonJaSubtitleTrack = tracks.find((track) => (
+      normalizedTrackKind(track) === "subtitle" && !isJapaneseTrack(track)
+    )) || null;
+    return nonJaSubtitleTrack?.track_id ? String(nonJaSubtitleTrack.track_id) : null;
+  }
+  if (safePreference === "subtitle") {
+    const subtitleTrack = tracks.find((track) => normalizedTrackKind(track) === "subtitle") || null;
+    return subtitleTrack?.track_id ? String(subtitleTrack.track_id) : null;
+  }
+  if (safePreference === "any") {
+    const defaultTrackId = String(video?.default_track || "");
+    if (defaultTrackId && tracks.some((track) => String(track?.track_id || "") === defaultTrackId)) {
+      return defaultTrackId;
+    }
+  }
+  const firstTrack = tracks[0] || null;
+  return firstTrack?.track_id ? String(firstTrack.track_id) : null;
+}
+
+function resolvePlaybackTrackFallbackOrder(preference) {
+  const safePreference = normalizePlaybackTrackPreference(preference, "en-subtitle");
+  if (safePreference === "any") {
+    return ["any", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local"];
+  }
+  if (safePreference === "ja") {
+    return ["ja", "ja-local", "ja-asr-local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  }
+  if (safePreference === "ja-local") {
+    return ["ja-local", "ja", "ja-asr-local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  }
+  if (safePreference === "ja-asr-local") {
+    return ["ja-asr-local", "ja-local", "ja", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  }
+  if (safePreference === "asr") {
+    return ["asr", "en-subtitle", "non-ja-subtitle", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+  }
+  if (safePreference === "subtitle") {
+    return ["subtitle", "en-subtitle", "non-ja-subtitle", "asr", "ja", "ja-local", "ja-asr-local", "any"];
+  }
+  if (safePreference === "non-ja-subtitle") {
+    return ["non-ja-subtitle", "en-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+  }
+  return ["en-subtitle", "non-ja-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+}
+
+function findFallbackTrackIdForMissingCues(video, currentTrackId, attemptedTrackIds = null) {
   const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
   if (!tracks.length || !currentTrackId) {
     return null;
   }
-  const currentTrack = tracks.find((track) => String(track?.track_id || "") === String(currentTrackId)) || null;
-  if (!currentTrack || normalizedTrackKind(currentTrack) !== "asr") {
-    return null;
+  const attempted = attemptedTrackIds instanceof Set ? attemptedTrackIds : null;
+  const sourceId = String(video?.source_id || "").trim();
+  const preferredTrackPreference = getPlaybackTrackPreferenceForSource(sourceId);
+  const fallbackOrder = resolvePlaybackTrackFallbackOrder(preferredTrackPreference);
+  for (const candidatePreference of fallbackOrder) {
+    const trackId = findTrackIdByPlaybackTrackPreference(video, candidatePreference);
+    if (trackId && trackId !== currentTrackId && (!attempted || !attempted.has(String(trackId)))) {
+      return trackId;
+    }
   }
-
-  const englishSubtitleTrack = tracks.find((track) => isEnglishSubtitleTrack(track)) || null;
-  if (englishSubtitleTrack && englishSubtitleTrack.track_id) {
-    return String(englishSubtitleTrack.track_id);
-  }
-
-  const nonJapaneseSubtitleTrack = tracks.find((track) => (
-    normalizedTrackKind(track) === "subtitle" && !isJapaneseTrack(track)
-  )) || null;
-  if (nonJapaneseSubtitleTrack && nonJapaneseSubtitleTrack.track_id) {
-    return String(nonJapaneseSubtitleTrack.track_id);
-  }
-
-  const anySubtitleTrack = tracks.find((track) => normalizedTrackKind(track) === "subtitle") || null;
-  if (anySubtitleTrack && anySubtitleTrack.track_id) {
-    return String(anySubtitleTrack.track_id);
+  const defaultTrackId = String(video.default_track || "");
+  if (
+    defaultTrackId
+    && defaultTrackId !== currentTrackId
+    && (!attempted || !attempted.has(defaultTrackId))
+    && tracks.some((track) => String(track?.track_id || "") === defaultTrackId)
+  ) {
+    return defaultTrackId;
   }
   return null;
 }
@@ -6634,7 +6817,10 @@ function startCountdown() {
   }, 1000);
 }
 
-async function loadTrackCues() {
+async function loadTrackCues(options = {}) {
+  const attemptedTrackIds = options.attemptedTrackIds instanceof Set
+    ? options.attemptedTrackIds
+    : new Set();
   closeLyricReel();
   const video = currentVideo();
   if (!video) {
@@ -6664,15 +6850,16 @@ async function loadTrackCues() {
   state.cues = Array.isArray(payload.cues) ? payload.cues : [];
   state.activeCueIndex = -1;
   state.lyricReelIndex = -1;
+  attemptedTrackIds.add(String(state.currentTrackId || ""));
 
   if (!state.cues.length) {
-    const fallbackTrackId = findFallbackTrackIdForEmptyAsr(video, state.currentTrackId);
+    const fallbackTrackId = findFallbackTrackIdForMissingCues(video, state.currentTrackId, attemptedTrackIds);
     if (fallbackTrackId && fallbackTrackId !== state.currentTrackId) {
       state.currentTrackId = fallbackTrackId;
       if (elements.trackSelect) {
         elements.trackSelect.value = fallbackTrackId;
       }
-      await loadTrackCues();
+      await loadTrackCues({ attemptedTrackIds });
       return;
     }
     clearSubtitleOverlay("字幕が見つかりません");
@@ -7650,7 +7837,7 @@ async function loadFeed(
   updateTranslationFilterSelect();
   const variantSourceId = String(sourceId || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(variantSourceId);
-  updateTranslationVariantSelect(variantSourceId, null);
+  updateTranslationVariantSelect(variantSourceId);
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
@@ -8530,16 +8717,24 @@ function bindEvents() {
   if (elements.translationVariantSelect) {
     elements.translationVariantSelect.addEventListener("change", () => {
       const sourceId = getSourceIdForTranslationVariantPreference(elements.sourceSelect.value);
-      const selectedVariant = normalizeTranslationVariant(elements.translationVariantSelect.value, "auto");
+      const selectedVariant = normalizeTranslationVariant(elements.translationVariantSelect.value, "ja");
       setTranslationVariantPreference(selectedVariant, sourceId, { persist: true, updateSelect: true });
 
       const video = currentVideo();
       if (video && String(video?.source_id || "").trim() === sourceId) {
-        const nextTrackId = resolveTrackIdFromTranslationVariant(video, selectedVariant);
-        if (nextTrackId && nextTrackId !== state.currentTrackId) {
-          state.currentTrackId = nextTrackId;
-          elements.trackSelect.value = nextTrackId;
-          loadTrackCues().catch((error) => setStatus(error.message, "error"));
+        const currentTrack = (
+          Array.isArray(video?.tracks)
+            ? video.tracks.find((track) => String(track?.track_id || "") === String(state.currentTrackId))
+            : null
+        ) || null;
+        if (currentTrack && getJaTrackVariant(currentTrack)) {
+          setPlaybackTrackPreference(selectedVariant, sourceId, { persist: true });
+          const nextTrackId = resolveTrackIdFromTranslationVariant(video, selectedVariant);
+          if (nextTrackId && nextTrackId !== state.currentTrackId) {
+            state.currentTrackId = nextTrackId;
+            elements.trackSelect.value = nextTrackId;
+            loadTrackCues().catch((error) => setStatus(error.message, "error"));
+          }
         }
       }
 
@@ -8703,14 +8898,19 @@ function bindEvents() {
     state.currentTrackId = elements.trackSelect.value || null;
     const video = currentVideo();
     if (video) {
+      const sourceId = String(video?.source_id || "");
       const selectedTrack = (
         Array.isArray(video?.tracks)
           ? video.tracks.find((track) => String(track?.track_id || "") === String(state.currentTrackId))
           : null
       ) || null;
+      if (selectedTrack) {
+        const selectedTrackPreference = getPlaybackTrackPreferenceFromTrack(selectedTrack);
+        setPlaybackTrackPreference(selectedTrackPreference, sourceId, { persist: true });
+      }
       const selectedVariant = getJaTrackVariant(selectedTrack);
       if (selectedVariant) {
-        setTranslationVariantPreference(selectedVariant, String(video?.source_id || ""), {
+        setTranslationVariantPreference(selectedVariant, sourceId, {
           persist: true,
           updateSelect: true,
         });
@@ -8870,7 +9070,7 @@ async function initialize() {
         { persist: true, updateSelect: true }
       );
     } else {
-      updateTranslationVariantSelect(initialSelection.sourceId, null);
+      updateTranslationVariantSelect(initialSelection.sourceId);
     }
     await loadFeed(
       initialSelection.sourceId,
