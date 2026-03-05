@@ -103,7 +103,7 @@ const state = {
   videos: [],
   sources: [],
   index: 0,
-  shuffleMode: false,
+  shuffleMode: true,
   shuffleQueue: [],
   playbackHistory: [],
   historyPointer: -1,
@@ -7910,14 +7910,24 @@ async function loadFeed(
     return;
   }
 
+  const preferredVideoIdText = String(preferredVideoId || "").trim();
+  const shouldRandomizeInitialIndex = (
+    Boolean(startRandom)
+    || (
+      state.shuffleMode
+      && !variantSourceId
+      && !preferredVideoIdText
+    )
+  );
+
   let initialIndex = -1;
   let usedPreferredVideo = false;
-  if (preferredVideoId) {
-    initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoId);
+  if (preferredVideoIdText) {
+    initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoIdText);
     usedPreferredVideo = initialIndex >= 0;
   }
   if (initialIndex < 0) {
-    initialIndex = startRandom
+    initialIndex = shouldRandomizeInitialIndex
       ? Math.floor(Math.random() * state.videos.length)
       : 0;
   }
