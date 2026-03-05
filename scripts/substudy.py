@@ -10,6 +10,7 @@ import math
 import mimetypes
 import os
 import plistlib
+import random
 import re
 import shlex
 import shutil
@@ -91,6 +92,7 @@ RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
 class GlobalConfig:
     ledger_db: Path
     ledger_csv: Path
+    source_order: str
 
 
 @dataclass
@@ -121,6 +123,7 @@ class SourceConfig:
     max_sleep_interval: int
     retry_sleep: int
     sleep_requests: float
+    media_discovery_interval_hours: float
     playlist_end: int | None
     break_on_existing: bool
     break_per_input: bool
@@ -366,6 +369,13 @@ def parse_non_negative_float(raw_value: Any, fallback: float) -> float:
     return parsed
 
 
+def normalize_source_order_mode(raw_value: Any, fallback: str = "random") -> str:
+    text = str(raw_value or "").strip().lower()
+    if text in {"config", "random"}:
+        return text
+    return fallback
+
+
 def parse_ext_list(raw_value: Any) -> list[str]:
     if raw_value in (None, ""):
         return list(DEFAULT_ASR_EXTS)
@@ -544,9 +554,19 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
         candidate = Path(base_data_dir_raw).expanduser()
         base_data_dir = candidate if candidate.is_absolute() else (cwd / candidate).resolve()
 
+    global_source_order = normalize_source_order_mode(
+        global_raw.get("source_order", "random"),
+        fallback="random",
+    )
+    global_media_discovery_interval_hours = parse_non_negative_float(
+        global_raw.get("media_discovery_interval_hours", 24.0),
+        24.0,
+    )
+
     global_config = GlobalConfig(
         ledger_db=resolve_path(cwd, global_raw.get("ledger_db"), str(DEFAULT_LEDGER_DB)),
         ledger_csv=resolve_path(cwd, global_raw.get("ledger_csv"), str(DEFAULT_LEDGER_CSV)),
+        source_order=global_source_order,
     )
     global_playlist_end = parse_optional_positive_int(
         global_raw.get("playlist_end"),
@@ -694,6 +714,13 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
                 source_raw.get("sleep_requests", global_raw.get("sleep_requests", 1.0)),
                 1.0,
             ),
+            media_discovery_interval_hours=parse_non_negative_float(
+                source_raw.get(
+                    "media_discovery_interval_hours",
+                    global_media_discovery_interval_hours,
+                ),
+                global_media_discovery_interval_hours,
+            ),
             playlist_end=source_playlist_end,
             break_on_existing=bool(
                 source_raw.get("break_on_existing", global_raw.get("break_on_existing", False))
@@ -749,6 +776,24 @@ def select_sources(all_sources: list[SourceConfig], selected_ids: list[str] | No
         if source not in selected:
             selected.append(source)
     return selected
+
+
+def order_sources_for_run(
+    sources: list[SourceConfig],
+    mode: str,
+    command_name: str,
+) -> list[SourceConfig]:
+    normalized_mode = normalize_source_order_mode(mode, fallback="random")
+    if normalized_mode != "random" or len(sources) <= 1:
+        return list(sources)
+
+    ordered = list(sources)
+    random.shuffle(ordered)
+    preview_ids = ", ".join(source.id for source in ordered[:8])
+    if len(ordered) > 8:
+        preview_ids += ", ..."
+    print(f"[{command_name}] source order=random ({preview_ids})")
+    return ordered
 
 
 def resolve_cookie_flags(source: SourceConfig) -> list[str]:
@@ -1042,6 +1087,7 @@ def sync_source(
     playlist_end: int | None = None,
     metadata_candidate_ids: list[str] | None = None,
     run_label: str = "sync",
+    respect_media_discovery_interval: bool = True,
 ) -> None:
     print(f"\n=== {run_label}: {source.id} ===")
 
@@ -1090,22 +1136,62 @@ def sync_source(
     media_before_ids = set(read_archive_ids(source.media_archive))
     new_media_ids: list[str] = []
     if not skip_media:
-        media_command = [
-            source.ytdlp_bin,
-            *cookie_flags,
-            "--download-archive",
-            str(source.media_archive),
-            "--continue",
-            "--no-overwrites",
-            *retry_flags,
-            *discovery_flags,
-            "-f",
-            source.video_format,
-            "-o",
-            str(source.media_dir / source.media_output_template),
-            "--no-playlist",
-            source.url,
-        ]
+        media_discovery_state_key = f"media_discovery_last_attempt:{source.id}"
+        run_media_discovery = True
+        media_discovery_remaining_hours: float | None = None
+        media_discovery_last_attempt: str | None = None
+        if (
+            connection is not None
+            and not dry_run
+            and respect_media_discovery_interval
+            and source.media_discovery_interval_hours > 0
+        ):
+            media_discovery_last_attempt = get_app_state_value(
+                connection,
+                media_discovery_state_key,
+                default="",
+            ).strip()
+            if media_discovery_last_attempt:
+                last_attempt_dt = parse_iso_datetime_utc(media_discovery_last_attempt)
+                if last_attempt_dt is not None:
+                    now_dt = dt.datetime.now(dt.timezone.utc)
+                    elapsed_hours = max(0.0, (now_dt - last_attempt_dt).total_seconds() / 3600.0)
+                    if elapsed_hours < source.media_discovery_interval_hours:
+                        run_media_discovery = False
+                        media_discovery_remaining_hours = (
+                            source.media_discovery_interval_hours - elapsed_hours
+                        )
+
+        media_command: list[str] | None = None
+        if run_media_discovery:
+            media_command = [
+                source.ytdlp_bin,
+                *cookie_flags,
+                "--download-archive",
+                str(source.media_archive),
+                "--continue",
+                "--no-overwrites",
+                *retry_flags,
+                *discovery_flags,
+                "-f",
+                source.video_format,
+                "-o",
+                str(source.media_dir / source.media_output_template),
+                "--no-playlist",
+                source.url,
+            ]
+        else:
+            wait_label = (
+                f"{media_discovery_remaining_hours:.2f}h"
+                if media_discovery_remaining_hours is not None
+                else "n/a"
+            )
+            print(
+                f"[media] {source.id}: discovery deferred "
+                f"(last_attempt={media_discovery_last_attempt or 'unknown'}, "
+                f"remaining={wait_label}, "
+                f"interval={source.media_discovery_interval_hours:.2f}h)"
+            )
         media_started_at = now_utc_iso()
         media_run_id: int | None = None
         if connection is not None and not dry_run:
@@ -1121,12 +1207,20 @@ def sync_source(
 
         media_exit_code = 0
         media_error: str | None = None
-        try:
-            media_exit_code = run_command(media_command, dry_run=dry_run, raise_on_error=False)
-        except Exception as exc:
-            media_exit_code = 1
-            media_error = str(exc)
-            print(f"[sync] {source.id} media command failed: {exc}", file=sys.stderr)
+        if media_command is not None:
+            try:
+                media_exit_code = run_command(media_command, dry_run=dry_run, raise_on_error=False)
+            except Exception as exc:
+                media_exit_code = 1
+                media_error = str(exc)
+                print(f"[sync] {source.id} media command failed: {exc}", file=sys.stderr)
+            if connection is not None and not dry_run:
+                set_app_state_value(
+                    connection,
+                    media_discovery_state_key,
+                    media_started_at,
+                )
+                connection.commit()
 
         media_after_ids = set(read_archive_ids(source.media_archive))
         new_media_ids = sorted(media_after_ids - media_before_ids)
@@ -5212,6 +5306,7 @@ def run_backfill(
                     playlist_end=playlist_end,
                     metadata_candidate_ids=window_ids,
                     run_label="backfill",
+                    respect_media_discovery_interval=False,
                 )
 
                 reached_tail = seen_count < window_size
@@ -11088,6 +11183,12 @@ def parse_args() -> argparse.Namespace:
     )
     sync_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     sync_parser.add_argument("--source", action="append", dest="sources")
+    sync_parser.add_argument(
+        "--source-order",
+        choices=["config", "random"],
+        default=None,
+        help="Source processing order (default: config global.source_order or random).",
+    )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--skip-media", action="store_true")
     sync_parser.add_argument("--skip-subs", action="store_true")
@@ -11145,6 +11246,12 @@ def parse_args() -> argparse.Namespace:
     )
     backfill_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     backfill_parser.add_argument("--source", action="append", dest="sources")
+    backfill_parser.add_argument(
+        "--source-order",
+        choices=["config", "random"],
+        default=None,
+        help="Source processing order (default: config global.source_order or random).",
+    )
     backfill_parser.add_argument("--dry-run", action="store_true")
     backfill_parser.add_argument("--skip-media", action="store_true")
     backfill_parser.add_argument("--skip-subs", action="store_true")
@@ -11802,6 +11909,15 @@ def main() -> int:
     ledger_csv_path = resolve_output_path(getattr(args, "ledger_csv", None), global_config.ledger_csv)
 
     if args.command == "sync":
+        source_order_mode = normalize_source_order_mode(
+            getattr(args, "source_order", None) or global_config.source_order,
+            fallback="random",
+        )
+        run_sources = order_sources_for_run(
+            sources=sources,
+            mode=source_order_mode,
+            command_name="sync",
+        )
         effective_skip_media, _network_decision = resolve_skip_media_with_network_profile(
             command_name="sync",
             explicit_skip_media=bool(args.skip_media),
@@ -11819,7 +11935,7 @@ def main() -> int:
             sync_connection.execute("PRAGMA journal_mode=WAL")
             create_schema(sync_connection)
         try:
-            for source in sources:
+            for source in run_sources:
                 sync_source(
                     source=source,
                     dry_run=args.dry_run,
@@ -11834,7 +11950,7 @@ def main() -> int:
 
         if not args.skip_ledger and not args.dry_run:
             build_ledger(
-                sources,
+                run_sources,
                 ledger_db_path,
                 ledger_csv_path,
                 incremental=not args.full_ledger,
@@ -11844,6 +11960,15 @@ def main() -> int:
         return 0
 
     if args.command == "backfill":
+        source_order_mode = normalize_source_order_mode(
+            getattr(args, "source_order", None) or global_config.source_order,
+            fallback="random",
+        )
+        run_sources = order_sources_for_run(
+            sources=sources,
+            mode=source_order_mode,
+            command_name="backfill",
+        )
         effective_skip_media, _network_decision = resolve_skip_media_with_network_profile(
             command_name="backfill",
             explicit_skip_media=bool(args.skip_media),
@@ -11855,7 +11980,7 @@ def main() -> int:
             weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
         )
         run_backfill(
-            sources=sources,
+            sources=run_sources,
             db_path=ledger_db_path,
             csv_path=ledger_csv_path,
             dry_run=args.dry_run,

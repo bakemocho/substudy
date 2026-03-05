@@ -298,7 +298,7 @@ enabled = true
         by_id_after = {row["id"]: row for row in list_payload_after.get("targets", [])}
         self.assertNotIn("storiesofcz_likes", by_id_after)
 
-    def test_load_config_parses_sleep_requests_global_and_source_override(self):
+    def test_load_config_parses_sleep_requests_and_media_interval_overrides(self):
         config_dir = self.workspace_root / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "sources.toml"
@@ -307,7 +307,9 @@ enabled = true
 [global]
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
+source_order = "random"
 sleep_requests = 1.5
+media_discovery_interval_hours = 24
 
 [[sources]]
 id = "storiesofcz"
@@ -322,15 +324,73 @@ url = "https://www.tiktok.com/@storiesofcz/liked"
 watch_kind = "likes"
 enabled = true
 sleep_requests = 0.25
+media_discovery_interval_hours = 3
             """.strip()
             + "\n",
             encoding="utf-8",
         )
 
-        _, sources = self.mod.load_config(config_path)
+        global_config, sources = self.mod.load_config(config_path)
         by_id = {source.id: source for source in sources}
+        self.assertEqual(global_config.source_order, "random")
         self.assertAlmostEqual(float(by_id["storiesofcz"].sleep_requests), 1.5, places=3)
         self.assertAlmostEqual(float(by_id["storiesofcz_likes"].sleep_requests), 0.25, places=3)
+        self.assertAlmostEqual(
+            float(by_id["storiesofcz"].media_discovery_interval_hours),
+            24.0,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            float(by_id["storiesofcz_likes"].media_discovery_interval_hours),
+            3.0,
+            places=3,
+        )
+
+    def test_order_sources_for_run_random_keeps_same_members(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "a"
+platform = "tiktok"
+url = "https://www.tiktok.com/@a"
+enabled = true
+
+[[sources]]
+id = "b"
+platform = "tiktok"
+url = "https://www.tiktok.com/@b"
+enabled = true
+
+[[sources]]
+id = "c"
+platform = "tiktok"
+url = "https://www.tiktok.com/@c"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+
+        def reverse_in_place(items):
+            items[:] = list(reversed(items))
+
+        with mock.patch.object(self.mod.random, "shuffle", side_effect=reverse_in_place):
+            ordered = self.mod.order_sources_for_run(
+                sources=sources,
+                mode="random",
+                command_name="sync",
+            )
+
+        self.assertEqual([source.id for source in ordered], ["c", "b", "a"])
+        self.assertEqual({source.id for source in ordered}, {"a", "b", "c"})
 
     def test_discover_playlist_window_ids_uses_sleep_requests_flags(self):
         config_dir = self.workspace_root / "config"
@@ -385,6 +445,79 @@ enabled = true
         self.assertIn("--max-sleep-interval", command)
         self.assertIn("--retry-sleep", command)
         self.assertNotIn("--ignore-errors", command)
+
+    def test_sync_source_defers_media_discovery_with_recent_attempt(self):
+        source_root = self.workspace_root / "storiesofcz"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+media_discovery_interval_hours = 24
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            recent_attempt_iso = self.mod.now_utc_iso()
+            self.mod.set_app_state_value(
+                connection=connection,
+                state_key=f"media_discovery_last_attempt:{source.id}",
+                state_value=recent_attempt_iso,
+            )
+            connection.commit()
+
+            with mock.patch.object(self.mod, "run_command") as run_command_mock:
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=False,
+                    skip_subs=True,
+                    skip_meta=True,
+                    connection=connection,
+                )
+            run_command_mock.assert_not_called()
+
+            media_run = connection.execute(
+                """
+                SELECT status, command, success_count, failure_count
+                FROM download_runs
+                WHERE source_id = ? AND stage = 'media'
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(media_run)
+            self.assertEqual(media_run[0], "success")
+            self.assertIsNone(media_run[1])
+            self.assertEqual(int(media_run[2] or 0), 0)
+            self.assertEqual(int(media_run[3] or 0), 0)
+
+            saved_attempt = self.mod.get_app_state_value(
+                connection,
+                f"media_discovery_last_attempt:{source.id}",
+                default="",
+            )
+            self.assertEqual(saved_attempt, recent_attempt_iso)
+        finally:
+            connection.close()
 
     def test_build_media_audio_fallback_format_selector_prefers_download_then_audio(self):
         selector = self.mod.build_media_audio_fallback_format_selector("bv*+ba/best")
