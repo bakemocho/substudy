@@ -20,6 +20,28 @@
 sqlite3 data/master_ledger.sqlite "SELECT source_id FROM sources;"
 ```
 
+### `ja` と `ja-local` の区別
+
+`subtitles` テーブルの `language` カラムと `translation_runs` の `target_lang` カラムには、以下の2種類の日本語トラックが混在する。
+
+| 値 | ファイル例 | 意味 |
+|---|---|---|
+| `ja` | `video_id.ja.vtt` | **Claude による翻訳**（本手順書の対象） |
+| `ja-local` | `video_id.ja-local.vtt` | **local LLM による翻訳**（`translate-local` スクリプト産） |
+
+- TikTok ダウンロード後に `translate-local` を走らせたソースでは `ja-local` だけ存在し、`ja` が未作成のケースがある。
+- 対象選定クエリで `s.language <> 'ja'` とすると `ja-local` ファイルも混入するため、**`NOT LIKE 'ja%'`** で日本語系を一括除外すること。
+- `NOT EXISTS` 節は `target_lang = 'ja'` のみチェックすればよい（`ja-local` は別トラックとして共存する）。
+- ソースの言語値はプロバイダによって異なる（例: `en`、`NA.eng-US`）。不明な場合は先に下記で確認する。
+
+```bash
+sqlite3 data/master_ledger.sqlite "
+SELECT DISTINCT language, ext, COUNT(*) FROM subtitles
+WHERE source_id = 'YOUR_SOURCE_ID'
+GROUP BY language, ext ORDER BY 3 DESC;
+"
+```
+
 ## 3. 出力要件
 
 ### MUST
@@ -66,7 +88,7 @@ JOIN videos v
   ON v.source_id = s.source_id AND v.video_id = s.video_id
 WHERE v.has_media = 1
   AND s.source_id = '${SOURCE_ID}'      -- ソース指定
-  AND s.language <> 'ja'                 -- 和訳自体を除外
+  AND s.language NOT LIKE 'ja%'           -- ja / ja-local 等、日本語系を一括除外
   AND s.subtitle_path IS NOT NULL
   AND s.subtitle_path <> ''
   AND lower(COALESCE(s.ext, '')) IN ('srt', 'vtt')

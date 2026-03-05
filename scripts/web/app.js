@@ -7863,11 +7863,6 @@ async function loadFeed(
         ? hasJaSubtitleTrack(video)
         : !hasJaSubtitleTrack(video)
     ));
-    const sourceSet = new Set(loadedVideos.map((video) => String(video?.source_id || "")).filter(Boolean));
-    loadedSources = loadedSources.filter((source) => sourceSet.has(String(source || "")));
-    if (sourceId && !sourceSet.has(sourceId)) {
-      loadedSources = [...new Set([...loadedSources, sourceId])];
-    }
   }
 
   state.videos = loadedVideos;

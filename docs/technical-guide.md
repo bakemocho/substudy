@@ -13,6 +13,53 @@ make privacy-check
 GitHub Actions also runs this check on pull requests and pushes to `master`
 via `.github/workflows/privacy-check.yml`.
 
+## Playwright verification policy
+
+Use Playwright for UI regressions where query params, dropdown filters, and
+fallback behavior can break in browser-only flows.
+
+### 1) Run in an isolated temp workspace
+
+- Do not add Playwright dependencies to this repository unless explicitly planned.
+- Use a throwaway directory (example: `/tmp/substudy-pw`) for one-shot checks.
+- Use a local npm cache path to avoid permission issues:
+  `NPM_CONFIG_CACHE=/tmp/substudy-npm-cache`.
+
+Example setup:
+
+```bash
+mkdir -p /tmp/substudy-pw
+cd /tmp/substudy-pw
+NPM_CONFIG_CACHE=/tmp/substudy-npm-cache npm init -y
+NPM_CONFIG_CACHE=/tmp/substudy-npm-cache npm install -D @playwright/test
+```
+
+### 2) Always test against a dedicated local server
+
+- Start `substudy web` from the current working tree on a dedicated port
+  (example: `8890`) to avoid stale behavior from older processes.
+- When backend logic changed, restart the server before browser validation.
+
+Example:
+
+```bash
+python3 scripts/substudy.py web --host 127.0.0.1 --port 8890
+```
+
+### 3) Verify both reproduction and fixed behavior
+
+- If the issue report includes a failing URL, check it first as a reproduction.
+- Run assertions for the intended behavior on the patched server.
+- For source filtering fixes, assert that sources without playable media are not
+  present in `#sourceSelect`.
+
+### 4) Keep evidence and clean up
+
+- In the task report, include: tested URL, selected query params, expected vs.
+  observed option list, and pass/fail result.
+- Stop temporary server processes after validation.
+- Do not commit temporary Playwright files or caches under `/tmp`.
+
 ## Project layout
 
 - `scripts/substudy.py`: main CLI (`sync`, `backfill`, `ledger`, `asr`, `loudness`, `dict-index`, `downloads`, `web`)

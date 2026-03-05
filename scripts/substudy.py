@@ -8898,7 +8898,6 @@ def build_web_handler(
             limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
             offset = clamp_int(query.get("offset", [None])[0], default=0, minimum=0, maximum=20000)
             effective_scope = self._resolve_effective_source_scope()
-            configured_source_ids = sorted(effective_scope) if effective_scope is not None else []
             if effective_scope is not None and not effective_scope:
                 self._send_json(
                     {
@@ -8983,6 +8982,7 @@ def build_web_handler(
                 source_where_clauses = [
                     "has_media = 1",
                     "media_path IS NOT NULL",
+                    "media_path <> ''",
                 ]
                 source_params: list[Any] = []
                 if effective_scope is not None:
@@ -8995,7 +8995,7 @@ def build_web_handler(
                     source_where_clauses.append(f"NOT ({ja_subtitle_exists_clause('videos')})")
                 source_rows = connection.execute(
                     f"""
-                    SELECT DISTINCT source_id
+                    SELECT source_id, media_path
                     FROM videos
                     WHERE {" AND ".join(source_where_clauses)}
                     ORDER BY source_id ASC
@@ -9005,19 +9005,19 @@ def build_web_handler(
                 source_ids: list[str] = []
                 source_seen: set[str] = set()
                 for row in source_rows:
-                    source_id_value = str(row["source_id"])
+                    source_id_value = str(row["source_id"] or "").strip()
+                    if not source_id_value:
+                        continue
                     if source_id_value in source_seen:
+                        continue
+                    media_path_value = row["media_path"]
+                    if media_path_value in (None, ""):
+                        continue
+                    media_path = Path(str(media_path_value))
+                    if not media_path.exists() or not media_path.is_file():
                         continue
                     source_seen.add(source_id_value)
                     source_ids.append(source_id_value)
-                for source_id_value in configured_source_ids:
-                    if source_id_value in source_seen:
-                        continue
-                    source_seen.add(source_id_value)
-                    source_ids.append(source_id_value)
-                if source_filter and source_filter not in source_seen:
-                    source_ids.append(source_filter)
-                    source_seen.add(source_filter)
 
                 videos: list[dict[str, Any]] = []
                 for row in rows:
