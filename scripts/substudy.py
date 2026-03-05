@@ -120,6 +120,7 @@ class SourceConfig:
     sleep_interval: int
     max_sleep_interval: int
     retry_sleep: int
+    sleep_requests: float
     playlist_end: int | None
     break_on_existing: bool
     break_per_input: bool
@@ -350,6 +351,18 @@ def parse_optional_positive_int(raw_value: Any, fallback: int | None) -> int | N
     parsed = int(raw_value)
     if parsed <= 0:
         return None
+    return parsed
+
+
+def parse_non_negative_float(raw_value: Any, fallback: float) -> float:
+    if raw_value in (None, ""):
+        return fallback
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(parsed) or parsed < 0:
+        return fallback
     return parsed
 
 
@@ -677,6 +690,10 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
                 source_raw.get("max_sleep_interval", global_raw.get("max_sleep_interval", 6))
             ),
             retry_sleep=int(source_raw.get("retry_sleep", global_raw.get("retry_sleep", 5))),
+            sleep_requests=parse_non_negative_float(
+                source_raw.get("sleep_requests", global_raw.get("sleep_requests", 1.0)),
+                1.0,
+            ),
             playlist_end=source_playlist_end,
             break_on_existing=bool(
                 source_raw.get("break_on_existing", global_raw.get("break_on_existing", False))
@@ -988,6 +1005,32 @@ def bootstrap_missing_archives(source: SourceConfig, dry_run: bool) -> None:
         write_archive_ids(source.subs_archive, extractor, subtitle_ids, dry_run=dry_run)
 
 
+def build_ytdlp_retry_flags(
+    source: SourceConfig,
+    include_ignore_errors: bool = True,
+) -> list[str]:
+    flags: list[str] = []
+    if include_ignore_errors:
+        flags.append("--ignore-errors")
+    flags.extend(
+        [
+            "--retries",
+            "infinite",
+            "--fragment-retries",
+            "infinite",
+            "--sleep-interval",
+            str(source.sleep_interval),
+            "--max-sleep-interval",
+            str(source.max_sleep_interval),
+            "--retry-sleep",
+            str(source.retry_sleep),
+        ]
+    )
+    if source.sleep_requests > 0:
+        flags.extend(["--sleep-requests", str(source.sleep_requests)])
+    return flags
+
+
 def sync_source(
     source: SourceConfig,
     dry_run: bool,
@@ -1010,19 +1053,7 @@ def sync_source(
 
     bootstrap_missing_archives(source, dry_run=dry_run)
 
-    retry_flags = [
-        "--ignore-errors",
-        "--retries",
-        "infinite",
-        "--fragment-retries",
-        "infinite",
-        "--sleep-interval",
-        str(source.sleep_interval),
-        "--max-sleep-interval",
-        str(source.max_sleep_interval),
-        "--retry-sleep",
-        str(source.retry_sleep),
-    ]
+    retry_flags = build_ytdlp_retry_flags(source, include_ignore_errors=True)
     discovery_flags: list[str] = []
     if source.break_on_existing:
         discovery_flags.append("--break-on-existing")
@@ -4087,13 +4118,14 @@ def discover_playlist_window_ids(
     dry_run: bool,
 ) -> list[str]:
     cookie_flags = resolve_cookie_flags(source)
+    retry_flags = build_ytdlp_retry_flags(source, include_ignore_errors=False)
     command = [
         source.ytdlp_bin,
         *cookie_flags,
+        *retry_flags,
         "--flat-playlist",
         "--print",
         "%(id)s",
-        "--ignore-errors",
         "--playlist-start",
         str(playlist_start),
         "--playlist-end",

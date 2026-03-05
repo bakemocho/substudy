@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 from pathlib import Path
 
@@ -296,6 +297,94 @@ enabled = true
             list_payload_after = json.loads(response.read().decode("utf-8"))
         by_id_after = {row["id"]: row for row in list_payload_after.get("targets", [])}
         self.assertNotIn("storiesofcz_likes", by_id_after)
+
+    def test_load_config_parses_sleep_requests_global_and_source_override(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+sleep_requests = 1.5
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+
+[[sources]]
+id = "storiesofcz_likes"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz/liked"
+watch_kind = "likes"
+enabled = true
+sleep_requests = 0.25
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        self.assertAlmostEqual(float(by_id["storiesofcz"].sleep_requests), 1.5, places=3)
+        self.assertAlmostEqual(float(by_id["storiesofcz_likes"].sleep_requests), 0.25, places=3)
+
+    def test_discover_playlist_window_ids_uses_sleep_requests_flags(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+sleep_interval = 3
+max_sleep_interval = 7
+retry_sleep = 9
+sleep_requests = 1.25
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(command, check, capture_output, text):
+            captured["command"] = list(command)
+            return self.mod.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="7611111111111111111\n7612222222222222222\n",
+                stderr="",
+            )
+
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+            ids = self.mod.discover_playlist_window_ids(
+                source=source,
+                playlist_start=1,
+                playlist_end=5,
+                dry_run=False,
+            )
+
+        self.assertEqual(ids, ["7611111111111111111", "7612222222222222222"])
+        command = captured["command"]
+        self.assertIn("--sleep-requests", command)
+        self.assertIn("1.25", command)
+        self.assertIn("--sleep-interval", command)
+        self.assertIn("--max-sleep-interval", command)
+        self.assertIn("--retry-sleep", command)
+        self.assertNotIn("--ignore-errors", command)
 
     def test_build_media_audio_fallback_format_selector_prefers_download_then_audio(self):
         selector = self.mod.build_media_audio_fallback_format_selector("bv*+ba/best")
