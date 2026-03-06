@@ -1,7 +1,26 @@
 # 並列ワーカー化設計書（同一source同時実行対応）
 
-更新日: 2026-03-06  
-状態: Draft
+更新日: 2026-03-07  
+状態: In Progress（Phase 1 進行中）
+
+## 0. 実装進捗（2026-03-07）
+
+### 実装済み
+
+- DB スキーマに `work_items` / `source_poll_state` / `worker_heartbeats` を追加。
+- `sync` / `backfill` に `--execution-mode legacy|queue` を追加。
+- `sync --execution-mode queue` で source ごとの discovery を実行し、`work_items(stage=media)` へ投入。
+- `source_poll_state.next_poll_at` を使った source ごとの discovery 間隔制御（既定 24h）を実装。
+- `backfill --execution-mode queue` で window 取得済み ID を `work_items` へ投入。
+- queue 導入に伴う回帰テストを追加（スキーマ作成、enqueue 再投入、poll 間隔抑制）。
+
+### 未着手/継続中
+
+- `work_items` を実際に処理する worker（lease 取得・lease 延長・stale lease 回収）。
+- `meta/subs/media` の各 stage 実行を queue 駆動へ移行。
+- `downloads` への queue 状態統合表示。
+- `urls.txt` の run-local 化と archive 依存の段階削減。
+- legacy 側の `running` 回収ロジック撤去。
 
 ## 1. 背景
 
@@ -203,4 +222,3 @@ lease 失効時:
 - archive ファイルを将来的に完全廃止するか。  
 - worker 優先度（新規取得 vs retry）のデフォルト方針。  
 - stage 間依存（`media -> subs/meta -> asr`）を queue 上でどう表現するか（単純投入 or DAG）。
-

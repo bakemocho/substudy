@@ -2673,6 +2673,55 @@ def create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_backfill_state_status ON backfill_state(status, updated_at);
 
+        CREATE TABLE IF NOT EXISTS work_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            priority INTEGER NOT NULL DEFAULT 100,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at TEXT,
+            lease_owner TEXT,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            last_error TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            UNIQUE (source_id, stage, video_id),
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_work_items_status_retry
+            ON work_items(status, next_retry_at, priority, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_work_items_source_stage
+            ON work_items(source_id, stage, status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS source_poll_state (
+            source_id TEXT PRIMARY KEY,
+            last_poll_at TEXT,
+            next_poll_at TEXT,
+            poll_interval_hours REAL NOT NULL DEFAULT 24,
+            last_poll_status TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_poll_state_next
+            ON source_poll_state(next_poll_at, updated_at);
+
+        CREATE TABLE IF NOT EXISTS worker_heartbeats (
+            worker_id TEXT PRIMARY KEY,
+            host TEXT,
+            pid INTEGER,
+            started_at TEXT NOT NULL,
+            last_heartbeat_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS video_favorites (
             source_id TEXT NOT NULL,
             video_id TEXT NOT NULL,
@@ -4142,6 +4191,322 @@ def get_due_retry_ids(
     return [str(row[0]) for row in rows]
 
 
+def compute_next_poll_at_iso(
+    poll_interval_hours: float,
+    from_dt: dt.datetime | None = None,
+) -> str:
+    safe_hours = max(0.0, float(poll_interval_hours))
+    base_dt = from_dt or dt.datetime.now(dt.timezone.utc)
+    next_dt = base_dt + dt.timedelta(hours=safe_hours)
+    return next_dt.replace(microsecond=0).isoformat()
+
+
+def should_poll_source_discovery(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    now_dt: dt.datetime | None = None,
+) -> tuple[bool, float, str | None]:
+    safe_interval_hours = max(0.0, float(source.media_discovery_interval_hours))
+    if safe_interval_hours <= 0:
+        return True, 0.0, None
+
+    now_value = now_dt or dt.datetime.now(dt.timezone.utc)
+    row = connection.execute(
+        """
+        SELECT next_poll_at
+        FROM source_poll_state
+        WHERE source_id = ?
+        """,
+        (source.id,),
+    ).fetchone()
+    if row is None or row[0] in (None, ""):
+        return True, 0.0, None
+
+    next_poll_text = str(row[0])
+    next_poll_dt = parse_iso_datetime_utc(next_poll_text)
+    if next_poll_dt is None:
+        return True, 0.0, None
+    if now_value >= next_poll_dt:
+        return True, 0.0, next_poll_text
+
+    remaining_hours = max(0.0, (next_poll_dt - now_value).total_seconds() / 3600.0)
+    return False, remaining_hours, next_poll_text
+
+
+def upsert_source_poll_state(
+    connection: sqlite3.Connection,
+    source_id: str,
+    poll_interval_hours: float,
+    last_poll_status: str,
+    last_error: str | None,
+    last_poll_at: str | None,
+    next_poll_at: str | None,
+    updated_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO source_poll_state (
+            source_id,
+            last_poll_at,
+            next_poll_at,
+            poll_interval_hours,
+            last_poll_status,
+            last_error,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            last_poll_at = excluded.last_poll_at,
+            next_poll_at = excluded.next_poll_at,
+            poll_interval_hours = excluded.poll_interval_hours,
+            last_poll_status = excluded.last_poll_status,
+            last_error = excluded.last_error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            source_id,
+            last_poll_at,
+            next_poll_at,
+            float(max(0.0, poll_interval_hours)),
+            last_poll_status,
+            last_error,
+            updated_at,
+        ),
+    )
+
+
+def enqueue_work_item(
+    connection: sqlite3.Connection,
+    source_id: str,
+    stage: str,
+    video_id: str,
+    now_iso: str,
+    priority: int = 100,
+    payload_json: str | None = None,
+) -> str:
+    row = connection.execute(
+        """
+        SELECT status, priority
+        FROM work_items
+        WHERE source_id = ? AND stage = ? AND video_id = ?
+        """,
+        (source_id, stage, video_id),
+    ).fetchone()
+    safe_priority = int(priority)
+    if row is None:
+        connection.execute(
+            """
+            INSERT INTO work_items (
+                source_id,
+                stage,
+                video_id,
+                status,
+                priority,
+                attempt_count,
+                next_retry_at,
+                lease_owner,
+                lease_token,
+                lease_expires_at,
+                last_error,
+                payload_json,
+                created_at,
+                updated_at,
+                started_at,
+                finished_at
+            ) VALUES (?, ?, ?, 'queued', ?, 0, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL)
+            """,
+            (
+                source_id,
+                stage,
+                video_id,
+                safe_priority,
+                payload_json,
+                now_iso,
+                now_iso,
+            ),
+        )
+        return "inserted"
+
+    current_status = str(row[0] or "")
+    current_priority = int(row[1] or safe_priority)
+    next_priority = min(current_priority, safe_priority)
+
+    if current_status in {"queued", "leased"}:
+        if next_priority != current_priority:
+            connection.execute(
+                """
+                UPDATE work_items
+                SET priority = ?, updated_at = ?
+                WHERE source_id = ? AND stage = ? AND video_id = ?
+                """,
+                (next_priority, now_iso, source_id, stage, video_id),
+            )
+            return "updated"
+        return "kept"
+
+    if current_status == "success":
+        return "kept"
+
+    connection.execute(
+        """
+        UPDATE work_items
+        SET status = 'queued',
+            priority = ?,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            last_error = NULL,
+            payload_json = COALESCE(?, payload_json),
+            updated_at = ?,
+            started_at = NULL,
+            finished_at = NULL
+        WHERE source_id = ? AND stage = ? AND video_id = ?
+        """,
+        (
+            next_priority,
+            payload_json,
+            now_iso,
+            source_id,
+            stage,
+            video_id,
+        ),
+    )
+    return "requeued"
+
+
+def enqueue_media_work_items(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_ids: list[str],
+    now_iso: str,
+) -> tuple[int, int, int, int]:
+    inserted = 0
+    requeued = 0
+    updated = 0
+    kept = 0
+    for index, video_id in enumerate(video_ids):
+        action = enqueue_work_item(
+            connection=connection,
+            source_id=source_id,
+            stage="media",
+            video_id=video_id,
+            now_iso=now_iso,
+            priority=index,
+            payload_json=None,
+        )
+        if action == "inserted":
+            inserted += 1
+        elif action == "requeued":
+            requeued += 1
+        elif action == "updated":
+            updated += 1
+        else:
+            kept += 1
+    return inserted, requeued, updated, kept
+
+
+def enqueue_source_media_discovery(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    dry_run: bool,
+    run_label: str,
+    playlist_start: int | None = None,
+    playlist_end: int | None = None,
+    enforce_poll_interval: bool = True,
+) -> tuple[int, int, int]:
+    now_dt = dt.datetime.now(dt.timezone.utc)
+    now_iso = now_dt.replace(microsecond=0).isoformat()
+    interval_hours = max(0.0, float(source.media_discovery_interval_hours))
+
+    should_poll = True
+    remaining_hours = 0.0
+    next_poll_at = None
+    if enforce_poll_interval:
+        should_poll, remaining_hours, next_poll_at = should_poll_source_discovery(
+            connection=connection,
+            source=source,
+            now_dt=now_dt,
+        )
+
+    if not should_poll:
+        print(
+            f"[{run_label}] {source.id}: media discovery deferred "
+            f"(next_poll_at={next_poll_at or 'unknown'}, remaining={remaining_hours:.2f}h)"
+        )
+        return 0, 0, 0
+
+    playlist_start_value = playlist_start if playlist_start is not None else 1
+    if playlist_end is not None:
+        playlist_end_value = playlist_end
+    elif source.playlist_end is not None:
+        playlist_end_value = source.playlist_end
+    else:
+        playlist_end_value = DEFAULT_PLAYLIST_END
+
+    discovered_ids: list[str] = []
+    try:
+        discovered_ids = discover_playlist_window_ids(
+            source=source,
+            playlist_start=playlist_start_value,
+            playlist_end=playlist_end_value,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        next_poll_iso = compute_next_poll_at_iso(
+            poll_interval_hours=min(interval_hours, 1.0) if interval_hours > 0 else 1.0,
+            from_dt=now_dt,
+        )
+        if not dry_run:
+            upsert_source_poll_state(
+                connection=connection,
+                source_id=source.id,
+                poll_interval_hours=interval_hours if interval_hours > 0 else 24.0,
+                last_poll_status="error",
+                last_error=str(exc),
+                last_poll_at=now_iso,
+                next_poll_at=next_poll_iso,
+                updated_at=now_iso,
+            )
+            connection.commit()
+        raise
+
+    if dry_run:
+        print(
+            f"[{run_label}] {source.id}: discovery dry-run ids={len(discovered_ids)} "
+            f"range={playlist_start_value}-{playlist_end_value}"
+        )
+        return len(discovered_ids), 0, 0
+
+    inserted, requeued, updated, kept = enqueue_media_work_items(
+        connection=connection,
+        source_id=source.id,
+        video_ids=discovered_ids,
+        now_iso=now_iso,
+    )
+    next_poll_iso = compute_next_poll_at_iso(
+        poll_interval_hours=interval_hours if interval_hours > 0 else 24.0,
+        from_dt=now_dt,
+    )
+    upsert_source_poll_state(
+        connection=connection,
+        source_id=source.id,
+        poll_interval_hours=interval_hours if interval_hours > 0 else 24.0,
+        last_poll_status="success",
+        last_error=None,
+        last_poll_at=now_iso,
+        next_poll_at=next_poll_iso,
+        updated_at=now_iso,
+    )
+    connection.commit()
+
+    print(
+        f"[{run_label}] {source.id}: queued media ids={len(discovered_ids)} "
+        f"(inserted={inserted}, requeued={requeued}, reprioritized={updated}, kept={kept}) "
+        f"range={playlist_start_value}-{playlist_end_value}"
+    )
+    return len(discovered_ids), inserted, requeued
+
+
 def get_media_no_audio_bootstrap_ids(
     connection: sqlite3.Connection,
     source_id: str,
@@ -5183,7 +5548,9 @@ def run_backfill(
     full_ledger: bool = False,
     windows_override: int | None = None,
     reset: bool = False,
+    execution_mode: str = "legacy",
 ) -> None:
+    normalized_execution_mode = "queue" if str(execution_mode).strip().lower() == "queue" else "legacy"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5295,19 +5662,34 @@ def run_backfill(
                     break
 
                 any_work = True
-                sync_source(
-                    source=source,
-                    dry_run=False,
-                    skip_media=skip_media,
-                    skip_subs=skip_subs,
-                    skip_meta=skip_meta,
-                    connection=connection,
-                    playlist_start=playlist_start,
-                    playlist_end=playlist_end,
-                    metadata_candidate_ids=window_ids,
-                    run_label="backfill",
-                    respect_media_discovery_interval=False,
-                )
+                if normalized_execution_mode == "queue":
+                    now_iso = now_utc_iso()
+                    inserted, requeued, reprioritized, kept = enqueue_media_work_items(
+                        connection=connection,
+                        source_id=source.id,
+                        video_ids=window_ids,
+                        now_iso=now_iso,
+                    )
+                    connection.commit()
+                    print(
+                        f"[backfill-queue] {source.id}: queued media ids={len(window_ids)} "
+                        f"(inserted={inserted}, requeued={requeued}, "
+                        f"reprioritized={reprioritized}, kept={kept})"
+                    )
+                else:
+                    sync_source(
+                        source=source,
+                        dry_run=False,
+                        skip_media=skip_media,
+                        skip_subs=skip_subs,
+                        skip_meta=skip_meta,
+                        connection=connection,
+                        playlist_start=playlist_start,
+                        playlist_end=playlist_end,
+                        metadata_candidate_ids=window_ids,
+                        run_label="backfill",
+                        respect_media_discovery_interval=False,
+                    )
 
                 reached_tail = seen_count < window_size
                 next_start = playlist_end + 1
@@ -9018,6 +9400,12 @@ def build_web_handler(
                         continue
                     source_seen.add(source_id_value)
                     source_ids.append(source_id_value)
+                if effective_scope is not None:
+                    for source_id_value in sorted(effective_scope):
+                        if source_id_value in source_seen:
+                            continue
+                        source_seen.add(source_id_value)
+                        source_ids.append(source_id_value)
 
                 videos: list[dict[str, Any]] = []
                 for row in rows:
@@ -11189,6 +11577,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Source processing order (default: config global.source_order or random).",
     )
+    sync_parser.add_argument(
+        "--execution-mode",
+        choices=["legacy", "queue"],
+        default="legacy",
+        help="Execution mode: legacy direct processing or queue producer mode.",
+    )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--skip-media", action="store_true")
     sync_parser.add_argument("--skip-subs", action="store_true")
@@ -11251,6 +11645,12 @@ def parse_args() -> argparse.Namespace:
         choices=["config", "random"],
         default=None,
         help="Source processing order (default: config global.source_order or random).",
+    )
+    backfill_parser.add_argument(
+        "--execution-mode",
+        choices=["legacy", "queue"],
+        default="legacy",
+        help="Execution mode: legacy direct processing or queue producer mode.",
     )
     backfill_parser.add_argument("--dry-run", action="store_true")
     backfill_parser.add_argument("--skip-media", action="store_true")
@@ -11928,6 +12328,47 @@ def main() -> int:
             weak_net_min_kbps=max(50.0, float(args.weak_net_min_kbps)),
             weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
         )
+        execution_mode = str(getattr(args, "execution_mode", "legacy") or "legacy").strip().lower()
+        if execution_mode == "queue":
+            if args.dry_run:
+                queue_db_path = ":memory:"
+            else:
+                ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
+                queue_db_path = str(ledger_db_path)
+
+            queue_connection = sqlite3.connect(queue_db_path, timeout=30)
+            if queue_db_path != ":memory:":
+                queue_connection.execute("PRAGMA journal_mode=WAL")
+            create_schema(queue_connection)
+            try:
+                if bool(args.skip_media):
+                    print("[sync-queue] media discovery skipped by explicit --skip-media")
+                else:
+                    for source in run_sources:
+                        try:
+                            enqueue_source_media_discovery(
+                                connection=queue_connection,
+                                source=source,
+                                dry_run=bool(args.dry_run),
+                                run_label="sync-queue",
+                                playlist_start=1,
+                                playlist_end=source.playlist_end,
+                                enforce_poll_interval=True,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[sync-queue] {source.id}: discovery failed ({exc})",
+                                file=sys.stderr,
+                            )
+            finally:
+                queue_connection.close()
+
+            if not args.skip_ledger and not args.dry_run:
+                print("[sync-queue] skip ledger rebuild (no media/subs/meta files were downloaded)")
+            elif args.dry_run and not args.skip_ledger:
+                print("dry-run: skip ledger rebuild")
+            return 0
+
         sync_connection: sqlite3.Connection | None = None
         if not args.dry_run:
             ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -11991,6 +12432,7 @@ def main() -> int:
             full_ledger=args.full_ledger,
             windows_override=args.windows,
             reset=args.reset,
+            execution_mode=str(getattr(args, "execution_mode", "legacy") or "legacy"),
         )
         return 0
 

@@ -446,6 +446,160 @@ enabled = true
         self.assertIn("--retry-sleep", command)
         self.assertNotIn("--ignore-errors", command)
 
+    def test_create_schema_includes_parallel_queue_tables(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertIn("work_items", tables)
+            self.assertIn("source_poll_state", tables)
+            self.assertIn("worker_heartbeats", tables)
+        finally:
+            connection.close()
+
+    def test_enqueue_work_item_requeue_and_keep_success(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-07T00:00:00+00:00"
+
+            action_1 = self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="media",
+                video_id="7611111111111111111",
+                now_iso=now_iso,
+                priority=10,
+            )
+            self.assertEqual(action_1, "inserted")
+
+            action_2 = self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="media",
+                video_id="7611111111111111111",
+                now_iso=now_iso,
+                priority=5,
+            )
+            self.assertEqual(action_2, "updated")
+
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status='error', next_retry_at='2026-03-08T00:00:00+00:00', last_error='x'
+                WHERE source_id='storiesofcz' AND stage='media' AND video_id='7611111111111111111'
+                """
+            )
+            action_3 = self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="media",
+                video_id="7611111111111111111",
+                now_iso="2026-03-07T01:00:00+00:00",
+                priority=8,
+            )
+            self.assertEqual(action_3, "requeued")
+
+            row = connection.execute(
+                """
+                SELECT status, next_retry_at, last_error
+                FROM work_items
+                WHERE source_id='storiesofcz' AND stage='media' AND video_id='7611111111111111111'
+                """
+            ).fetchone()
+            self.assertEqual(row[0], "queued")
+            self.assertIsNone(row[1])
+            self.assertIsNone(row[2])
+
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status='success'
+                WHERE source_id='storiesofcz' AND stage='media' AND video_id='7611111111111111111'
+                """
+            )
+            action_4 = self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="media",
+                video_id="7611111111111111111",
+                now_iso="2026-03-07T02:00:00+00:00",
+                priority=1,
+            )
+            self.assertEqual(action_4, "kept")
+        finally:
+            connection.close()
+
+    def test_enqueue_source_media_discovery_respects_poll_interval(self):
+        source_root = self.workspace_root / "storiesofcz_queue"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+media_discovery_interval_hours = 24
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+
+            with mock.patch.object(
+                self.mod,
+                "discover_playlist_window_ids",
+                return_value=["7611111111111111111", "7612222222222222222"],
+            ) as discover_mock:
+                discovered, inserted, _ = self.mod.enqueue_source_media_discovery(
+                    connection=connection,
+                    source=source,
+                    dry_run=False,
+                    run_label="sync-queue",
+                    enforce_poll_interval=True,
+                )
+            self.assertEqual(discovered, 2)
+            self.assertEqual(inserted, 2)
+            self.assertEqual(discover_mock.call_count, 1)
+
+            with mock.patch.object(
+                self.mod,
+                "discover_playlist_window_ids",
+                return_value=["7613333333333333333"],
+            ) as discover_mock_2:
+                discovered_2, inserted_2, requeued_2 = self.mod.enqueue_source_media_discovery(
+                    connection=connection,
+                    source=source,
+                    dry_run=False,
+                    run_label="sync-queue",
+                    enforce_poll_interval=True,
+                )
+            self.assertEqual(discovered_2, 0)
+            self.assertEqual(inserted_2, 0)
+            self.assertEqual(requeued_2, 0)
+            self.assertEqual(discover_mock_2.call_count, 0)
+        finally:
+            connection.close()
+
     def test_sync_source_defers_media_discovery_with_recent_attempt(self):
         source_root = self.workspace_root / "storiesofcz"
         source_root.mkdir(parents=True, exist_ok=True)
