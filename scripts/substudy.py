@@ -1124,7 +1124,11 @@ def sync_source(
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
     cookie_flags = resolve_cookie_flags(source)
-    active_urls_file = urls_file_override if urls_file_override is not None else source.urls_file
+    if urls_file_override is not None:
+        active_urls_file = urls_file_override
+    else:
+        run_token = f"{int(time.time())}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        active_urls_file = source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
     if connection is not None and not dry_run and recover_interrupted_runs:
         recovered_any = False
         for stage in ("media", "subs", "meta"):

@@ -958,6 +958,62 @@ data_dir = "{source_root}"
         finally:
             connection_check.close()
 
+    def test_sync_source_uses_run_local_urls_file_by_default(self):
+        source_root = self.workspace_root / "storiesofcz_urls_local"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+
+            written_paths: list[Path] = []
+
+            def fake_write_urls(path, urls):
+                written_paths.append(Path(path))
+
+            with mock.patch.object(self.mod, "write_urls_file", side_effect=fake_write_urls):
+                with mock.patch.object(self.mod, "run_command", return_value=0):
+                    self.mod.sync_source(
+                        source=source,
+                        dry_run=False,
+                        skip_media=True,
+                        skip_subs=True,
+                        skip_meta=False,
+                        connection=connection,
+                        metadata_candidate_ids=["7617777777777777777"],
+                        recover_interrupted_runs=False,
+                    )
+
+            self.assertEqual(len(written_paths), 1)
+            active_path = written_paths[0]
+            self.assertNotEqual(active_path, source.urls_file)
+            self.assertEqual(active_path.parent.name, "tmp")
+            self.assertTrue(active_path.name.startswith("urls."))
+            self.assertTrue(active_path.name.endswith(".txt"))
+        finally:
+            connection.close()
+
     def test_sync_source_defers_media_discovery_with_recent_attempt(self):
         source_root = self.workspace_root / "storiesofcz"
         source_root.mkdir(parents=True, exist_ok=True)

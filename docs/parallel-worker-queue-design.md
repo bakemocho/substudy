@@ -16,6 +16,7 @@
 - `queue-worker` コマンドを追加し、`work_items` の lease 取得/期限切れ回収/heartbeat/retry/dead を実装。
 - worker から `sync_source` を stage 別（`media/subs/meta`）に再利用できるようにし、候補限定実行（single video）を追加。
 - worker 実行時は source 共通 `urls.txt` を使わず、一時 `urls.*.txt` を使うようにした。
+- legacy 経路の `sync_source` でも source 共通 `urls.txt` ではなく、一時 `urls.*.txt` を使うようにした。
 - `downloads` に `work_items` の status 集計と pending 行表示を追加。
 - `queue-worker` 実行中の lease keepalive（期限延長）を追加。
 - `media` 成功時に `subs/meta` を downstream として自動 enqueue する連鎖を追加。
@@ -23,7 +24,6 @@
 ### 未着手/継続中
 
 - queue 駆動時の stage 間連鎖を `asr` まで拡張する（現状は `media -> subs/meta` まで）。
-- `urls.txt` run-local 化を legacy 経路にも広げる。
 - legacy 側の `running` 回収ロジック撤去。
 
 ## 1. 背景
