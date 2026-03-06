@@ -145,6 +145,11 @@ write_media_worker_plist() {
     <string>--max-attempts</string>
     <string>${QUEUE_WORKER_MAX_ATTEMPTS}</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>WorkingDirectory</key>
   <string>${REPO_ROOT}</string>
   <key>RunAtLoad</key>
@@ -206,6 +211,11 @@ write_pipeline_worker_plist() {
     <string>--max-attempts</string>
     <string>${QUEUE_WORKER_MAX_ATTEMPTS}</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>WorkingDirectory</key>
   <string>${REPO_ROOT}</string>
   <key>RunAtLoad</key>

@@ -235,7 +235,7 @@ if [[ "${IS_METERED_LINK}" == "1" ]]; then
 fi
 
 SYNC_PID=""
-WORKER_PIDS=()
+declare -a WORKER_PIDS=()
 
 start_worker() {
   local label="$1"
@@ -254,12 +254,14 @@ start_worker() {
 
 stop_workers() {
   local pid=""
-  for pid in "${WORKER_PIDS[@]}"; do
+  for pid in "${WORKER_PIDS[@]:-}"; do
+    [[ -n "${pid}" ]] || continue
     if kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
     fi
   done
-  for pid in "${WORKER_PIDS[@]}"; do
+  for pid in "${WORKER_PIDS[@]:-}"; do
+    [[ -n "${pid}" ]] || continue
     wait "${pid}" || true
   done
   WORKER_PIDS=()

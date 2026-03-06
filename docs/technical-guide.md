@@ -217,6 +217,7 @@ Notes:
 - `sync/backfill --execution-mode queue` use a shared producer lock (`data/locks/producer.lock`).
 - If another producer is running, new producer runs exit immediately with lock-busy error.
 - `queue-worker` has no producer lock and is safe to run multiple instances in parallel.
+- launchd worker jobs set PATH explicitly (`/opt/homebrew/bin:/usr/local/bin:...`) so `ffmpeg/ffprobe` are discoverable.
 
 Metered-link safeguards (`run_daily_sync.sh` / `run_weekly_full_sync.sh`):
 
