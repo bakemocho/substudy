@@ -90,7 +90,7 @@ DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
-DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness")
+DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
 DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS = 6.0
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
@@ -4845,11 +4845,15 @@ def enqueue_downstream_work_items(
     now_iso: str,
     base_priority: int = 100,
 ) -> tuple[int, int, int, int]:
-    if str(stage or "").strip().lower() != "media":
+    normalized_stage = str(stage or "").strip().lower()
+    if normalized_stage == "media":
+        next_stages = ["subs", "meta", "loudness"]
+        if source is not None and source.asr_enabled and bool(source.asr_command):
+            next_stages.append("asr")
+    elif normalized_stage in {"subs", "asr"}:
+        next_stages = ["translate"]
+    else:
         return (0, 0, 0, 0)
-    next_stages = ["subs", "meta", "loudness"]
-    if source is not None and source.asr_enabled and bool(source.asr_command):
-        next_stages.append("asr")
     inserted = 0
     requeued = 0
     updated = 0
@@ -4976,6 +4980,10 @@ def process_leased_work_item(
     source_by_id: dict[str, SourceConfig],
     work_item: dict[str, Any],
     worker_id: str,
+    db_path: Path,
+    translate_target_lang: str = "ja-local",
+    translate_source_track: str = "auto",
+    translate_timeout_sec: int = 60,
     dry_run: bool = False,
 ) -> tuple[bool, str | None]:
     source_id = str(work_item.get("source_id") or "")
@@ -4990,7 +4998,7 @@ def process_leased_work_item(
     if not video_id:
         return (False, "work item has empty video_id")
 
-    if stage not in {"media", "subs", "meta", "asr", "loudness"}:
+    if stage not in {"media", "subs", "meta", "asr", "loudness", "translate"}:
         return (False, f"unsupported stage: {stage}")
 
     if dry_run:
@@ -5065,7 +5073,7 @@ def process_leased_work_item(
             )
             if not asr_ok:
                 return (False, asr_error or f"asr failed ({source.id}/{video_id})")
-        else:
+        elif stage == "loudness":
             loudness_ok, loudness_error = run_loudness_for_video(
                 connection=connection,
                 source=source,
@@ -5080,6 +5088,22 @@ def process_leased_work_item(
                     False,
                     loudness_error or f"loudness failed ({source.id}/{video_id})",
                 )
+        else:
+            translate_ok, translate_error = run_translate_local_for_video(
+                connection=connection,
+                db_path=db_path,
+                source=source,
+                video_id=video_id,
+                target_lang=translate_target_lang,
+                source_track=translate_source_track,
+                timeout_sec=translate_timeout_sec,
+                dry_run=False,
+            )
+            if not translate_ok:
+                return (
+                    False,
+                    translate_error or f"translate failed ({source.id}/{video_id})",
+                )
     finally:
         if urls_temp_path.exists():
             try:
@@ -5087,7 +5111,7 @@ def process_leased_work_item(
             except OSError:
                 pass
 
-    if stage in {"asr", "loudness"}:
+    if stage in {"asr", "loudness", "translate"}:
         return (True, None)
 
     status, last_error = get_download_state_status(
@@ -5121,6 +5145,9 @@ def run_queue_worker(
     dry_run: bool = False,
     max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS,
     enqueue_downstream: bool = True,
+    translate_target_lang: str = "ja-local",
+    translate_source_track: str = "auto",
+    translate_timeout_sec: int = 60,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path), timeout=30)
@@ -5218,6 +5245,10 @@ def run_queue_worker(
                     source_by_id=source_by_id,
                     work_item=leased_item,
                     worker_id=worker_id_value,
+                    db_path=db_path,
+                    translate_target_lang=translate_target_lang,
+                    translate_source_track=translate_source_track,
+                    translate_timeout_sec=translate_timeout_sec,
                     dry_run=dry_run,
                 )
             except Exception as exc:
@@ -12809,6 +12840,102 @@ def run_translate_local(
         )
 
 
+def run_translate_local_for_video(
+    connection: sqlite3.Connection,
+    db_path: Path,
+    source: SourceConfig,
+    video_id: str,
+    target_lang: str = "ja-local",
+    source_track: str = "auto",
+    timeout_sec: int = 60,
+    dry_run: bool = False,
+) -> tuple[bool, str | None]:
+    safe_target_lang = str(target_lang or "ja-local").strip() or "ja-local"
+    safe_source_track = normalize_translation_source_track(source_track, "auto")
+    safe_timeout_sec = max(10, int(timeout_sec))
+
+    targets = collect_local_translation_targets(
+        connection=connection,
+        source_ids=[source.id],
+        target_lang=safe_target_lang,
+        source_track=safe_source_track,
+        video_ids=[video_id],
+        limit=1,
+        include_translated=False,
+        overwrite=False,
+    )
+    if not targets:
+        return (
+            False,
+            f"{source.id}/{video_id}: translate target not ready "
+            f"(source_track={safe_source_track}, target_lang={safe_target_lang})",
+        )
+
+    endpoint = os.environ.get("SUBSTUDY_LOCAL_LLM_ENDPOINT", DEFAULT_LOCAL_LLM_ENDPOINT)
+    api_key = os.environ.get("SUBSTUDY_LOCAL_LLM_API_KEY", "")
+    run_translate_local(
+        db_path=db_path,
+        source_ids=[source.id],
+        endpoint=endpoint,
+        api_key=api_key,
+        source_lang="en",
+        target_lang=safe_target_lang,
+        draft_model=DEFAULT_LOCAL_TRANSLATE_DRAFT_MODEL,
+        refine_model=DEFAULT_LOCAL_TRANSLATE_REFINE_MODEL,
+        global_model=DEFAULT_LOCAL_TRANSLATE_GLOBAL_MODEL,
+        draft_max_tokens=160,
+        refine_max_tokens=480,
+        global_max_tokens=1200,
+        temperature=0.1,
+        top_p=0.9,
+        chunk_size=12,
+        global_max_cues=240,
+        timeout_sec=safe_timeout_sec,
+        limit=1,
+        source_track=safe_source_track,
+        include_translated=False,
+        overwrite=False,
+        dry_run=bool(dry_run),
+        agent="local-llm",
+        method="multi-stage",
+        method_version="20b-draft+120b-refine+120b-global-v1",
+        quality_enforce=False,
+        quality_loop_max_rounds=DEFAULT_LOCAL_TRANSLATE_QUALITY_LOOP_MAX_ROUNDS,
+        quality_json_fragment_threshold=DEFAULT_LOCAL_TRANSLATE_QUALITY_JSON_FRAGMENT_THRESHOLD,
+        quality_english_heavy_threshold=DEFAULT_LOCAL_TRANSLATE_QUALITY_ENGLISH_HEAVY_THRESHOLD,
+        quality_unchanged_threshold=DEFAULT_LOCAL_TRANSLATE_QUALITY_UNCHANGED_THRESHOLD,
+        quality_audit_model=DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MODEL,
+        quality_repair_model=DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MODEL,
+        quality_audit_max_tokens=DEFAULT_LOCAL_TRANSLATE_QUALITY_AUDIT_MAX_TOKENS,
+        quality_repair_max_tokens=DEFAULT_LOCAL_TRANSLATE_QUALITY_REPAIR_MAX_TOKENS,
+        video_ids=[video_id],
+    )
+
+    row = connection.execute(
+        """
+        SELECT status, COALESCE(summary, '')
+        FROM translation_runs
+        WHERE source_id = ?
+          AND video_id = ?
+          AND target_lang = ?
+        ORDER BY run_id DESC
+        LIMIT 1
+        """,
+        (source.id, video_id, safe_target_lang),
+    ).fetchone()
+    if row is None:
+        return (False, f"{source.id}/{video_id}: no translation_runs row after translate-local")
+
+    status = str(row[0] or "").strip().lower()
+    summary = str(row[1] or "").strip()
+    if status == "active":
+        return (True, None)
+    return (
+        False,
+        summary or f"{source.id}/{video_id}: translate-local finished with status={status or 'unknown'}",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Substudy sync and ledger tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -12971,8 +13098,8 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         action="append",
         dest="stages",
-        choices=["media", "subs", "meta", "asr", "loudness"],
-        help="Stage filter (repeatable). Defaults to media+subs+meta+asr+loudness.",
+        choices=["media", "subs", "meta", "asr", "loudness", "translate"],
+        help="Stage filter (repeatable). Defaults to media+subs+meta+asr+loudness+translate.",
     )
     queue_worker_parser.add_argument(
         "--worker-id",
@@ -13005,7 +13132,24 @@ def parse_args() -> argparse.Namespace:
     queue_worker_parser.add_argument(
         "--no-enqueue-downstream",
         action="store_true",
-        help="Disable media->subs/meta/asr/loudness downstream work item enqueue on success.",
+        help="Disable downstream work item enqueue on success (media->subs/meta/asr/loudness, subs/asr->translate).",
+    )
+    queue_worker_parser.add_argument(
+        "--translate-target-lang",
+        default="ja-local",
+        help="Target language label for translate stage runs (default: ja-local).",
+    )
+    queue_worker_parser.add_argument(
+        "--translate-source-track",
+        choices=["subtitle", "asr", "auto"],
+        default="auto",
+        help="Source track preference for translate stage (default: auto).",
+    )
+    queue_worker_parser.add_argument(
+        "--translate-timeout-sec",
+        type=int,
+        default=60,
+        help="HTTP timeout per translate request (default: 60).",
     )
     queue_worker_parser.add_argument(
         "--once",
@@ -13751,6 +13895,9 @@ def main() -> int:
             dry_run=bool(args.dry_run),
             max_attempts=max(1, int(args.max_attempts)),
             enqueue_downstream=not bool(getattr(args, "no_enqueue_downstream", False)),
+            translate_target_lang=str(getattr(args, "translate_target_lang", "ja-local") or "ja-local"),
+            translate_source_track=str(getattr(args, "translate_source_track", "auto") or "auto"),
+            translate_timeout_sec=max(10, int(getattr(args, "translate_timeout_sec", 60))),
         )
         return 0
 
