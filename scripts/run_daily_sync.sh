@@ -60,16 +60,18 @@ NETWORK_ARGS=(
 METERED_LINK_MODE="${SUBSTUDY_METERED_LINK_MODE:-auto}"
 METERED_MIN_ARCHIVE_IDS="${SUBSTUDY_METERED_MIN_ARCHIVE_IDS:-200}"
 METERED_PLAYLIST_END="${SUBSTUDY_METERED_PLAYLIST_END:-40}"
-
-ASR_BATCH="${SUBSTUDY_ASR_BATCH:-10}"
-LOUDNESS_BATCH="${SUBSTUDY_LOUDNESS_BATCH:-80}"
-CPU_SLEEP="${SUBSTUDY_CPU_SLEEP:-20}"
-
+QUEUE_WORKER_LEASE_SEC="${SUBSTUDY_QUEUE_WORKER_LEASE_SEC:-1800}"
+QUEUE_WORKER_POLL_SEC="${SUBSTUDY_QUEUE_WORKER_POLL_SEC:-2.0}"
+QUEUE_WORKER_MAX_ATTEMPTS="${SUBSTUDY_QUEUE_WORKER_MAX_ATTEMPTS:-8}"
+MEDIA_WORKER_ENABLED="${SUBSTUDY_MEDIA_WORKER_ENABLED:-1}"
+PIPELINE_WORKER_ENABLED="${SUBSTUDY_PIPELINE_WORKER_ENABLED:-1}"
+MEDIA_WORKER_MAX_ITEMS="${SUBSTUDY_MEDIA_WORKER_MAX_ITEMS:-0}"
+PIPELINE_WORKER_MAX_ITEMS="${SUBSTUDY_PIPELINE_WORKER_MAX_ITEMS:-0}"
+QUEUE_DRAIN_TIMEOUT_SEC="${SUBSTUDY_QUEUE_DRAIN_TIMEOUT_SEC:-600}"
+QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
-TRANSLATE_BATCH="${SUBSTUDY_TRANSLATE_BATCH:-1}"
-TRANSLATE_FINAL_LIMIT="${SUBSTUDY_TRANSLATE_FINAL_LIMIT:-50}"
+TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
-MEM_SLEEP="${SUBSTUDY_MEM_SLEEP:-15}"
 while (($# > 0)); do
   case "$1" in
     --source)
@@ -232,90 +234,147 @@ if [[ "${IS_METERED_LINK}" == "1" ]]; then
   )
 fi
 
-echo "[daily] 1) sync start (network lane)"
+SYNC_PID=""
+WORKER_PIDS=()
+
+start_worker() {
+  local label="$1"
+  shift
+  run_substudy queue-worker \
+    --config "${CONFIG_PATH}" \
+    --ledger-db "${LEDGER_DB}" \
+    --lease-sec "${QUEUE_WORKER_LEASE_SEC}" \
+    --poll-sec "${QUEUE_WORKER_POLL_SEC}" \
+    --max-attempts "${QUEUE_WORKER_MAX_ATTEMPTS}" \
+    "$@" &
+  local pid=$!
+  WORKER_PIDS+=("${pid}")
+  echo "[daily] worker ${label} pid=${pid}"
+}
+
+stop_workers() {
+  local pid=""
+  for pid in "${WORKER_PIDS[@]}"; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+    fi
+  done
+  for pid in "${WORKER_PIDS[@]}"; do
+    wait "${pid}" || true
+  done
+  WORKER_PIDS=()
+}
+
+queue_pending_count() {
+  "${PYTHON_BIN}" - "${LEDGER_DB}" <<'PY'
+import datetime as dt
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+now_iso = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+try:
+    connection = sqlite3.connect(db_path, timeout=5)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+try:
+    row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM work_items
+        WHERE status IN ('queued', 'leased')
+           OR (
+             status = 'error'
+             AND next_retry_at IS NOT NULL
+             AND next_retry_at <= ?
+           )
+        """,
+        (now_iso,),
+    ).fetchone()
+    print(int(row[0] if row else 0))
+except Exception:
+    print(0)
+finally:
+    connection.close()
+PY
+}
+
+wait_for_queue_drain() {
+  local timeout_sec="$1"
+  local poll_sec="$2"
+  local deadline=$((SECONDS + timeout_sec))
+  local pending="0"
+  while ((SECONDS < deadline)); do
+    pending="$(queue_pending_count)"
+    echo "[daily] queue pending=${pending}"
+    if [[ "${pending}" == "0" ]]; then
+      return 0
+    fi
+    sleep "${poll_sec}"
+  done
+  echo "[daily] warning: queue drain timeout pending=${pending}" >&2
+  return 1
+}
+
+cleanup() {
+  if [[ -n "${SYNC_PID}" ]] && kill -0 "${SYNC_PID}" 2>/dev/null; then
+    kill "${SYNC_PID}" 2>/dev/null || true
+  fi
+  stop_workers
+  wait || true
+}
+trap cleanup INT TERM
+
+echo "[daily] 1) start queue producer (sync)"
 run_substudy sync \
+  --execution-mode queue \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" &
 SYNC_PID=$!
-echo "[daily] sync pid=${SYNC_PID}"
+echo "[daily] sync producer pid=${SYNC_PID}"
 
-cpu_lane() {
-  echo "[daily] 2-A) CPU lane start (asr/loudness)"
-  while kill -0 "${SYNC_PID}" 2>/dev/null; do
-    run_substudy asr \
-      --config "${CONFIG_PATH}" \
-      --ledger-db "${LEDGER_DB}" \
-      --max-per-source "${ASR_BATCH}" || true
-    run_substudy loudness \
-      --config "${CONFIG_PATH}" \
-      --ledger-db "${LEDGER_DB}" \
-      --limit "${LOUDNESS_BATCH}" || true
-    sleep "${CPU_SLEEP}"
-  done
-  echo "[daily] 2-A) CPU lane done"
-}
+echo "[daily] 2) start queue workers"
+if [[ "${MEDIA_WORKER_ENABLED}" != "0" ]]; then
+  start_worker "media" \
+    --stage media \
+    --max-items "${MEDIA_WORKER_MAX_ITEMS}"
+fi
+if [[ "${PIPELINE_WORKER_ENABLED}" != "0" ]]; then
+  start_worker "pipeline" \
+    --stage subs \
+    --stage meta \
+    --stage asr \
+    --stage loudness \
+    --stage translate \
+    --translate-target-lang "${TRANSLATE_TARGET_LANG}" \
+    --translate-source-track "${TRANSLATE_SOURCE_TRACK}" \
+    --translate-timeout-sec "${TRANSLATE_TIMEOUT}" \
+    --max-items "${PIPELINE_WORKER_MAX_ITEMS}"
+fi
 
-mem_lane() {
-  echo "[daily] 2-B) MEM lane start (translate-local)"
-  while kill -0 "${SYNC_PID}" 2>/dev/null; do
-    out="$(run_substudy translate-local \
-      --config "${CONFIG_PATH}" \
-      --ledger-db "${LEDGER_DB}" \
-      --target-lang "${TRANSLATE_TARGET_LANG}" \
-      --limit "${TRANSLATE_BATCH}" \
-      --timeout-sec "${TRANSLATE_TIMEOUT}" 2>&1 || true)"
-    printf '%s\n' "${out}"
-    if [[ "${out}" == *"database is locked"* ]]; then
-      sleep $((MEM_SLEEP * 3))
-    else
-      sleep "${MEM_SLEEP}"
-    fi
-  done
-  echo "[daily] 2-B) MEM lane done"
-}
-
-cleanup() {
-  for pid in "${SYNC_PID:-}" "${CPU_PID:-}" "${MEM_PID:-}"; do
-    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-      kill "${pid}" 2>/dev/null || true
-    fi
-  done
-  wait || true
-}
-trap cleanup INT TERM
-
-cpu_lane &
-CPU_PID=$!
-mem_lane &
-MEM_PID=$!
-
-echo "[daily] 3) wait sync"
+echo "[daily] 3) wait sync producer"
 wait "${SYNC_PID}"
+SYNC_PID=""
 
-echo "[daily] 4) wait workers"
-wait "${CPU_PID}" || true
-wait "${MEM_PID}" || true
-
-echo "[daily] 5) backfill after sync"
+echo "[daily] 4) run queue producer (backfill)"
 run_substudy backfill \
+  --execution-mode queue \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" || true
 
-echo "[daily] 6) final catch-up"
-run_substudy asr --config "${CONFIG_PATH}" --ledger-db "${LEDGER_DB}" || true
-run_substudy loudness --config "${CONFIG_PATH}" --ledger-db "${LEDGER_DB}" || true
-run_substudy translate-local \
-  --config "${CONFIG_PATH}" \
-  --ledger-db "${LEDGER_DB}" \
-  --target-lang "${TRANSLATE_TARGET_LANG}" \
-  --limit "${TRANSLATE_FINAL_LIMIT}" \
-  --timeout-sec "${TRANSLATE_TIMEOUT}" || true
+echo "[daily] 5) wait queue drain"
+wait_for_queue_drain "${QUEUE_DRAIN_TIMEOUT_SEC}" "${QUEUE_DRAIN_POLL_SEC}" || true
+
+echo "[daily] 6) stop workers"
+stop_workers
 
 echo "[daily] 7) ledger + downloads report"
 run_substudy ledger \
