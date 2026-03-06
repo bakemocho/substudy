@@ -63,6 +63,7 @@ CPU_SLEEP="${SUBSTUDY_CPU_SLEEP:-20}"
 
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
 TRANSLATE_BATCH="${SUBSTUDY_TRANSLATE_BATCH:-1}"
+TRANSLATE_FINAL_LIMIT="${SUBSTUDY_TRANSLATE_FINAL_LIMIT:-50}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
 MEM_SLEEP="${SUBSTUDY_MEM_SLEEP:-15}"
 while (($# > 0)); do
@@ -178,7 +179,7 @@ run_substudy translate-local \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
   --target-lang "${TRANSLATE_TARGET_LANG}" \
-  --limit 0 \
+  --limit "${TRANSLATE_FINAL_LIMIT}" \
   --timeout-sec "${TRANSLATE_TIMEOUT}" || true
 
 echo "[daily] 7) ledger + downloads report"
