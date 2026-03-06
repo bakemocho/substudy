@@ -20,11 +20,12 @@
 - `downloads` に `work_items` の status 集計と pending 行表示を追加。
 - `queue-worker` 実行中の lease keepalive（期限延長）を追加。
 - `media` 成功時に `subs/meta` を downstream として自動 enqueue する連鎖を追加。
+- legacy 側の interrupted 回収は stale run のみを対象に制限し、同時実行中 run の誤回収リスクを下げた。
 
 ### 未着手/継続中
 
 - queue 駆動時の stage 間連鎖を `asr` まで拡張する（現状は `media -> subs/meta` まで）。
-- legacy 側の `running` 回収ロジック撤去。
+- legacy 側の `running` 回収ロジックを最終的に撤去し、queue lease に統一する。
 
 ## 1. 背景
 

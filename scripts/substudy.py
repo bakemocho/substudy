@@ -91,6 +91,7 @@ DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta")
+DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS = 6.0
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
 
@@ -3965,8 +3966,12 @@ def recover_interrupted_download_runs(
     source_id: str,
     stage: str,
     finished_at: str | None = None,
+    min_age_hours: float = DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS,
 ) -> int:
     finished_value = finished_at or now_utc_iso()
+    safe_min_age_hours = max(0.0, float(min_age_hours))
+    cutoff_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=safe_min_age_hours)
+    cutoff_iso = cutoff_dt.replace(microsecond=0).isoformat()
     cursor = connection.execute(
         """
         UPDATE download_runs
@@ -3980,11 +3985,19 @@ def recover_interrupted_download_runs(
         WHERE source_id = ?
           AND stage = ?
           AND status = 'running'
+          AND (
+            ? <= 0
+            OR started_at IS NULL
+            OR started_at = ''
+            OR started_at <= ?
+          )
         """,
         (
             finished_value,
             source_id,
             stage,
+            safe_min_age_hours,
+            cutoff_iso,
         ),
     )
     return cursor.rowcount
