@@ -725,6 +725,144 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_extend_work_item_lease_updates_expiry(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="media",
+                video_id="7615555555555555555",
+                now_iso="2026-03-07T00:00:00+00:00",
+                priority=1,
+            )
+            connection.commit()
+
+            leased = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-lease",
+                stages=["media"],
+                lease_seconds=120,
+            )
+            self.assertIsNotNone(leased)
+            initial_expiry = str(leased["lease_expires_at"])
+            connection.execute(
+                "UPDATE work_items SET lease_expires_at = ? WHERE id = ?",
+                ("2026-03-07T00:01:00+00:00", int(leased["id"])),
+            )
+            connection.commit()
+
+            extended, next_expiry = self.mod.extend_work_item_lease(
+                connection=connection,
+                work_item_id=int(leased["id"]),
+                lease_token=str(leased["lease_token"]),
+                lease_seconds=600,
+            )
+            self.assertTrue(extended)
+            self.assertIsNotNone(next_expiry)
+            self.assertNotEqual(initial_expiry, str(next_expiry))
+
+            row = connection.execute(
+                "SELECT lease_expires_at FROM work_items WHERE id = ?",
+                (int(leased["id"]),),
+            ).fetchone()
+            self.assertEqual(str(row[0]), str(next_expiry))
+        finally:
+            connection.close()
+
+    def test_run_queue_worker_media_enqueues_subs_meta(self):
+        source_root = self.workspace_root / "storiesofcz_queue_worker_media"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="media",
+                video_id="7616666666666666666",
+                now_iso="2026-03-07T00:00:00+00:00",
+                priority=1,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def fake_sync_source(**kwargs):
+            connection_for_sync = kwargs["connection"]
+            target_source = kwargs["source"]
+            target_video_id = str(kwargs["media_candidate_ids"][0])
+            self.mod.upsert_download_state(
+                connection=connection_for_sync,
+                source_id=target_source.id,
+                stage="media",
+                video_id=target_video_id,
+                status="success",
+                run_id=None,
+                attempt_at="2026-03-07T00:05:00+00:00",
+                url=f"https://example.com/{target_video_id}",
+                last_error=None,
+                retry_count=0,
+                next_retry_at=None,
+            )
+            connection_for_sync.commit()
+
+        with mock.patch.object(self.mod, "sync_source", side_effect=fake_sync_source):
+            self.mod.run_queue_worker(
+                sources=[source],
+                db_path=self.db_path,
+                stages=["media"],
+                worker_id="worker-downstream",
+                lease_seconds=600,
+                poll_interval_sec=0.2,
+                max_items=1,
+                once=False,
+                dry_run=False,
+                max_attempts=3,
+                enqueue_downstream=True,
+            )
+
+        connection_check = sqlite3.connect(str(self.db_path))
+        try:
+            rows = connection_check.execute(
+                """
+                SELECT stage, status
+                FROM work_items
+                WHERE source_id = ? AND video_id = ?
+                ORDER BY stage ASC
+                """,
+                (source.id, "7616666666666666666"),
+            ).fetchall()
+            stage_status = {str(stage): str(status) for stage, status in rows}
+            self.assertEqual(stage_status.get("media"), "success")
+            self.assertEqual(stage_status.get("subs"), "queued")
+            self.assertEqual(stage_status.get("meta"), "queued")
+        finally:
+            connection_check.close()
+
     def test_run_queue_worker_processes_meta_item(self):
         source_root = self.workspace_root / "storiesofcz_queue_worker"
         source_root.mkdir(parents=True, exist_ok=True)

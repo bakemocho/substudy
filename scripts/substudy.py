@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zlib
@@ -4627,6 +4628,82 @@ def requeue_expired_work_item_leases(
     return int(updated or 0)
 
 
+def extend_work_item_lease(
+    connection: sqlite3.Connection,
+    work_item_id: int,
+    lease_token: str,
+    lease_seconds: int = DEFAULT_QUEUE_LEASE_SEC,
+    now_dt: dt.datetime | None = None,
+) -> tuple[bool, str | None]:
+    now_value = now_dt or dt.datetime.now(dt.timezone.utc)
+    now_iso = now_value.replace(microsecond=0).isoformat()
+    next_lease_expires_at = compute_lease_expires_at_iso(
+        lease_seconds=lease_seconds,
+        from_dt=now_value,
+    )
+    updated = connection.execute(
+        """
+        UPDATE work_items
+        SET lease_expires_at = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND status = 'leased'
+          AND lease_token = ?
+        """,
+        (
+            next_lease_expires_at,
+            now_iso,
+            int(work_item_id),
+            lease_token,
+        ),
+    ).rowcount
+    connection.commit()
+    return (updated == 1, next_lease_expires_at if updated == 1 else None)
+
+
+def lease_keepalive_loop(
+    db_path: Path,
+    work_item_id: int,
+    lease_token: str,
+    lease_seconds: int,
+    poll_interval_sec: float,
+    stop_event: threading.Event,
+    worker_id: str,
+) -> None:
+    safe_interval_sec = max(5.0, float(poll_interval_sec))
+    while not stop_event.wait(safe_interval_sec):
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(str(db_path), timeout=30)
+            connection.execute("PRAGMA journal_mode=WAL")
+            extended, next_expires_at = extend_work_item_lease(
+                connection=connection,
+                work_item_id=work_item_id,
+                lease_token=lease_token,
+                lease_seconds=lease_seconds,
+            )
+            if not extended:
+                print(
+                    f"[queue-worker] lease keepalive stopped worker_id={worker_id} "
+                    f"id={work_item_id} (lease lost)",
+                    file=sys.stderr,
+                )
+                return
+            print(
+                f"[queue-worker] lease extended worker_id={worker_id} "
+                f"id={work_item_id} next_expires_at={next_expires_at}"
+            )
+        except Exception as exc:
+            print(
+                f"[queue-worker] lease keepalive warning worker_id={worker_id} "
+                f"id={work_item_id} ({exc})",
+                file=sys.stderr,
+            )
+        finally:
+            if connection is not None:
+                connection.close()
+
+
 def lease_next_work_item(
     connection: sqlite3.Connection,
     worker_id: str,
@@ -4740,6 +4817,40 @@ def complete_work_item_success(
     ).rowcount
     connection.commit()
     return updated == 1
+
+
+def enqueue_downstream_work_items(
+    connection: sqlite3.Connection,
+    source_id: str,
+    stage: str,
+    video_id: str,
+    now_iso: str,
+    base_priority: int = 100,
+) -> tuple[int, int, int, int]:
+    if str(stage or "").strip().lower() != "media":
+        return (0, 0, 0, 0)
+    inserted = 0
+    requeued = 0
+    updated = 0
+    kept = 0
+    for offset, next_stage in enumerate(("subs", "meta"), start=1):
+        action = enqueue_work_item(
+            connection=connection,
+            source_id=source_id,
+            stage=next_stage,
+            video_id=video_id,
+            now_iso=now_iso,
+            priority=max(0, int(base_priority) + offset),
+        )
+        if action == "inserted":
+            inserted += 1
+        elif action == "requeued":
+            requeued += 1
+        elif action == "updated":
+            updated += 1
+        else:
+            kept += 1
+    return (inserted, requeued, updated, kept)
 
 
 def fail_work_item_lease(
@@ -4959,6 +5070,7 @@ def run_queue_worker(
     once: bool = False,
     dry_run: bool = False,
     max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS,
+    enqueue_downstream: bool = True,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path), timeout=30)
@@ -5033,6 +5145,24 @@ def run_queue_worker(
 
             ok = False
             failure_reason: str | None = None
+            keepalive_stop_event = threading.Event()
+            keepalive_thread: threading.Thread | None = None
+            if not dry_run:
+                keepalive_interval_sec = max(10.0, min(float(safe_lease_seconds) / 3.0, 120.0))
+                keepalive_thread = threading.Thread(
+                    target=lease_keepalive_loop,
+                    kwargs={
+                        "db_path": db_path,
+                        "work_item_id": item_id,
+                        "lease_token": lease_token,
+                        "lease_seconds": safe_lease_seconds,
+                        "poll_interval_sec": keepalive_interval_sec,
+                        "stop_event": keepalive_stop_event,
+                        "worker_id": worker_id_value,
+                    },
+                    daemon=True,
+                )
+                keepalive_thread.start()
             try:
                 ok, failure_reason = process_leased_work_item(
                     connection=connection,
@@ -5044,6 +5174,10 @@ def run_queue_worker(
             except Exception as exc:
                 ok = False
                 failure_reason = f"work item execution exception: {exc}"
+            finally:
+                keepalive_stop_event.set()
+                if keepalive_thread is not None:
+                    keepalive_thread.join(timeout=2.0)
 
             if ok:
                 if complete_work_item_success(
@@ -5051,10 +5185,33 @@ def run_queue_worker(
                     work_item_id=item_id,
                     lease_token=lease_token,
                 ):
+                    downstream_summary = ""
+                    if enqueue_downstream:
+                        (
+                            ds_inserted,
+                            ds_requeued,
+                            ds_updated,
+                            ds_kept,
+                        ) = enqueue_downstream_work_items(
+                            connection=connection,
+                            source_id=source_id,
+                            stage=stage,
+                            video_id=video_id,
+                            now_iso=now_utc_iso(),
+                            base_priority=int(leased_item.get("priority") or 100),
+                        )
+                        connection.commit()
+                        if ds_inserted or ds_requeued or ds_updated:
+                            downstream_summary = (
+                                " downstream="
+                                f"(inserted={ds_inserted}, requeued={ds_requeued}, "
+                                f"updated={ds_updated}, kept={ds_kept})"
+                            )
                     success_count += 1
                     print(
                         f"[queue-worker] success id={item_id} "
                         f"source={source_id} stage={stage} video_id={video_id}"
+                        f"{downstream_summary}"
                     )
                 else:
                     failure_count += 1
@@ -12397,6 +12554,11 @@ def parse_args() -> argparse.Namespace:
         help=f"Mark item dead after this many failed attempts (default: {DEFAULT_QUEUE_MAX_ATTEMPTS}).",
     )
     queue_worker_parser.add_argument(
+        "--no-enqueue-downstream",
+        action="store_true",
+        help="Disable media->subs/meta downstream work item enqueue on success.",
+    )
+    queue_worker_parser.add_argument(
         "--once",
         action="store_true",
         help="Try to process at most one currently due item, then exit.",
@@ -13139,6 +13301,7 @@ def main() -> int:
             once=bool(args.once),
             dry_run=bool(args.dry_run),
             max_attempts=max(1, int(args.max_attempts)),
+            enqueue_downstream=not bool(getattr(args, "no_enqueue_downstream", False)),
         )
         return 0
 
