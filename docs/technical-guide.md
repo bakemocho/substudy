@@ -66,8 +66,8 @@ python3 scripts/substudy.py web --host 127.0.0.1 --port 8890
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
-- `scripts/run_daily_sync.sh`: daily 3-lane wrapper (network: `sync` + `backfill`, CPU: `asr`/`loudness`, memory: `translate-local`)
-- `scripts/run_weekly_full_sync.sh`: weekly 3-lane wrapper (includes `brew upgrade yt-dlp`, then network/CPU/memory lanes + final full `ledger`)
+- `scripts/run_daily_sync.sh`: daily queue wrapper (`sync/backfill --execution-mode queue` producer + `queue-worker` lanes + incremental ledger)
+- `scripts/run_weekly_full_sync.sh`: weekly queue wrapper (includes `brew upgrade yt-dlp`, queue producer/worker flow, full ledger)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
 - `docs/local-translation-quality-lab.md`: ローカル翻訳品質の仮説検証ログ
@@ -157,10 +157,12 @@ Operator note:
 
 ## Daily and weekly automation (macOS)
 
-Install both jobs with defaults:
+Install launchd jobs with defaults:
 
-- daily: `06:30`
-- weekly full: `Sunday 07:00` (`Weekday=0`) + `yt-dlp` Homebrew upgrade
+- producer daily: `06:30`
+- producer weekly full: `Sunday 07:00` (`Weekday=0`) + `yt-dlp` Homebrew upgrade
+- worker media: every `300s` (`StartInterval`)
+- worker pipeline: every `300s` (`StartInterval`)
 
 ```bash
 ./scripts/install_launchd.sh
@@ -178,11 +180,43 @@ Example:
 ./scripts/install_launchd.sh 6 30 0 7 0 com.substudy
 ```
 
+Optional install-time overrides:
+
+- Disable worker jobs:
+  - `SUBSTUDY_ENABLE_WORKER_JOBS=0 ./scripts/install_launchd.sh`
+- Change worker intervals:
+  - `SUBSTUDY_MEDIA_WORKER_INTERVAL_SEC=180`
+  - `SUBSTUDY_PIPELINE_WORKER_INTERVAL_SEC=120`
+- Change queue-worker lease/poll:
+  - `SUBSTUDY_QUEUE_WORKER_LEASE_SEC`
+  - `SUBSTUDY_QUEUE_WORKER_POLL_SEC`
+  - `SUBSTUDY_QUEUE_WORKER_MAX_ATTEMPTS`
+
 Check jobs:
 
 ```bash
 launchctl list | rg substudy
 ```
+
+Manual producer/worker operation:
+
+```bash
+# producer: discovery + enqueue only (lock protected)
+python3 scripts/substudy.py sync --config config/sources.toml --execution-mode queue --skip-ledger
+python3 scripts/substudy.py backfill --config config/sources.toml --execution-mode queue --skip-ledger
+
+# worker: media lane
+python3 scripts/substudy.py queue-worker --config config/sources.toml --stage media
+
+# worker: pipeline lane
+python3 scripts/substudy.py queue-worker --config config/sources.toml --stage subs --stage meta --stage asr --stage loudness --stage translate --translate-target-lang ja-local --translate-source-track auto
+```
+
+Notes:
+
+- `sync/backfill --execution-mode queue` use a shared producer lock (`data/locks/producer.lock`).
+- If another producer is running, new producer runs exit immediately with lock-busy error.
+- `queue-worker` has no producer lock and is safe to run multiple instances in parallel.
 
 Metered-link safeguards (`run_daily_sync.sh` / `run_weekly_full_sync.sh`):
 
