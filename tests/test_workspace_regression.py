@@ -1578,6 +1578,116 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_sync_source_metered_updates_only_skips_unseeded_media(self):
+        source_root = self.workspace_root / "storiesofcz_metered_skip"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            with mock.patch.object(self.mod, "run_command") as run_command_mock:
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=False,
+                    skip_subs=True,
+                    skip_meta=True,
+                    connection=connection,
+                    metered_media_mode="updates-only",
+                    metered_min_archive_ids=1,
+                    metered_playlist_end=5,
+                )
+            run_command_mock.assert_not_called()
+
+            media_run = connection.execute(
+                """
+                SELECT run_id
+                FROM download_runs
+                WHERE source_id = ? AND stage = 'media'
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNone(media_run)
+        finally:
+            connection.close()
+
+    def test_sync_source_metered_updates_only_limits_discovery_command(self):
+        source_root = self.workspace_root / "storiesofcz_metered_limit"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+        source.media_archive.write_text(
+            "tiktok 7611234567890123456\n",
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            with mock.patch.object(self.mod, "run_command", return_value=0) as run_command_mock:
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=False,
+                    skip_subs=True,
+                    skip_meta=True,
+                    connection=connection,
+                    metered_media_mode="updates-only",
+                    metered_min_archive_ids=1,
+                    metered_playlist_end=5,
+                )
+
+            self.assertGreaterEqual(run_command_mock.call_count, 1)
+            media_command = list(run_command_mock.call_args_list[0].args[0])
+            self.assertIn("--break-on-existing", media_command)
+            self.assertIn("--playlist-end", media_command)
+            playlist_end_index = media_command.index("--playlist-end")
+            self.assertEqual(str(media_command[playlist_end_index + 1]), "5")
+        finally:
+            connection.close()
+
     def test_build_media_audio_fallback_format_selector_prefers_download_then_audio(self):
         selector = self.mod.build_media_audio_fallback_format_selector("bv*+ba/best")
         self.assertEqual(selector, "download/best*[acodec!=none]/bv*+ba/best")

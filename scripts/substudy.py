@@ -87,6 +87,9 @@ DEFAULT_NETWORK_PROBE_TIMEOUT_SEC = 8
 DEFAULT_NETWORK_PROBE_BYTES = 131072
 DEFAULT_WEAK_NET_MIN_KBPS = 900.0
 DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
+DEFAULT_METERED_MEDIA_MODE = "off"
+DEFAULT_METERED_MIN_ARCHIVE_IDS = 200
+DEFAULT_METERED_PLAYLIST_END = 40
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
@@ -963,6 +966,50 @@ def resolve_skip_media_with_network_profile(
     return (False, decision)
 
 
+def normalize_metered_media_mode(raw_mode: str | None, fallback: str = DEFAULT_METERED_MEDIA_MODE) -> str:
+    mode = str(raw_mode or "").strip().lower()
+    if mode in {"off", "updates-only"}:
+        return mode
+    return str(fallback or DEFAULT_METERED_MEDIA_MODE).strip().lower() or DEFAULT_METERED_MEDIA_MODE
+
+
+def resolve_metered_media_policy(
+    source_id: str,
+    mode: str,
+    media_archive_count: int,
+    configured_playlist_end: int | None,
+    min_archive_ids: int,
+    metered_playlist_end: int,
+) -> tuple[bool, bool, int | None, str]:
+    normalized_mode = normalize_metered_media_mode(mode, DEFAULT_METERED_MEDIA_MODE)
+    safe_archive_count = max(0, int(media_archive_count))
+    safe_min_archive_ids = max(0, int(min_archive_ids))
+    safe_metered_playlist_end = max(1, int(metered_playlist_end))
+    effective_playlist_end = configured_playlist_end
+
+    if normalized_mode != "updates-only":
+        return (False, False, effective_playlist_end, "metered mode off")
+
+    if safe_archive_count < safe_min_archive_ids:
+        return (
+            True,
+            False,
+            effective_playlist_end,
+            f"{source_id}: skip media (archive_count={safe_archive_count} < min={safe_min_archive_ids})",
+        )
+
+    if effective_playlist_end is None or effective_playlist_end > safe_metered_playlist_end:
+        effective_playlist_end = safe_metered_playlist_end
+
+    return (
+        False,
+        True,
+        effective_playlist_end,
+        f"{source_id}: updates-only discovery (archive_count={safe_archive_count}, "
+        f"playlist_end={effective_playlist_end}, break_on_existing=on)",
+    )
+
+
 def read_archive_ids(archive_path: Path) -> list[str]:
     if not archive_path.exists():
         return []
@@ -1096,6 +1143,9 @@ def sync_source(
     metadata_candidate_ids: list[str] | None = None,
     run_label: str = "sync",
     respect_media_discovery_interval: bool = True,
+    metered_media_mode: str = DEFAULT_METERED_MEDIA_MODE,
+    metered_min_archive_ids: int = DEFAULT_METERED_MIN_ARCHIVE_IDS,
+    metered_playlist_end: int = DEFAULT_METERED_PLAYLIST_END,
     urls_file_override: Path | None = None,
     strict_candidate_scope: bool = False,
 ) -> None:
@@ -1109,9 +1159,32 @@ def sync_source(
 
     bootstrap_missing_archives(source, dry_run=dry_run)
 
+    media_before_ids = set(read_archive_ids(source.media_archive))
+    configured_playlist_end = playlist_end if playlist_end is not None else source.playlist_end
+    metered_skip_media = False
+    metered_force_break_on_existing = False
+    metered_reason = ""
+    effective_playlist_end = configured_playlist_end
+    if media_candidate_ids is None and playlist_start is None:
+        (
+            metered_skip_media,
+            metered_force_break_on_existing,
+            effective_playlist_end,
+            metered_reason,
+        ) = resolve_metered_media_policy(
+            source_id=source.id,
+            mode=metered_media_mode,
+            media_archive_count=len(media_before_ids),
+            configured_playlist_end=configured_playlist_end,
+            min_archive_ids=max(0, int(metered_min_archive_ids)),
+            metered_playlist_end=max(1, int(metered_playlist_end)),
+        )
+        if normalize_metered_media_mode(metered_media_mode, DEFAULT_METERED_MEDIA_MODE) == "updates-only":
+            print(f"[media] {metered_reason}")
+
     retry_flags = build_ytdlp_retry_flags(source, include_ignore_errors=True)
     discovery_flags: list[str] = []
-    if source.break_on_existing:
+    if source.break_on_existing or metered_force_break_on_existing:
         discovery_flags.append("--break-on-existing")
     if source.break_per_input:
         discovery_flags.append("--break-per-input")
@@ -1119,7 +1192,6 @@ def sync_source(
         discovery_flags.append("--lazy-playlist")
     if playlist_start is not None:
         discovery_flags.extend(["--playlist-start", str(playlist_start)])
-    effective_playlist_end = playlist_end if playlist_end is not None else source.playlist_end
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
     cookie_flags = resolve_cookie_flags(source)
@@ -1135,7 +1207,6 @@ def sync_source(
         except ValueError:
             return None
 
-    media_before_ids = set(read_archive_ids(source.media_archive))
     new_media_ids: list[str] = []
     normalized_media_candidate_ids: list[str] = []
     if media_candidate_ids is not None:
@@ -1147,7 +1218,7 @@ def sync_source(
             seen_media_candidate_ids.add(video_id_value)
             normalized_media_candidate_ids.append(video_id_value)
 
-    if not skip_media:
+    if not skip_media and not metered_skip_media:
         media_discovery_state_key = f"media_discovery_last_attempt:{source.id}"
         run_media_discovery = media_candidate_ids is None
         media_discovery_remaining_hours: float | None = None
@@ -1841,7 +1912,12 @@ def sync_source(
             f"(retry={len(retry_media_ids)}, bootstrap={len(bootstrap_no_audio_media_ids)})"
         )
     else:
-        print("skip media")
+        if skip_media:
+            print("skip media")
+        else:
+            print(
+                f"skip media (metered updates-only; archive_count<{max(0, int(metered_min_archive_ids))})"
+            )
 
     subs_before_ids = set(read_archive_ids(source.subs_archive))
     if not skip_subs:
@@ -6711,8 +6787,20 @@ def run_backfill(
     windows_override: int | None = None,
     reset: bool = False,
     execution_mode: str = "legacy",
+    metered_media_mode: str = DEFAULT_METERED_MEDIA_MODE,
+    metered_min_archive_ids: int = DEFAULT_METERED_MIN_ARCHIVE_IDS,
+    metered_playlist_end: int = DEFAULT_METERED_PLAYLIST_END,
 ) -> None:
     normalized_execution_mode = "queue" if str(execution_mode).strip().lower() == "queue" else "legacy"
+    normalized_metered_mode = normalize_metered_media_mode(
+        metered_media_mode,
+        DEFAULT_METERED_MEDIA_MODE,
+    )
+    if normalized_metered_mode == "updates-only":
+        print(
+            "[backfill] metered updates-only mode: skip historical backfill windows"
+        )
+        return
     db_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -6851,6 +6939,9 @@ def run_backfill(
                         metadata_candidate_ids=window_ids,
                         run_label="backfill",
                         respect_media_discovery_interval=False,
+                        metered_media_mode=normalized_metered_mode,
+                        metered_min_archive_ids=metered_min_archive_ids,
+                        metered_playlist_end=metered_playlist_end,
                     )
 
                 reached_tail = seen_count < window_size
@@ -12940,6 +13031,33 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_WEAK_NET_MAX_RTT_MS,
         help=f"Auto profile threshold: above this RTT is weak (default: {DEFAULT_WEAK_NET_MAX_RTT_MS})",
     )
+    sync_parser.add_argument(
+        "--metered-media-mode",
+        choices=["off", "updates-only"],
+        default=DEFAULT_METERED_MEDIA_MODE,
+        help=(
+            "Media policy for metered links: "
+            "off=normal behavior, updates-only=download only recent updates for already-seeded sources."
+        ),
+    )
+    sync_parser.add_argument(
+        "--metered-min-archive-ids",
+        type=int,
+        default=DEFAULT_METERED_MIN_ARCHIVE_IDS,
+        help=(
+            "Minimum media archive IDs required to treat a source as seeded in updates-only mode "
+            f"(default: {DEFAULT_METERED_MIN_ARCHIVE_IDS})."
+        ),
+    )
+    sync_parser.add_argument(
+        "--metered-playlist-end",
+        type=int,
+        default=DEFAULT_METERED_PLAYLIST_END,
+        help=(
+            "Max playlist_end used in updates-only mode to cap discovery scan range "
+            f"(default: {DEFAULT_METERED_PLAYLIST_END})."
+        ),
+    )
     sync_parser.add_argument("--skip-ledger", action="store_true")
     sync_parser.add_argument(
         "--full-ledger",
@@ -13008,6 +13126,33 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_WEAK_NET_MAX_RTT_MS,
         help=f"Auto profile threshold: above this RTT is weak (default: {DEFAULT_WEAK_NET_MAX_RTT_MS})",
+    )
+    backfill_parser.add_argument(
+        "--metered-media-mode",
+        choices=["off", "updates-only"],
+        default=DEFAULT_METERED_MEDIA_MODE,
+        help=(
+            "Media policy for metered links. "
+            "updates-only disables historical backfill windows."
+        ),
+    )
+    backfill_parser.add_argument(
+        "--metered-min-archive-ids",
+        type=int,
+        default=DEFAULT_METERED_MIN_ARCHIVE_IDS,
+        help=(
+            "Reserved for sync compatibility in updates-only mode "
+            f"(default: {DEFAULT_METERED_MIN_ARCHIVE_IDS})."
+        ),
+    )
+    backfill_parser.add_argument(
+        "--metered-playlist-end",
+        type=int,
+        default=DEFAULT_METERED_PLAYLIST_END,
+        help=(
+            "Reserved for sync compatibility in updates-only mode "
+            f"(default: {DEFAULT_METERED_PLAYLIST_END})."
+        ),
     )
     backfill_parser.add_argument("--skip-ledger", action="store_true")
     backfill_parser.add_argument(
@@ -13714,6 +13859,12 @@ def main() -> int:
             weak_net_min_kbps=max(50.0, float(args.weak_net_min_kbps)),
             weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
         )
+        metered_media_mode = normalize_metered_media_mode(
+            getattr(args, "metered_media_mode", DEFAULT_METERED_MEDIA_MODE),
+            DEFAULT_METERED_MEDIA_MODE,
+        )
+        metered_min_archive_ids = max(0, int(getattr(args, "metered_min_archive_ids", DEFAULT_METERED_MIN_ARCHIVE_IDS)))
+        metered_playlist_end = max(1, int(getattr(args, "metered_playlist_end", DEFAULT_METERED_PLAYLIST_END)))
         execution_mode = str(getattr(args, "execution_mode", "legacy") or "legacy").strip().lower()
         if execution_mode == "queue":
             if args.dry_run:
@@ -13731,6 +13882,25 @@ def main() -> int:
                     print("[sync-queue] media discovery skipped by explicit --skip-media")
                 else:
                     for source in run_sources:
+                        source_playlist_end = source.playlist_end
+                        if metered_media_mode == "updates-only":
+                            media_archive_count = len(read_archive_ids(source.media_archive))
+                            (
+                                skip_by_metered,
+                                _force_break_on_existing,
+                                source_playlist_end,
+                                metered_reason,
+                            ) = resolve_metered_media_policy(
+                                source_id=source.id,
+                                mode=metered_media_mode,
+                                media_archive_count=media_archive_count,
+                                configured_playlist_end=source.playlist_end,
+                                min_archive_ids=metered_min_archive_ids,
+                                metered_playlist_end=metered_playlist_end,
+                            )
+                            print(f"[sync-queue] {metered_reason}")
+                            if skip_by_metered:
+                                continue
                         try:
                             enqueue_source_media_discovery(
                                 connection=queue_connection,
@@ -13738,7 +13908,7 @@ def main() -> int:
                                 dry_run=bool(args.dry_run),
                                 run_label="sync-queue",
                                 playlist_start=1,
-                                playlist_end=source.playlist_end,
+                                playlist_end=source_playlist_end,
                                 enforce_poll_interval=True,
                             )
                         except Exception as exc:
@@ -13770,6 +13940,9 @@ def main() -> int:
                     skip_subs=args.skip_subs,
                     skip_meta=args.skip_meta,
                     connection=sync_connection,
+                    metered_media_mode=metered_media_mode,
+                    metered_min_archive_ids=metered_min_archive_ids,
+                    metered_playlist_end=metered_playlist_end,
                 )
         finally:
             if sync_connection is not None:
@@ -13806,6 +13979,12 @@ def main() -> int:
             weak_net_min_kbps=max(50.0, float(args.weak_net_min_kbps)),
             weak_net_max_rtt_ms=max(50.0, float(args.weak_net_max_rtt_ms)),
         )
+        metered_media_mode = normalize_metered_media_mode(
+            getattr(args, "metered_media_mode", DEFAULT_METERED_MEDIA_MODE),
+            DEFAULT_METERED_MEDIA_MODE,
+        )
+        metered_min_archive_ids = max(0, int(getattr(args, "metered_min_archive_ids", DEFAULT_METERED_MIN_ARCHIVE_IDS)))
+        metered_playlist_end = max(1, int(getattr(args, "metered_playlist_end", DEFAULT_METERED_PLAYLIST_END)))
         run_backfill(
             sources=run_sources,
             db_path=ledger_db_path,
@@ -13819,6 +13998,9 @@ def main() -> int:
             windows_override=args.windows,
             reset=args.reset,
             execution_mode=str(getattr(args, "execution_mode", "legacy") or "legacy"),
+            metered_media_mode=metered_media_mode,
+            metered_min_archive_ids=metered_min_archive_ids,
+            metered_playlist_end=metered_playlist_end,
         )
         return 0
 

@@ -184,6 +184,22 @@ Check jobs:
 launchctl list | rg substudy
 ```
 
+Metered-link safeguards (`run_daily_sync.sh` / `run_weekly_full_sync.sh`):
+
+- The scripts auto-detect likely metered links (e.g. iPhone USB, Bluetooth PAN, hotspot gateway `172.20.10.1`, hotspot-like SSID) and pass:
+  - Also treats `ipconfig getsummary <iface>` with `IsExpensive : TRUE` as metered.
+  - `--metered-media-mode updates-only`
+  - `--metered-min-archive-ids <N>`
+  - `--metered-playlist-end <N>`
+- In `updates-only` mode:
+  - sources with too few archived media IDs are skipped for media download
+  - seeded sources download only recent update range (forced `break-on-existing` + capped playlist window)
+  - `backfill` historical windows are skipped entirely
+- Overrides:
+  - `SUBSTUDY_METERED_LINK_MODE=auto|on|off`
+  - `SUBSTUDY_METERED_MIN_ARCHIVE_IDS` (default: `200`)
+  - `SUBSTUDY_METERED_PLAYLIST_END` (default: `40`)
+
 ## Dictionary source prep (EIJIRO)
 
 Use EIJIRO as source data with `cp932` decoding, then keep a UTF-8 normalized copy for editor-friendly access.

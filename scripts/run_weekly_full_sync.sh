@@ -56,6 +56,10 @@ NETWORK_ARGS=(
   --weak-net-max-rtt-ms "${WEAK_NET_MAX_RTT_MS}"
 )
 
+METERED_LINK_MODE="${SUBSTUDY_METERED_LINK_MODE:-auto}"
+METERED_MIN_ARCHIVE_IDS="${SUBSTUDY_METERED_MIN_ARCHIVE_IDS:-200}"
+METERED_PLAYLIST_END="${SUBSTUDY_METERED_PLAYLIST_END:-40}"
+
 ASR_BATCH="${SUBSTUDY_ASR_BATCH:-10}"
 LOUDNESS_BATCH="${SUBSTUDY_LOUDNESS_BATCH:-80}"
 CPU_SLEEP="${SUBSTUDY_CPU_SLEEP:-20}"
@@ -97,7 +101,135 @@ run_substudy() {
   "${cmd[@]}"
 }
 
+route_default_field() {
+  local field="$1"
+  route -n get default 2>/dev/null | awk -v key="${field}" '$1 == key {print $2; exit}'
+}
+
+detect_hardware_port_for_device() {
+  local device="$1"
+  [[ -n "${device}" ]] || return 0
+  networksetup -listallhardwareports 2>/dev/null | awk -v target="${device}" '
+    /^Hardware Port: / {port = substr($0, 16)}
+    /^Device: / {
+      dev = substr($0, 9)
+      if (dev == target) {
+        print port
+        exit
+      }
+    }
+  '
+}
+
+detect_wifi_ssid_for_device() {
+  local device="$1"
+  local output=""
+  [[ -n "${device}" ]] || return 0
+  output="$(networksetup -getairportnetwork "${device}" 2>/dev/null || true)"
+  if [[ "${output}" == Current\ Wi-Fi\ Network:* ]]; then
+    printf '%s\n' "${output#Current Wi-Fi Network: }"
+    return 0
+  fi
+  printf '%s\n' ""
+}
+
+detect_interface_is_expensive() {
+  local device="$1"
+  local summary=""
+  [[ -n "${device}" ]] || {
+    printf '%s\n' "0"
+    return 0
+  }
+  summary="$(ipconfig getsummary "${device}" 2>/dev/null || true)"
+  if [[ "${summary}" == *"IsExpensive : TRUE"* ]]; then
+    printf '%s\n' "1"
+    return 0
+  fi
+  printf '%s\n' "0"
+}
+
+detect_metered_link() {
+  local mode="$1"
+  local default_if=""
+  local gateway=""
+  local hw_port=""
+  local ssid=""
+  local ssid_lower=""
+  local is_expensive="0"
+  local is_metered="0"
+  local reason="auto: non-metered"
+
+  default_if="$(route_default_field "interface:")"
+  gateway="$(route_default_field "gateway:")"
+  hw_port="$(detect_hardware_port_for_device "${default_if}")"
+  ssid="$(detect_wifi_ssid_for_device "${default_if}")"
+  ssid_lower="$(printf '%s' "${ssid}" | tr '[:upper:]' '[:lower:]')"
+  is_expensive="$(detect_interface_is_expensive "${default_if}")"
+
+  case "${mode}" in
+    on)
+      is_metered="1"
+      reason="manual mode=on"
+      ;;
+    off)
+      is_metered="0"
+      reason="manual mode=off"
+      ;;
+    *)
+      if [[ "${default_if}" == pdp_ip* ]]; then
+        is_metered="1"
+        reason="auto: cellular interface (${default_if})"
+      elif [[ "${hw_port}" == "iPhone USB" ]]; then
+        is_metered="1"
+        reason="auto: iPhone USB tethering"
+      elif [[ "${hw_port}" == "Bluetooth PAN" ]]; then
+        is_metered="1"
+        reason="auto: Bluetooth PAN tethering"
+      elif [[ "${gateway}" == "172.20.10.1" ]]; then
+        is_metered="1"
+        reason="auto: hotspot gateway (${gateway})"
+      elif [[ "${is_expensive}" == "1" ]]; then
+        is_metered="1"
+        reason="auto: interface marked expensive (${default_if})"
+      elif [[ -n "${ssid_lower}" ]] && (
+        [[ "${ssid_lower}" == *"iphone"* ]] ||
+        [[ "${ssid_lower}" == *"android"* ]] ||
+        [[ "${ssid_lower}" == *"pixel"* ]] ||
+        [[ "${ssid_lower}" == *"galaxy"* ]] ||
+        [[ "${ssid_lower}" == *"xperia"* ]] ||
+        [[ "${ssid_lower}" == *"hotspot"* ]] ||
+        [[ "${ssid_lower}" == *"tether"* ]]
+      ); then
+        is_metered="1"
+        reason="auto: hotspot-like ssid (${ssid})"
+      fi
+      ;;
+  esac
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "${is_metered}" \
+    "${reason}" \
+    "${default_if}" \
+    "${gateway}" \
+    "${hw_port}" \
+    "${ssid}" \
+    "${is_expensive}"
+}
+
 echo "[weekly] start: $(date '+%Y-%m-%d %H:%M:%S')"
+metered_info="$(detect_metered_link "${METERED_LINK_MODE}")"
+IFS='|' read -r IS_METERED_LINK METERED_REASON DEFAULT_IFACE DEFAULT_GATEWAY DEFAULT_HW_PORT DEFAULT_WIFI_SSID DEFAULT_IS_EXPENSIVE <<< "${metered_info}"
+echo "[weekly] link mode=${METERED_LINK_MODE} metered=${IS_METERED_LINK} reason=${METERED_REASON}"
+echo "[weekly] route iface=${DEFAULT_IFACE:-unknown} gateway=${DEFAULT_GATEWAY:-unknown} hw_port=${DEFAULT_HW_PORT:-unknown} ssid=${DEFAULT_WIFI_SSID:-unknown} expensive=${DEFAULT_IS_EXPENSIVE:-0}"
+
+METERED_MEDIA_ARGS=(--metered-media-mode off)
+if [[ "${IS_METERED_LINK}" == "1" ]]; then
+  METERED_MEDIA_ARGS=(
+    --metered-media-mode updates-only
+    --metered-min-archive-ids "${METERED_MIN_ARCHIVE_IDS}"
+    --metered-playlist-end "${METERED_PLAYLIST_END}"
+  )
+fi
 
 # Keep yt-dlp fresh, but do not block weekly sync if Homebrew update fails.
 if command -v brew >/dev/null 2>&1; then
@@ -124,6 +256,7 @@ run_substudy sync \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
+  "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" &
 SYNC_PID=$!
 echo "[weekly] sync pid=${SYNC_PID}"
