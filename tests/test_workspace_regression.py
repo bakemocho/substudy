@@ -462,6 +462,44 @@ enabled = true
         finally:
             connection.close()
 
+    def test_get_queue_producer_lock_path_uses_db_sibling_locks_dir(self):
+        db_path = self.workspace_root / "data" / "custom.sqlite"
+        lock_path = self.mod.get_queue_producer_lock_path(db_path)
+        expected = db_path.resolve().parent / "locks" / self.mod.DEFAULT_PRODUCER_LOCK_FILE_NAME
+        self.assertEqual(lock_path, expected)
+
+    def test_queue_producer_lock_writes_holder_and_clears_on_release(self):
+        if self.mod.fcntl is None:
+            self.skipTest("fcntl unavailable")
+
+        lock_path = self.workspace_root / "data" / "locks" / "producer.lock"
+        with self.mod.queue_producer_lock(lock_path, enabled=True):
+            holder = lock_path.read_text(encoding="utf-8").strip()
+            self.assertIn("pid=", holder)
+            self.assertIn("host=", holder)
+            self.assertIn("started_at=", holder)
+
+        self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+
+    def test_queue_producer_lock_raises_with_existing_holder_when_busy(self):
+        if self.mod.fcntl is None:
+            self.skipTest("fcntl unavailable")
+
+        lock_path = self.workspace_root / "data" / "locks" / "producer.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(
+            "pid=11111 host=holder-host started_at=2026-03-07T00:00:00+00:00\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(self.mod.fcntl, "flock", side_effect=BlockingIOError()):
+            with self.assertRaises(self.mod.ProducerLockAcquisitionError) as raised:
+                with self.mod.queue_producer_lock(lock_path, enabled=True):
+                    pass
+
+        message = str(raised.exception)
+        self.assertIn("producer lock busy:", message)
+        self.assertIn("pid=11111", message)
+
     def test_enqueue_work_item_requeue_and_keep_success(self):
         connection = sqlite3.connect(str(self.db_path))
         try:

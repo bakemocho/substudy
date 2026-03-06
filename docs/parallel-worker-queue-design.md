@@ -25,6 +25,7 @@
 - `media` 成功時に `subs/meta/asr/loudness` を downstream として自動 enqueue する連鎖を追加。
 - `subs/asr` 成功時に `translate` を downstream として自動 enqueue する連鎖を追加。
 - legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
+- `sync/backfill --execution-mode queue` に producer 共有ロックを追加し、launchd/手動の同時 producer 起動を抑止。
 
 ### 未着手/継続中
 
@@ -277,11 +278,11 @@ lease 失効時:
 
 ### 16.5 実装ステップ
 
-1. producer ラッパー追加（ロック取得/解放、共通ログ）
-2. `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行
-3. launchd 定義を producer/worker 分離
-4. 手動運用向けコマンド例を `technical-guide.md` に追記
-5. 既存 legacy 直実行レーン（asr/loudness/translate-local 直呼び）を段階停止
+1. 完了: producer ラッパー追加（ロック取得/解放、共通ログ）
+2. 未着手: `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行
+3. 未着手: launchd 定義を producer/worker 分離
+4. 未着手: 手動運用向けコマンド例を `technical-guide.md` に追記
+5. 未着手: 既存 legacy 直実行レーン（asr/loudness/translate-local 直呼び）を段階停止
 
 ### 16.6 検証項目（受け入れ）
 

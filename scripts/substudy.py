@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +37,11 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     raise SystemExit(
         "tomllib is required (Python 3.11+)."
     ) from exc
+
+try:
+    import fcntl  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 INFO_SUFFIX = ".info.json"
 DEFAULT_CONFIG = Path("config/sources.toml")
@@ -90,6 +96,7 @@ DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_METERED_MEDIA_MODE = "off"
 DEFAULT_METERED_MIN_ARCHIVE_IDS = 200
 DEFAULT_METERED_PLAYLIST_END = 40
+DEFAULT_PRODUCER_LOCK_FILE_NAME = "producer.lock"
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
@@ -225,8 +232,68 @@ class NetworkProfileDecision:
     bytes_read: int = 0
 
 
+class ProducerLockAcquisitionError(RuntimeError):
+    pass
+
+
 def now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def get_queue_producer_lock_path(db_path: Path) -> Path:
+    safe_db_path = Path(db_path).expanduser().resolve()
+    return safe_db_path.parent / "locks" / DEFAULT_PRODUCER_LOCK_FILE_NAME
+
+
+@contextmanager
+def queue_producer_lock(lock_path: Path, enabled: bool = True) -> Iterable[None]:
+    if not enabled:
+        yield
+        return
+    if fcntl is None:  # pragma: no cover
+        print(
+            "[producer-lock] warning: fcntl unavailable; lock disabled",
+            file=sys.stderr,
+        )
+        yield
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    holder = f"pid={os.getpid()} host={socket.gethostname()} started_at={now_utc_iso()}"
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock_file.seek(0)
+            existing_holder = lock_file.read().strip()
+            detail = f" holder={existing_holder}" if existing_holder else ""
+            raise ProducerLockAcquisitionError(
+                f"producer lock busy: {lock_path}{detail}"
+            ) from exc
+
+        acquired = True
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(f"{holder}\n")
+        lock_file.flush()
+        print(f"[producer-lock] acquired {lock_path} ({holder})")
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_file.seek(0)
+                lock_file.truncate()
+                lock_file.flush()
+            except OSError:
+                pass
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            print(f"[producer-lock] released {lock_path}")
+        lock_file.close()
 
 
 def parse_iso_datetime_utc(raw_value: Any) -> dt.datetime | None:
@@ -12989,6 +13056,11 @@ def parse_args() -> argparse.Namespace:
         default="legacy",
         help="Execution mode: legacy direct processing or queue producer mode.",
     )
+    sync_parser.add_argument(
+        "--no-producer-lock",
+        action="store_true",
+        help="Disable producer lock in queue mode (unsafe; advanced use only).",
+    )
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--skip-media", action="store_true")
     sync_parser.add_argument("--skip-subs", action="store_true")
@@ -13084,6 +13156,11 @@ def parse_args() -> argparse.Namespace:
         choices=["legacy", "queue"],
         default="legacy",
         help="Execution mode: legacy direct processing or queue producer mode.",
+    )
+    backfill_parser.add_argument(
+        "--no-producer-lock",
+        action="store_true",
+        help="Disable producer lock in queue mode (unsafe; advanced use only).",
     )
     backfill_parser.add_argument("--dry-run", action="store_true")
     backfill_parser.add_argument("--skip-media", action="store_true")
@@ -13867,63 +13944,76 @@ def main() -> int:
         metered_playlist_end = max(1, int(getattr(args, "metered_playlist_end", DEFAULT_METERED_PLAYLIST_END)))
         execution_mode = str(getattr(args, "execution_mode", "legacy") or "legacy").strip().lower()
         if execution_mode == "queue":
-            if args.dry_run:
-                queue_db_path = ":memory:"
-            else:
-                ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
-                queue_db_path = str(ledger_db_path)
-
-            queue_connection = sqlite3.connect(queue_db_path, timeout=30)
-            if queue_db_path != ":memory:":
-                queue_connection.execute("PRAGMA journal_mode=WAL")
-            create_schema(queue_connection)
             try:
-                if bool(args.skip_media):
-                    print("[sync-queue] media discovery skipped by explicit --skip-media")
-                else:
-                    for source in run_sources:
-                        source_playlist_end = source.playlist_end
-                        if metered_media_mode == "updates-only":
-                            media_archive_count = len(read_archive_ids(source.media_archive))
-                            (
-                                skip_by_metered,
-                                _force_break_on_existing,
-                                source_playlist_end,
-                                metered_reason,
-                            ) = resolve_metered_media_policy(
-                                source_id=source.id,
-                                mode=metered_media_mode,
-                                media_archive_count=media_archive_count,
-                                configured_playlist_end=source.playlist_end,
-                                min_archive_ids=metered_min_archive_ids,
-                                metered_playlist_end=metered_playlist_end,
-                            )
-                            print(f"[sync-queue] {metered_reason}")
-                            if skip_by_metered:
-                                continue
-                        try:
-                            enqueue_source_media_discovery(
-                                connection=queue_connection,
-                                source=source,
-                                dry_run=bool(args.dry_run),
-                                run_label="sync-queue",
-                                playlist_start=1,
-                                playlist_end=source_playlist_end,
-                                enforce_poll_interval=True,
-                            )
-                        except Exception as exc:
-                            print(
-                                f"[sync-queue] {source.id}: discovery failed ({exc})",
-                                file=sys.stderr,
-                            )
-            finally:
-                queue_connection.close()
+                lock_enabled = not bool(getattr(args, "no_producer_lock", False)) and not bool(
+                    args.dry_run
+                )
+                if bool(getattr(args, "no_producer_lock", False)) and not bool(args.dry_run):
+                    print("[producer-lock] disabled by --no-producer-lock")
+                with queue_producer_lock(
+                    get_queue_producer_lock_path(ledger_db_path),
+                    enabled=lock_enabled,
+                ):
+                    if args.dry_run:
+                        queue_db_path = ":memory:"
+                    else:
+                        ledger_db_path.parent.mkdir(parents=True, exist_ok=True)
+                        queue_db_path = str(ledger_db_path)
 
-            if not args.skip_ledger and not args.dry_run:
-                print("[sync-queue] skip ledger rebuild (no media/subs/meta files were downloaded)")
-            elif args.dry_run and not args.skip_ledger:
-                print("dry-run: skip ledger rebuild")
-            return 0
+                    queue_connection = sqlite3.connect(queue_db_path, timeout=30)
+                    if queue_db_path != ":memory:":
+                        queue_connection.execute("PRAGMA journal_mode=WAL")
+                    create_schema(queue_connection)
+                    try:
+                        if bool(args.skip_media):
+                            print("[sync-queue] media discovery skipped by explicit --skip-media")
+                        else:
+                            for source in run_sources:
+                                source_playlist_end = source.playlist_end
+                                if metered_media_mode == "updates-only":
+                                    media_archive_count = len(read_archive_ids(source.media_archive))
+                                    (
+                                        skip_by_metered,
+                                        _force_break_on_existing,
+                                        source_playlist_end,
+                                        metered_reason,
+                                    ) = resolve_metered_media_policy(
+                                        source_id=source.id,
+                                        mode=metered_media_mode,
+                                        media_archive_count=media_archive_count,
+                                        configured_playlist_end=source.playlist_end,
+                                        min_archive_ids=metered_min_archive_ids,
+                                        metered_playlist_end=metered_playlist_end,
+                                    )
+                                    print(f"[sync-queue] {metered_reason}")
+                                    if skip_by_metered:
+                                        continue
+                                try:
+                                    enqueue_source_media_discovery(
+                                        connection=queue_connection,
+                                        source=source,
+                                        dry_run=bool(args.dry_run),
+                                        run_label="sync-queue",
+                                        playlist_start=1,
+                                        playlist_end=source_playlist_end,
+                                        enforce_poll_interval=True,
+                                    )
+                                except Exception as exc:
+                                    print(
+                                        f"[sync-queue] {source.id}: discovery failed ({exc})",
+                                        file=sys.stderr,
+                                    )
+                    finally:
+                        queue_connection.close()
+
+                if not args.skip_ledger and not args.dry_run:
+                    print("[sync-queue] skip ledger rebuild (no media/subs/meta files were downloaded)")
+                elif args.dry_run and not args.skip_ledger:
+                    print("dry-run: skip ledger rebuild")
+                return 0
+            except ProducerLockAcquisitionError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
 
         sync_connection: sqlite3.Connection | None = None
         if not args.dry_run:
@@ -13985,24 +14075,40 @@ def main() -> int:
         )
         metered_min_archive_ids = max(0, int(getattr(args, "metered_min_archive_ids", DEFAULT_METERED_MIN_ARCHIVE_IDS)))
         metered_playlist_end = max(1, int(getattr(args, "metered_playlist_end", DEFAULT_METERED_PLAYLIST_END)))
-        run_backfill(
-            sources=run_sources,
-            db_path=ledger_db_path,
-            csv_path=ledger_csv_path,
-            dry_run=args.dry_run,
-            skip_media=effective_skip_media,
-            skip_subs=args.skip_subs,
-            skip_meta=args.skip_meta,
-            skip_ledger=args.skip_ledger,
-            full_ledger=args.full_ledger,
-            windows_override=args.windows,
-            reset=args.reset,
-            execution_mode=str(getattr(args, "execution_mode", "legacy") or "legacy"),
-            metered_media_mode=metered_media_mode,
-            metered_min_archive_ids=metered_min_archive_ids,
-            metered_playlist_end=metered_playlist_end,
-        )
-        return 0
+        execution_mode = str(getattr(args, "execution_mode", "legacy") or "legacy").strip().lower()
+        try:
+            lock_enabled = (
+                execution_mode == "queue"
+                and not bool(getattr(args, "no_producer_lock", False))
+                and not bool(args.dry_run)
+            )
+            if execution_mode == "queue" and bool(getattr(args, "no_producer_lock", False)) and not bool(args.dry_run):
+                print("[producer-lock] disabled by --no-producer-lock")
+            with queue_producer_lock(
+                get_queue_producer_lock_path(ledger_db_path),
+                enabled=lock_enabled,
+            ):
+                run_backfill(
+                    sources=run_sources,
+                    db_path=ledger_db_path,
+                    csv_path=ledger_csv_path,
+                    dry_run=args.dry_run,
+                    skip_media=effective_skip_media,
+                    skip_subs=args.skip_subs,
+                    skip_meta=args.skip_meta,
+                    skip_ledger=args.skip_ledger,
+                    full_ledger=args.full_ledger,
+                    windows_override=args.windows,
+                    reset=args.reset,
+                    execution_mode=execution_mode,
+                    metered_media_mode=metered_media_mode,
+                    metered_min_archive_ids=metered_min_archive_ids,
+                    metered_playlist_end=metered_playlist_end,
+                )
+            return 0
+        except ProducerLockAcquisitionError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     if args.command == "queue-worker":
         run_queue_worker(
