@@ -90,7 +90,7 @@ DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
-DEFAULT_QUEUE_STAGES = ("media", "subs", "meta")
+DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr")
 DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS = 6.0
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
@@ -4838,6 +4838,7 @@ def complete_work_item_success(
 
 def enqueue_downstream_work_items(
     connection: sqlite3.Connection,
+    source: SourceConfig | None,
     source_id: str,
     stage: str,
     video_id: str,
@@ -4846,11 +4847,14 @@ def enqueue_downstream_work_items(
 ) -> tuple[int, int, int, int]:
     if str(stage or "").strip().lower() != "media":
         return (0, 0, 0, 0)
+    next_stages = ["subs", "meta"]
+    if source is not None and source.asr_enabled and bool(source.asr_command):
+        next_stages.append("asr")
     inserted = 0
     requeued = 0
     updated = 0
     kept = 0
-    for offset, next_stage in enumerate(("subs", "meta"), start=1):
+    for offset, next_stage in enumerate(next_stages, start=1):
         action = enqueue_work_item(
             connection=connection,
             source_id=source_id,
@@ -4986,7 +4990,7 @@ def process_leased_work_item(
     if not video_id:
         return (False, "work item has empty video_id")
 
-    if stage not in {"media", "subs", "meta"}:
+    if stage not in {"media", "subs", "meta", "asr"}:
         return (False, f"unsupported stage: {stage}")
 
     if dry_run:
@@ -5035,7 +5039,7 @@ def process_leased_work_item(
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
-        else:
+        elif stage == "meta":
             sync_source(
                 source=source,
                 dry_run=False,
@@ -5050,12 +5054,26 @@ def process_leased_work_item(
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
+        else:
+            asr_ok, asr_error = run_asr_for_video(
+                connection=connection,
+                source=source,
+                video_id=video_id,
+                dry_run=False,
+                force=False,
+                ffprobe_bin=shutil.which("ffprobe"),
+            )
+            if not asr_ok:
+                return (False, asr_error or f"asr failed ({source.id}/{video_id})")
     finally:
         if urls_temp_path.exists():
             try:
                 urls_temp_path.unlink()
             except OSError:
                 pass
+
+    if stage == "asr":
+        return (True, None)
 
     status, last_error = get_download_state_status(
         connection=connection,
@@ -5211,6 +5229,7 @@ def run_queue_worker(
                             ds_kept,
                         ) = enqueue_downstream_work_items(
                             connection=connection,
+                            source=source_by_id.get(source_id),
                             source_id=source_id,
                             stage=stage,
                             video_id=video_id,
@@ -5576,6 +5595,240 @@ def pick_asr_subtitle_file(artifact_dir: Path, prefer_exts: list[str]) -> Path |
 def write_empty_srt(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+
+
+def run_asr_for_video(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    video_id: str,
+    dry_run: bool = False,
+    force: bool = False,
+    ffprobe_bin: str | None = None,
+) -> tuple[bool, str | None]:
+    if not source.asr_enabled:
+        return (False, f"{source.id}: asr disabled")
+    if not source.asr_command:
+        return (False, f"{source.id}: missing asr_command")
+
+    row = connection.execute(
+        """
+        SELECT
+            v.media_path,
+            COALESCE(a.status, ''),
+            a.output_path,
+            COALESCE(a.attempts, 0)
+        FROM videos v
+        LEFT JOIN asr_runs a
+            ON a.source_id = v.source_id
+           AND a.video_id = v.video_id
+        WHERE v.source_id = ?
+          AND v.video_id = ?
+          AND v.has_media = 1
+        LIMIT 1
+        """,
+        (source.id, video_id),
+    ).fetchone()
+    if row is None:
+        return (False, f"{source.id}/{video_id}: missing ledger row or has_media=0")
+
+    media_path_value, status, output_path_value, attempts = row
+    if media_path_value in (None, ""):
+        return (False, f"{source.id}/{video_id}: media_path is empty")
+    media_path = Path(str(media_path_value))
+    if not media_path.exists():
+        return (False, f"{source.id}/{video_id}: media file missing ({media_path})")
+
+    ffprobe_value = ffprobe_bin if ffprobe_bin is not None else shutil.which("ffprobe")
+    has_valid_output = False
+    if output_path_value not in (None, ""):
+        output_path = Path(str(output_path_value))
+        if output_path.exists():
+            output_size = -1
+            try:
+                output_size = output_path.stat().st_size
+            except OSError:
+                output_size = -1
+            if output_size > 0:
+                has_valid_output = True
+            elif ffprobe_value:
+                has_audio_stream, _ = detect_audio_stream(
+                    media_path=media_path,
+                    ffprobe_bin=ffprobe_value,
+                )
+                has_valid_output = has_audio_stream is False
+
+    should_run = force or not (str(status or "") == "success" and has_valid_output)
+    if not should_run:
+        print(f"[asr] {source.id}/{video_id}: up to date")
+        return (True, None)
+
+    source.asr_dir.mkdir(parents=True, exist_ok=True)
+    final_dir = source.asr_dir / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = source.asr_dir / video_id
+    work_dir = artifact_dir / "work"
+    replacements = {
+        "input_path": str(media_path),
+        "media_path": str(media_path),
+        "video_id": video_id,
+        "source_id": source.id,
+        "work_dir": str(work_dir),
+        "artifact_dir": str(artifact_dir),
+        "asr_dir": str(source.asr_dir),
+    }
+    command = render_asr_command(source.asr_command, replacements)
+    print("$", shlex.join(command))
+
+    if dry_run:
+        return (True, None)
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    run_attempt = int(attempts) + 1
+    started_at = now_utc_iso()
+
+    upsert_asr_run(
+        connection=connection,
+        source_id=source.id,
+        video_id=video_id,
+        status="running",
+        attempts=run_attempt,
+        engine="command",
+        output_path=str(output_path_value) if output_path_value else None,
+        artifact_dir=str(artifact_dir),
+        last_error=None,
+        started_at=started_at,
+        finished_at=None,
+    )
+    connection.commit()
+
+    timeout = source.asr_timeout_sec if source.asr_timeout_sec > 0 else None
+    if ffprobe_value:
+        has_audio_stream, probe_error = detect_audio_stream(
+            media_path=media_path,
+            ffprobe_bin=ffprobe_value,
+        )
+        if has_audio_stream is False:
+            final_output_path = final_dir / f"{video_id}.asr.srt"
+            write_empty_srt(final_output_path)
+            finished_at = now_utc_iso()
+            retry_count, next_retry_at = mark_media_retry_state(
+                connection=connection,
+                source=source,
+                video_id=video_id,
+                reason="no audio stream detected during ASR",
+                attempt_at=finished_at,
+            )
+            upsert_asr_run(
+                connection=connection,
+                source_id=source.id,
+                video_id=video_id,
+                status="success",
+                attempts=run_attempt,
+                engine="command",
+                output_path=str(final_output_path),
+                artifact_dir=str(artifact_dir),
+                last_error=None,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            connection.commit()
+            print(
+                f"[asr] {source.id}/{video_id}: no audio stream "
+                f"(wrote {final_output_path}; media_retry_count={retry_count} "
+                f"next_retry_at={next_retry_at})"
+            )
+            return (True, None)
+        if has_audio_stream is None and probe_error:
+            print(
+                f"[asr] {source.id}/{video_id}: "
+                f"ffprobe warning ({probe_error}); continuing",
+                file=sys.stderr,
+            )
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        finished_at = now_utc_iso()
+        upsert_asr_run(
+            connection=connection,
+            source_id=source.id,
+            video_id=video_id,
+            status="error",
+            attempts=run_attempt,
+            engine="command",
+            output_path=str(output_path_value) if output_path_value else None,
+            artifact_dir=str(artifact_dir),
+            last_error=f"timeout after {source.asr_timeout_sec}s",
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.commit()
+        return (False, f"{source.id}/{video_id}: timeout")
+
+    if completed.returncode != 0:
+        finished_at = now_utc_iso()
+        upsert_asr_run(
+            connection=connection,
+            source_id=source.id,
+            video_id=video_id,
+            status="error",
+            attempts=run_attempt,
+            engine="command",
+            output_path=str(output_path_value) if output_path_value else None,
+            artifact_dir=str(artifact_dir),
+            last_error=f"command exit code {completed.returncode}",
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.commit()
+        return (False, f"{source.id}/{video_id}: command exit code {completed.returncode}")
+
+    subtitle_candidate = pick_asr_subtitle_file(artifact_dir, source.asr_prefer_exts)
+    if subtitle_candidate is None:
+        finished_at = now_utc_iso()
+        upsert_asr_run(
+            connection=connection,
+            source_id=source.id,
+            video_id=video_id,
+            status="error",
+            attempts=run_attempt,
+            engine="command",
+            output_path=str(output_path_value) if output_path_value else None,
+            artifact_dir=str(artifact_dir),
+            last_error=(
+                "ASR command succeeded but no subtitle file "
+                f"found in {artifact_dir}"
+            ),
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        connection.commit()
+        return (False, f"{source.id}/{video_id}: no subtitle artifacts")
+
+    final_output_path = final_dir / f"{video_id}.asr{subtitle_candidate.suffix.lower()}"
+    shutil.copy2(subtitle_candidate, final_output_path)
+
+    finished_at = now_utc_iso()
+    upsert_asr_run(
+        connection=connection,
+        source_id=source.id,
+        video_id=video_id,
+        status="success",
+        attempts=run_attempt,
+        engine="command",
+        output_path=str(final_output_path),
+        artifact_dir=str(artifact_dir),
+        last_error=None,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+    connection.commit()
+    print(f"[asr] {source.id}/{video_id}: {final_output_path}")
+    return (True, None)
 
 
 def run_asr(
@@ -12539,8 +12792,8 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         action="append",
         dest="stages",
-        choices=["media", "subs", "meta"],
-        help="Stage filter (repeatable). Defaults to media+subs+meta.",
+        choices=["media", "subs", "meta", "asr"],
+        help="Stage filter (repeatable). Defaults to media+subs+meta+asr.",
     )
     queue_worker_parser.add_argument(
         "--worker-id",
@@ -12573,7 +12826,7 @@ def parse_args() -> argparse.Namespace:
     queue_worker_parser.add_argument(
         "--no-enqueue-downstream",
         action="store_true",
-        help="Disable media->subs/meta downstream work item enqueue on success.",
+        help="Disable media->subs/meta/asr downstream work item enqueue on success.",
     )
     queue_worker_parser.add_argument(
         "--once",
