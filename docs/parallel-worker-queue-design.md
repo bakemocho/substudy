@@ -228,3 +228,65 @@ lease 失効時:
 - archive ファイルを将来的に完全廃止するか。  
 - worker 優先度（新規取得 vs retry）のデフォルト方針。  
 - stage 間依存（`media -> subs/meta -> asr`）を queue 上でどう表現するか（単純投入 or DAG）。
+
+## 16. launchd + 手動並行運用計画（安全優先）
+
+### 16.1 方針
+
+- 並行実行を 2 系統に分離する。
+  - `producer`: `sync/backfill --execution-mode queue`（ID 発見と queue 投入）
+  - `worker`: `queue-worker`（stage 実処理）
+- 安全性の鍵は以下:
+  - producer は常に単一起動（共有ロック必須）
+  - worker は複数起動可（DB lease で重複処理防止）
+
+### 16.2 同時実行ポリシー
+
+1. `sync --execution-mode queue`: 同時実行 `1`（launchd/手動合算）
+2. `backfill --execution-mode queue`: 同時実行 `1`（launchd/手動合算）
+3. `queue-worker`: 同時実行 `N`（増減可能）
+4. `legacy sync/backfill`: 運用停止（互換のため CLI は残す）
+5. `asr/loudness/translate-local` 直実行: 移行完了後は原則停止（queue-worker に統一）
+
+### 16.3 ロック設計（producer 専用）
+
+- ロック対象:
+  - `sync --execution-mode queue`
+  - `backfill --execution-mode queue`
+- ロックファイル:
+  - `data/locks/producer.lock`（固定パス）
+- 要件:
+  - launchd と手動の双方が同じロックを使う
+  - `queue-worker` はロック対象外
+  - ロック取得失敗時は即時終了し、運用ログに理由を残す
+
+### 16.4 運用構成（最終形）
+
+1. launchd producer ジョブ:
+   - `sync --execution-mode queue --skip-ledger`
+   - `backfill --execution-mode queue --skip-ledger`
+2. launchd worker ジョブ（複数定義可）:
+   - `queue-worker --stage media --max-items ...`
+   - `queue-worker --stage subs --stage meta --stage asr --stage loudness --stage translate`
+3. launchd catch-up ジョブ:
+   - `ledger --incremental`
+   - `downloads`
+4. 手動運用:
+   - producer は「ロック付きコマンド」でのみ起動
+   - worker は必要に応じて追加起動可
+
+### 16.5 実装ステップ
+
+1. producer ラッパー追加（ロック取得/解放、共通ログ）
+2. `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行
+3. launchd 定義を producer/worker 分離
+4. 手動運用向けコマンド例を `technical-guide.md` に追記
+5. 既存 legacy 直実行レーン（asr/loudness/translate-local 直呼び）を段階停止
+
+### 16.6 検証項目（受け入れ）
+
+1. launchd producer 実行中に手動 producer 起動しても、2 本目は安全に reject される
+2. launchd worker + 手動 worker を同時起動しても、同一 `(source, stage, video)` 重複処理が発生しない
+3. 24h poll 制御が維持され、source への過剰アクセスが増えない
+4. `downloads` で retry/dead/leased が観測可能
+5. daily/weekly 成果（成功件数、失敗率）が悪化しない
