@@ -14,10 +14,12 @@ import random
 import re
 import shlex
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -84,6 +86,10 @@ DEFAULT_NETWORK_PROBE_TIMEOUT_SEC = 8
 DEFAULT_NETWORK_PROBE_BYTES = 131072
 DEFAULT_WEAK_NET_MIN_KBPS = 900.0
 DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
+DEFAULT_QUEUE_LEASE_SEC = 1800
+DEFAULT_QUEUE_POLL_SEC = 3.0
+DEFAULT_QUEUE_MAX_ATTEMPTS = 8
+DEFAULT_QUEUE_STAGES = ("media", "subs", "meta")
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
 
@@ -1085,9 +1091,13 @@ def sync_source(
     connection: sqlite3.Connection | None = None,
     playlist_start: int | None = None,
     playlist_end: int | None = None,
+    media_candidate_ids: list[str] | None = None,
     metadata_candidate_ids: list[str] | None = None,
     run_label: str = "sync",
     respect_media_discovery_interval: bool = True,
+    recover_interrupted_runs: bool = True,
+    urls_file_override: Path | None = None,
+    strict_candidate_scope: bool = False,
 ) -> None:
     print(f"\n=== {run_label}: {source.id} ===")
 
@@ -1113,7 +1123,8 @@ def sync_source(
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
     cookie_flags = resolve_cookie_flags(source)
-    if connection is not None and not dry_run:
+    active_urls_file = urls_file_override if urls_file_override is not None else source.urls_file
+    if connection is not None and not dry_run and recover_interrupted_runs:
         recovered_any = False
         for stage in ("media", "subs", "meta"):
             recovered = recover_interrupted_download_runs(
@@ -1135,9 +1146,19 @@ def sync_source(
 
     media_before_ids = set(read_archive_ids(source.media_archive))
     new_media_ids: list[str] = []
+    normalized_media_candidate_ids: list[str] = []
+    if media_candidate_ids is not None:
+        seen_media_candidate_ids: set[str] = set()
+        for video_id in media_candidate_ids:
+            video_id_value = str(video_id or "").strip()
+            if not video_id_value or video_id_value in seen_media_candidate_ids:
+                continue
+            seen_media_candidate_ids.add(video_id_value)
+            normalized_media_candidate_ids.append(video_id_value)
+
     if not skip_media:
         media_discovery_state_key = f"media_discovery_last_attempt:{source.id}"
-        run_media_discovery = True
+        run_media_discovery = media_candidate_ids is None
         media_discovery_remaining_hours: float | None = None
         media_discovery_last_attempt: str | None = None
         if (
@@ -1145,6 +1166,7 @@ def sync_source(
             and not dry_run
             and respect_media_discovery_interval
             and source.media_discovery_interval_hours > 0
+            and media_candidate_ids is None
         ):
             media_discovery_last_attempt = get_app_state_value(
                 connection,
@@ -1180,6 +1202,12 @@ def sync_source(
                 "--no-playlist",
                 source.url,
             ]
+        elif media_candidate_ids is not None:
+            new_media_ids = list(normalized_media_candidate_ids)
+            print(
+                f"[media] {source.id}: target mode "
+                f"video_ids={len(new_media_ids)}"
+            )
         else:
             wait_label = (
                 f"{media_discovery_remaining_hours:.2f}h"
@@ -1222,12 +1250,13 @@ def sync_source(
                 )
                 connection.commit()
 
-        media_after_ids = set(read_archive_ids(source.media_archive))
-        new_media_ids = sorted(media_after_ids - media_before_ids)
+        if media_candidate_ids is None:
+            media_after_ids = set(read_archive_ids(source.media_archive))
+            new_media_ids = sorted(media_after_ids - media_before_ids)
 
         retry_media_ids: list[str] = []
         bootstrap_no_audio_media_ids: list[str] = []
-        if connection is not None and not dry_run:
+        if connection is not None and not dry_run and media_candidate_ids is None:
             retry_media_ids = get_due_retry_ids(connection, source.id, "media")
             bootstrap_no_audio_media_ids = get_media_no_audio_bootstrap_ids(
                 connection=connection,
@@ -1826,7 +1855,11 @@ def sync_source(
     subs_before_ids = set(read_archive_ids(source.subs_archive))
     if not skip_subs:
         bootstrap_missing_sub_ids: list[str] = []
-        if connection is not None and not dry_run:
+        if (
+            connection is not None
+            and not dry_run
+            and not (strict_candidate_scope and metadata_candidate_ids is not None)
+        ):
             bootstrap_missing_sub_ids = get_subtitle_missing_bootstrap_ids(
                 connection=connection,
                 source_id=source.id,
@@ -1865,7 +1898,11 @@ def sync_source(
             )
 
         retry_sub_ids: list[str] = []
-        if connection is not None and not dry_run:
+        if (
+            connection is not None
+            and not dry_run
+            and not (strict_candidate_scope and metadata_candidate_ids is not None)
+        ):
             retry_sub_ids = get_due_retry_ids(connection, source.id, "subs")
 
         subtitle_target_ids: list[str] = []
@@ -1925,7 +1962,7 @@ def sync_source(
                     f"deferred={len(deferred_sub_ids)})"
                 )
             elif subtitle_urls:
-                write_urls_file(source.urls_file, subtitle_urls)
+                write_urls_file(active_urls_file, subtitle_urls)
 
             subs_command: list[str] | None = None
             if resolved_subtitle_target_ids:
@@ -1948,7 +1985,7 @@ def sync_source(
                     str(source.subs_dir / source.subs_output_template),
                     "--no-playlist",
                     "-a",
-                    str(source.urls_file),
+                    str(active_urls_file),
                 ]
 
             subs_started_at = now_utc_iso()
@@ -2118,7 +2155,11 @@ def sync_source(
         )
 
     retry_ids: list[str] = []
-    if connection is not None and not dry_run:
+    if (
+        connection is not None
+        and not dry_run
+        and not (strict_candidate_scope and metadata_candidate_ids is not None)
+    ):
         retry_ids = get_due_retry_ids(connection, source.id, "meta")
 
     metadata_target_ids: list[str] = []
@@ -2151,7 +2192,7 @@ def sync_source(
             f"deferred={len(deferred_missing_ids)})"
         )
     elif urls:
-        write_urls_file(source.urls_file, urls)
+        write_urls_file(active_urls_file, urls)
 
     metadata_command: list[str] | None = None
     if resolved_metadata_target_ids:
@@ -2168,7 +2209,7 @@ def sync_source(
             str(source.meta_dir / source.meta_output_template),
             "--no-playlist",
             "-a",
-            str(source.urls_file),
+            str(active_urls_file),
         ]
     meta_started_at = now_utc_iso()
     meta_run_id: int | None = None
@@ -4507,6 +4548,550 @@ def enqueue_source_media_discovery(
     return len(discovered_ids), inserted, requeued
 
 
+def normalize_queue_stages(raw_stages: list[str] | None) -> list[str]:
+    if not raw_stages:
+        return list(DEFAULT_QUEUE_STAGES)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_stage in raw_stages:
+        stage = str(raw_stage or "").strip().lower()
+        if stage not in DEFAULT_QUEUE_STAGES or stage in seen:
+            continue
+        seen.add(stage)
+        normalized.append(stage)
+    return normalized or list(DEFAULT_QUEUE_STAGES)
+
+
+def compute_lease_expires_at_iso(
+    lease_seconds: int,
+    from_dt: dt.datetime | None = None,
+) -> str:
+    safe_lease_seconds = max(30, int(lease_seconds))
+    base_dt = from_dt or dt.datetime.now(dt.timezone.utc)
+    lease_dt = base_dt + dt.timedelta(seconds=safe_lease_seconds)
+    return lease_dt.replace(microsecond=0).isoformat()
+
+
+def upsert_worker_heartbeat(
+    connection: sqlite3.Connection,
+    worker_id: str,
+    started_at: str,
+    heartbeat_at: str,
+    host: str | None = None,
+    pid: int | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO worker_heartbeats (
+            worker_id,
+            host,
+            pid,
+            started_at,
+            last_heartbeat_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(worker_id) DO UPDATE SET
+            host = excluded.host,
+            pid = excluded.pid,
+            started_at = excluded.started_at,
+            last_heartbeat_at = excluded.last_heartbeat_at
+        """,
+        (
+            worker_id,
+            str(host or socket.gethostname()),
+            int(pid if pid is not None else os.getpid()),
+            started_at,
+            heartbeat_at,
+        ),
+    )
+
+
+def requeue_expired_work_item_leases(
+    connection: sqlite3.Connection,
+    now_iso: str | None = None,
+) -> int:
+    now_value = now_iso or now_utc_iso()
+    updated = connection.execute(
+        """
+        UPDATE work_items
+        SET status = 'queued',
+            lease_owner = NULL,
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            updated_at = ?
+        WHERE status = 'leased'
+          AND lease_expires_at IS NOT NULL
+          AND lease_expires_at <= ?
+        """,
+        (now_value, now_value),
+    ).rowcount
+    return int(updated or 0)
+
+
+def lease_next_work_item(
+    connection: sqlite3.Connection,
+    worker_id: str,
+    stages: list[str] | None,
+    lease_seconds: int = DEFAULT_QUEUE_LEASE_SEC,
+    now_dt: dt.datetime | None = None,
+    max_scan_attempts: int = 12,
+) -> dict[str, Any] | None:
+    normalized_stages = normalize_queue_stages(stages)
+    if not normalized_stages:
+        return None
+    placeholders = ",".join("?" for _ in normalized_stages)
+
+    for _ in range(max(1, int(max_scan_attempts))):
+        now_value = now_dt or dt.datetime.now(dt.timezone.utc)
+        now_iso = now_value.replace(microsecond=0).isoformat()
+        lease_expires_at = compute_lease_expires_at_iso(
+            lease_seconds=lease_seconds,
+            from_dt=now_value,
+        )
+        lease_token = uuid.uuid4().hex
+
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            f"""
+            SELECT
+                id,
+                source_id,
+                stage,
+                video_id,
+                priority,
+                attempt_count,
+                COALESCE(payload_json, '')
+            FROM work_items
+            WHERE stage IN ({placeholders})
+              AND status IN ('queued', 'error')
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY priority ASC, updated_at ASC, id ASC
+            LIMIT 1
+            """,
+            (*normalized_stages, now_iso),
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return None
+
+        item_id = int(row[0])
+        updated = connection.execute(
+            """
+            UPDATE work_items
+            SET status = 'leased',
+                lease_owner = ?,
+                lease_token = ?,
+                lease_expires_at = ?,
+                updated_at = ?,
+                started_at = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status IN ('queued', 'error')
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            """,
+            (
+                worker_id,
+                lease_token,
+                lease_expires_at,
+                now_iso,
+                now_iso,
+                item_id,
+                now_iso,
+            ),
+        ).rowcount
+        if updated == 1:
+            connection.commit()
+            return {
+                "id": item_id,
+                "source_id": str(row[1]),
+                "stage": str(row[2]),
+                "video_id": str(row[3]),
+                "priority": int(row[4] or 0),
+                "attempt_count": int(row[5] or 0),
+                "payload_json": str(row[6] or ""),
+                "lease_token": lease_token,
+                "lease_expires_at": lease_expires_at,
+            }
+        connection.rollback()
+    return None
+
+
+def complete_work_item_success(
+    connection: sqlite3.Connection,
+    work_item_id: int,
+    lease_token: str,
+    finished_at: str | None = None,
+) -> bool:
+    finished_value = finished_at or now_utc_iso()
+    updated = connection.execute(
+        """
+        UPDATE work_items
+        SET status = 'success',
+            attempt_count = attempt_count + 1,
+            next_retry_at = NULL,
+            lease_owner = NULL,
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            last_error = NULL,
+            updated_at = ?,
+            finished_at = ?
+        WHERE id = ?
+          AND lease_token = ?
+        """,
+        (finished_value, finished_value, int(work_item_id), lease_token),
+    ).rowcount
+    connection.commit()
+    return updated == 1
+
+
+def fail_work_item_lease(
+    connection: sqlite3.Connection,
+    work_item_id: int,
+    lease_token: str,
+    error_message: str,
+    max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS,
+    finished_at: str | None = None,
+) -> tuple[str, int, str | None]:
+    safe_error = str(error_message or "").strip() or "work item failed"
+    safe_error = safe_error[:4000]
+    finished_value = finished_at or now_utc_iso()
+    row = connection.execute(
+        """
+        SELECT attempt_count
+        FROM work_items
+        WHERE id = ?
+          AND lease_token = ?
+        """,
+        (int(work_item_id), lease_token),
+    ).fetchone()
+    if row is None:
+        return ("lost", 0, None)
+
+    next_attempt_count = int(row[0] or 0) + 1
+    if next_attempt_count >= max(1, int(max_attempts)):
+        next_status = "dead"
+        next_retry_at = None
+    else:
+        next_status = "error"
+        next_retry_at = schedule_next_retry_iso(next_attempt_count)
+
+    updated = connection.execute(
+        """
+        UPDATE work_items
+        SET status = ?,
+            attempt_count = ?,
+            next_retry_at = ?,
+            lease_owner = NULL,
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            last_error = ?,
+            updated_at = ?,
+            finished_at = ?
+        WHERE id = ?
+          AND lease_token = ?
+        """,
+        (
+            next_status,
+            next_attempt_count,
+            next_retry_at,
+            safe_error,
+            finished_value,
+            finished_value,
+            int(work_item_id),
+            lease_token,
+        ),
+    ).rowcount
+    connection.commit()
+    if updated != 1:
+        return ("lost", next_attempt_count, next_retry_at)
+    return (next_status, next_attempt_count, next_retry_at)
+
+
+def get_download_state_status(
+    connection: sqlite3.Connection,
+    source_id: str,
+    stage: str,
+    video_id: str,
+) -> tuple[str | None, str | None]:
+    row = connection.execute(
+        """
+        SELECT status, COALESCE(last_error, '')
+        FROM download_state
+        WHERE source_id = ?
+          AND stage = ?
+          AND video_id = ?
+        """,
+        (source_id, stage, video_id),
+    ).fetchone()
+    if row is None:
+        return (None, None)
+    status = str(row[0] or "")
+    error_text = str(row[1] or "")
+    return (status, error_text)
+
+
+def build_worker_urls_temp_path(
+    source: SourceConfig,
+    worker_id: str,
+    work_item_id: int,
+) -> Path:
+    worker_token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(worker_id or "worker"))
+    return source.media_archive.parent / "tmp" / (
+        f"urls.{worker_token}.{os.getpid()}.{int(work_item_id)}.txt"
+    )
+
+
+def process_leased_work_item(
+    connection: sqlite3.Connection,
+    source_by_id: dict[str, SourceConfig],
+    work_item: dict[str, Any],
+    worker_id: str,
+    dry_run: bool = False,
+) -> tuple[bool, str | None]:
+    source_id = str(work_item.get("source_id") or "")
+    stage = str(work_item.get("stage") or "").strip().lower()
+    video_id = str(work_item.get("video_id") or "")
+    item_id = int(work_item.get("id") or 0)
+
+    source = source_by_id.get(source_id)
+    if source is None:
+        return (False, f"unknown source_id for work item: {source_id}")
+
+    if not video_id:
+        return (False, "work item has empty video_id")
+
+    if stage not in {"media", "subs", "meta"}:
+        return (False, f"unsupported stage: {stage}")
+
+    if dry_run:
+        print(
+            f"[queue-worker] dry-run processed "
+            f"id={item_id} source={source_id} stage={stage} video_id={video_id}"
+        )
+        return (True, None)
+
+    run_label = f"queue-worker:{worker_id}:{stage}:{item_id}"
+    urls_temp_path = build_worker_urls_temp_path(
+        source=source,
+        worker_id=worker_id,
+        work_item_id=item_id,
+    )
+
+    try:
+        if stage == "media":
+            sync_source(
+                source=source,
+                dry_run=False,
+                skip_media=False,
+                skip_subs=True,
+                skip_meta=True,
+                connection=connection,
+                media_candidate_ids=[video_id],
+                metadata_candidate_ids=None,
+                run_label=run_label,
+                respect_media_discovery_interval=False,
+                recover_interrupted_runs=False,
+                urls_file_override=urls_temp_path,
+                strict_candidate_scope=True,
+            )
+        elif stage == "subs":
+            sync_source(
+                source=source,
+                dry_run=False,
+                skip_media=True,
+                skip_subs=False,
+                skip_meta=True,
+                connection=connection,
+                metadata_candidate_ids=[video_id],
+                run_label=run_label,
+                respect_media_discovery_interval=False,
+                recover_interrupted_runs=False,
+                urls_file_override=urls_temp_path,
+                strict_candidate_scope=True,
+            )
+        else:
+            sync_source(
+                source=source,
+                dry_run=False,
+                skip_media=True,
+                skip_subs=True,
+                skip_meta=False,
+                connection=connection,
+                metadata_candidate_ids=[video_id],
+                run_label=run_label,
+                respect_media_discovery_interval=False,
+                recover_interrupted_runs=False,
+                urls_file_override=urls_temp_path,
+                strict_candidate_scope=True,
+            )
+    finally:
+        if urls_temp_path.exists():
+            try:
+                urls_temp_path.unlink()
+            except OSError:
+                pass
+
+    status, last_error = get_download_state_status(
+        connection=connection,
+        source_id=source_id,
+        stage=stage,
+        video_id=video_id,
+    )
+    if status == "success":
+        return (True, None)
+    if status == "error":
+        return (False, last_error or f"{stage} download_state status=error")
+
+    if stage == "media":
+        media_path = find_media_file_for_video(source, video_id)
+        if media_path is not None and media_path.exists():
+            return (True, None)
+
+    return (False, f"{stage} did not write a terminal download_state row")
+
+
+def run_queue_worker(
+    sources: list[SourceConfig],
+    db_path: Path,
+    stages: list[str] | None = None,
+    worker_id: str | None = None,
+    lease_seconds: int = DEFAULT_QUEUE_LEASE_SEC,
+    poll_interval_sec: float = DEFAULT_QUEUE_POLL_SEC,
+    max_items: int = 0,
+    once: bool = False,
+    dry_run: bool = False,
+    max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS,
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    create_schema(connection)
+
+    source_by_id = {source.id: source for source in sources}
+    normalized_stages = normalize_queue_stages(stages)
+    safe_lease_seconds = max(30, int(lease_seconds))
+    safe_poll_interval_sec = max(0.2, float(poll_interval_sec))
+    safe_max_items = max(0, int(max_items))
+    safe_max_attempts = max(1, int(max_attempts))
+
+    worker_id_value = str(worker_id or "").strip()
+    if not worker_id_value:
+        worker_id_value = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+    started_at = now_utc_iso()
+    processed = 0
+    success_count = 0
+    failure_count = 0
+    print(
+        f"[queue-worker] start worker_id={worker_id_value} "
+        f"stages={','.join(normalized_stages)} "
+        f"lease={safe_lease_seconds}s poll={safe_poll_interval_sec:.1f}s "
+        f"max_items={safe_max_items or 'unbounded'} once={bool(once)}"
+    )
+
+    try:
+        while True:
+            heartbeat_at = now_utc_iso()
+            upsert_worker_heartbeat(
+                connection=connection,
+                worker_id=worker_id_value,
+                started_at=started_at,
+                heartbeat_at=heartbeat_at,
+            )
+            reclaimed = requeue_expired_work_item_leases(
+                connection=connection,
+                now_iso=heartbeat_at,
+            )
+            connection.commit()
+            if reclaimed > 0:
+                print(
+                    f"[queue-worker] reclaimed expired leases={reclaimed}"
+                )
+
+            leased_item = lease_next_work_item(
+                connection=connection,
+                worker_id=worker_id_value,
+                stages=normalized_stages,
+                lease_seconds=safe_lease_seconds,
+            )
+            if leased_item is None:
+                if once:
+                    break
+                if safe_max_items > 0 and processed >= safe_max_items:
+                    break
+                time.sleep(safe_poll_interval_sec)
+                continue
+
+            processed += 1
+            item_id = int(leased_item["id"])
+            source_id = str(leased_item["source_id"])
+            stage = str(leased_item["stage"])
+            video_id = str(leased_item["video_id"])
+            lease_token = str(leased_item["lease_token"])
+            print(
+                f"[queue-worker] leased id={item_id} source={source_id} "
+                f"stage={stage} video_id={video_id}"
+            )
+
+            ok = False
+            failure_reason: str | None = None
+            try:
+                ok, failure_reason = process_leased_work_item(
+                    connection=connection,
+                    source_by_id=source_by_id,
+                    work_item=leased_item,
+                    worker_id=worker_id_value,
+                    dry_run=dry_run,
+                )
+            except Exception as exc:
+                ok = False
+                failure_reason = f"work item execution exception: {exc}"
+
+            if ok:
+                if complete_work_item_success(
+                    connection=connection,
+                    work_item_id=item_id,
+                    lease_token=lease_token,
+                ):
+                    success_count += 1
+                    print(
+                        f"[queue-worker] success id={item_id} "
+                        f"source={source_id} stage={stage} video_id={video_id}"
+                    )
+                else:
+                    failure_count += 1
+                    print(
+                        f"[queue-worker] lost lease before success update id={item_id}",
+                        file=sys.stderr,
+                    )
+            else:
+                failure_count += 1
+                next_status, attempt_count, next_retry_at = fail_work_item_lease(
+                    connection=connection,
+                    work_item_id=item_id,
+                    lease_token=lease_token,
+                    error_message=failure_reason or "unknown worker error",
+                    max_attempts=safe_max_attempts,
+                )
+                retry_label = next_retry_at or "-"
+                print(
+                    f"[queue-worker] failed id={item_id} source={source_id} "
+                    f"stage={stage} video_id={video_id} status={next_status} "
+                    f"attempt={attempt_count} next_retry_at={retry_label}",
+                    file=sys.stderr,
+                )
+
+            if once:
+                break
+            if safe_max_items > 0 and processed >= safe_max_items:
+                break
+    finally:
+        connection.close()
+
+    print(
+        f"[queue-worker] done processed={processed} "
+        f"success={success_count} failed={failure_count}"
+    )
+
+
 def get_media_no_audio_bootstrap_ids(
     connection: sqlite3.Connection,
     source_id: str,
@@ -5812,6 +6397,63 @@ def show_download_report(
                 )
                 if last_error:
                     print(f"    reason: {last_error}")
+
+        queue_summary_rows = connection.execute(
+            """
+            SELECT stage, status, COUNT(*)
+            FROM work_items
+            WHERE source_id = ?
+            GROUP BY stage, status
+            ORDER BY stage ASC, status ASC
+            """,
+            (source.id,),
+        ).fetchall()
+        if queue_summary_rows:
+            print("queue status counts:")
+            for queue_stage, queue_status, queue_count in queue_summary_rows:
+                print(
+                    f"  stage={queue_stage} status={queue_status} "
+                    f"count={int(queue_count or 0)}"
+                )
+        else:
+            print("queue status counts: none")
+
+        queue_pending_rows = connection.execute(
+            """
+            SELECT
+                stage,
+                video_id,
+                status,
+                attempt_count,
+                COALESCE(next_retry_at, ''),
+                COALESCE(last_error, '')
+            FROM work_items
+            WHERE source_id = ?
+              AND status IN ('queued', 'leased', 'error')
+            ORDER BY priority ASC, updated_at ASC, id ASC
+            LIMIT ?
+            """,
+            (source.id, limit),
+        ).fetchall()
+        if queue_pending_rows:
+            print("queue pending:")
+            for (
+                queue_stage,
+                queue_video_id,
+                queue_status,
+                queue_attempt_count,
+                queue_next_retry_at,
+                queue_last_error,
+            ) in queue_pending_rows:
+                print(
+                    f"  stage={queue_stage} video_id={queue_video_id} "
+                    f"status={queue_status} attempts={int(queue_attempt_count or 0)} "
+                    f"next_retry_at={queue_next_retry_at}"
+                )
+                if queue_last_error:
+                    print(f"    reason: {queue_last_error}")
+        else:
+            print("queue pending: none")
 
     connection.close()
 
@@ -11713,6 +12355,55 @@ def parse_args() -> argparse.Namespace:
     backfill_parser.add_argument("--ledger-db", type=Path)
     backfill_parser.add_argument("--ledger-csv", type=Path)
 
+    queue_worker_parser = subparsers.add_parser(
+        "queue-worker",
+        help="Lease and process work_items with per-video stage workers",
+    )
+    queue_worker_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    queue_worker_parser.add_argument("--source", action="append", dest="sources")
+    queue_worker_parser.add_argument(
+        "--stage",
+        action="append",
+        dest="stages",
+        choices=["media", "subs", "meta"],
+        help="Stage filter (repeatable). Defaults to media+subs+meta.",
+    )
+    queue_worker_parser.add_argument(
+        "--worker-id",
+        help="Optional stable worker identity (default: host-pid-random).",
+    )
+    queue_worker_parser.add_argument(
+        "--lease-sec",
+        type=int,
+        default=DEFAULT_QUEUE_LEASE_SEC,
+        help=f"Lease duration seconds (default: {DEFAULT_QUEUE_LEASE_SEC}).",
+    )
+    queue_worker_parser.add_argument(
+        "--poll-sec",
+        type=float,
+        default=DEFAULT_QUEUE_POLL_SEC,
+        help=f"Idle polling interval seconds (default: {DEFAULT_QUEUE_POLL_SEC}).",
+    )
+    queue_worker_parser.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="Stop after this many leased items (0 = unlimited).",
+    )
+    queue_worker_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_QUEUE_MAX_ATTEMPTS,
+        help=f"Mark item dead after this many failed attempts (default: {DEFAULT_QUEUE_MAX_ATTEMPTS}).",
+    )
+    queue_worker_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Try to process at most one currently due item, then exit.",
+    )
+    queue_worker_parser.add_argument("--dry-run", action="store_true")
+    queue_worker_parser.add_argument("--ledger-db", type=Path)
+
     ledger_parser = subparsers.add_parser("ledger", help="Rebuild ledger only")
     ledger_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     ledger_parser.add_argument("--source", action="append", dest="sources")
@@ -12433,6 +13124,21 @@ def main() -> int:
             windows_override=args.windows,
             reset=args.reset,
             execution_mode=str(getattr(args, "execution_mode", "legacy") or "legacy"),
+        )
+        return 0
+
+    if args.command == "queue-worker":
+        run_queue_worker(
+            sources=sources,
+            db_path=ledger_db_path,
+            stages=getattr(args, "stages", None),
+            worker_id=getattr(args, "worker_id", None),
+            lease_seconds=max(30, int(args.lease_sec)),
+            poll_interval_sec=max(0.2, float(args.poll_sec)),
+            max_items=max(0, int(args.max_items)),
+            once=bool(args.once),
+            dry_run=bool(args.dry_run),
+            max_attempts=max(1, int(args.max_attempts)),
         )
         return 0
 

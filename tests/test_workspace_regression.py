@@ -600,6 +600,226 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_lease_next_work_item_and_complete_success(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-07T00:00:00+00:00"
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="meta",
+                video_id="7611111111111111111",
+                now_iso=now_iso,
+                priority=5,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="meta",
+                video_id="7612222222222222222",
+                now_iso=now_iso,
+                priority=8,
+            )
+            connection.commit()
+
+            leased = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-test",
+                stages=["meta"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased)
+            self.assertEqual(leased["video_id"], "7611111111111111111")
+
+            completed = self.mod.complete_work_item_success(
+                connection=connection,
+                work_item_id=int(leased["id"]),
+                lease_token=str(leased["lease_token"]),
+                finished_at="2026-03-07T00:01:00+00:00",
+            )
+            self.assertTrue(completed)
+
+            row = connection.execute(
+                """
+                SELECT status, attempt_count, lease_owner, lease_token
+                FROM work_items
+                WHERE id = ?
+                """,
+                (int(leased["id"]),),
+            ).fetchone()
+            self.assertEqual(row[0], "success")
+            self.assertEqual(int(row[1]), 1)
+            self.assertIsNone(row[2])
+            self.assertIsNone(row[3])
+        finally:
+            connection.close()
+
+    def test_fail_work_item_lease_schedules_retry_then_dead(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="storiesofcz",
+                stage="meta",
+                video_id="7613333333333333333",
+                now_iso="2026-03-07T00:00:00+00:00",
+                priority=1,
+            )
+            connection.commit()
+
+            leased_1 = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-test",
+                stages=["meta"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased_1)
+
+            status_1, attempt_1, retry_1 = self.mod.fail_work_item_lease(
+                connection=connection,
+                work_item_id=int(leased_1["id"]),
+                lease_token=str(leased_1["lease_token"]),
+                error_message="simulated failure",
+                max_attempts=2,
+                finished_at="2026-03-07T00:02:00+00:00",
+            )
+            self.assertEqual(status_1, "error")
+            self.assertEqual(attempt_1, 1)
+            self.assertIsNotNone(retry_1)
+
+            connection.execute(
+                "UPDATE work_items SET next_retry_at = NULL WHERE id = ?",
+                (int(leased_1["id"]),),
+            )
+            connection.commit()
+
+            leased_2 = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-test",
+                stages=["meta"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased_2)
+            self.assertEqual(int(leased_1["id"]), int(leased_2["id"]))
+
+            status_2, attempt_2, retry_2 = self.mod.fail_work_item_lease(
+                connection=connection,
+                work_item_id=int(leased_2["id"]),
+                lease_token=str(leased_2["lease_token"]),
+                error_message="simulated failure again",
+                max_attempts=2,
+                finished_at="2026-03-07T00:03:00+00:00",
+            )
+            self.assertEqual(status_2, "dead")
+            self.assertEqual(attempt_2, 2)
+            self.assertIsNone(retry_2)
+
+            row = connection.execute(
+                "SELECT status, attempt_count FROM work_items WHERE id = ?",
+                (int(leased_2["id"]),),
+            ).fetchone()
+            self.assertEqual(row[0], "dead")
+            self.assertEqual(int(row[1]), 2)
+        finally:
+            connection.close()
+
+    def test_run_queue_worker_processes_meta_item(self):
+        source_root = self.workspace_root / "storiesofcz_queue_worker"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="meta",
+                video_id="7614444444444444444",
+                now_iso="2026-03-07T00:00:00+00:00",
+                priority=1,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def fake_sync_source(**kwargs):
+            connection_for_sync = kwargs["connection"]
+            target_source = kwargs["source"]
+            target_video_id = str(kwargs["metadata_candidate_ids"][0])
+            self.mod.upsert_download_state(
+                connection=connection_for_sync,
+                source_id=target_source.id,
+                stage="meta",
+                video_id=target_video_id,
+                status="success",
+                run_id=None,
+                attempt_at="2026-03-07T00:04:00+00:00",
+                url=f"https://example.com/{target_video_id}",
+                last_error=None,
+                retry_count=0,
+                next_retry_at=None,
+            )
+            connection_for_sync.commit()
+
+        with mock.patch.object(self.mod, "sync_source", side_effect=fake_sync_source) as sync_mock:
+            self.mod.run_queue_worker(
+                sources=[source],
+                db_path=self.db_path,
+                stages=["meta"],
+                worker_id="worker-ut",
+                lease_seconds=600,
+                poll_interval_sec=0.2,
+                max_items=1,
+                once=False,
+                dry_run=False,
+                max_attempts=3,
+            )
+
+        self.assertEqual(sync_mock.call_count, 1)
+        self.assertFalse(bool(sync_mock.call_args.kwargs["recover_interrupted_runs"]))
+        self.assertTrue(bool(sync_mock.call_args.kwargs["strict_candidate_scope"]))
+        self.assertEqual(sync_mock.call_args.kwargs["metadata_candidate_ids"], ["7614444444444444444"])
+
+        connection_check = sqlite3.connect(str(self.db_path))
+        try:
+            row = connection_check.execute(
+                """
+                SELECT status, attempt_count, last_error
+                FROM work_items
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (source.id, "7614444444444444444"),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "success")
+            self.assertEqual(int(row[1]), 1)
+            self.assertIn(str(row[2] or ""), {"", "None"})
+        finally:
+            connection_check.close()
+
     def test_sync_source_defers_media_discovery_with_recent_attempt(self):
         source_root = self.workspace_root / "storiesofcz"
         source_root.mkdir(parents=True, exist_ok=True)

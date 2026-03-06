@@ -1,7 +1,7 @@
 # 並列ワーカー化設計書（同一source同時実行対応）
 
 更新日: 2026-03-07  
-状態: In Progress（Phase 1 進行中）
+状態: In Progress（Phase 2/3 着手済み）
 
 ## 0. 実装進捗（2026-03-07）
 
@@ -13,13 +13,16 @@
 - `source_poll_state.next_poll_at` を使った source ごとの discovery 間隔制御（既定 24h）を実装。
 - `backfill --execution-mode queue` で window 取得済み ID を `work_items` へ投入。
 - queue 導入に伴う回帰テストを追加（スキーマ作成、enqueue 再投入、poll 間隔抑制）。
+- `queue-worker` コマンドを追加し、`work_items` の lease 取得/期限切れ回収/heartbeat/retry/dead を実装。
+- worker から `sync_source` を stage 別（`media/subs/meta`）に再利用できるようにし、候補限定実行（single video）を追加。
+- worker 実行時は source 共通 `urls.txt` を使わず、一時 `urls.*.txt` を使うようにした。
+- `downloads` に `work_items` の status 集計と pending 行表示を追加。
 
 ### 未着手/継続中
 
-- `work_items` を実際に処理する worker（lease 取得・lease 延長・stale lease 回収）。
-- `meta/subs/media` の各 stage 実行を queue 駆動へ移行。
-- `downloads` への queue 状態統合表示。
-- `urls.txt` の run-local 化と archive 依存の段階削減。
+- lease 延長（長時間処理中の keepalive）と中断検知を追加する。
+- queue 駆動時の stage 間連鎖（`media -> subs/meta -> asr`）を定義する。
+- `urls.txt` run-local 化を legacy 経路にも広げる。
 - legacy 側の `running` 回収ロジック撤去。
 
 ## 1. 背景
