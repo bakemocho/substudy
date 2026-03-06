@@ -90,7 +90,7 @@ DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
-DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr")
+DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness")
 DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS = 6.0
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
@@ -4847,7 +4847,7 @@ def enqueue_downstream_work_items(
 ) -> tuple[int, int, int, int]:
     if str(stage or "").strip().lower() != "media":
         return (0, 0, 0, 0)
-    next_stages = ["subs", "meta"]
+    next_stages = ["subs", "meta", "loudness"]
     if source is not None and source.asr_enabled and bool(source.asr_command):
         next_stages.append("asr")
     inserted = 0
@@ -4990,7 +4990,7 @@ def process_leased_work_item(
     if not video_id:
         return (False, "work item has empty video_id")
 
-    if stage not in {"media", "subs", "meta", "asr"}:
+    if stage not in {"media", "subs", "meta", "asr", "loudness"}:
         return (False, f"unsupported stage: {stage}")
 
     if dry_run:
@@ -5054,7 +5054,7 @@ def process_leased_work_item(
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
-        else:
+        elif stage == "asr":
             asr_ok, asr_error = run_asr_for_video(
                 connection=connection,
                 source=source,
@@ -5065,6 +5065,21 @@ def process_leased_work_item(
             )
             if not asr_ok:
                 return (False, asr_error or f"asr failed ({source.id}/{video_id})")
+        else:
+            loudness_ok, loudness_error = run_loudness_for_video(
+                connection=connection,
+                source=source,
+                video_id=video_id,
+                target_lufs=DEFAULT_LOUDNESS_TARGET_LUFS,
+                max_boost_db=DEFAULT_LOUDNESS_MAX_BOOST_DB,
+                max_cut_db=DEFAULT_LOUDNESS_MAX_CUT_DB,
+                ffmpeg_bin=DEFAULT_LOUDNESS_FFMPEG_BIN,
+            )
+            if not loudness_ok:
+                return (
+                    False,
+                    loudness_error or f"loudness failed ({source.id}/{video_id})",
+                )
     finally:
         if urls_temp_path.exists():
             try:
@@ -5072,7 +5087,7 @@ def process_leased_work_item(
             except OSError:
                 pass
 
-    if stage == "asr":
+    if stage in {"asr", "loudness"}:
         return (True, None)
 
     status, last_error = get_download_state_status(
@@ -5195,7 +5210,6 @@ def run_queue_worker(
                         "stop_event": keepalive_stop_event,
                         "worker_id": worker_id_value,
                     },
-                    daemon=True,
                 )
                 keepalive_thread.start()
             try:
@@ -5212,7 +5226,7 @@ def run_queue_worker(
             finally:
                 keepalive_stop_event.set()
                 if keepalive_thread is not None:
-                    keepalive_thread.join(timeout=2.0)
+                    keepalive_thread.join()
 
             if ok:
                 if complete_work_item_success(
@@ -6211,6 +6225,171 @@ def detect_audio_stream(
         message = merged_output.splitlines()[-1].strip() if merged_output else ""
         return None, message or f"ffprobe exited with code {completed.returncode}"
     return bool(completed.stdout.strip()), None
+
+
+def run_loudness_for_video(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    video_id: str,
+    target_lufs: float = DEFAULT_LOUDNESS_TARGET_LUFS,
+    max_boost_db: float = DEFAULT_LOUDNESS_MAX_BOOST_DB,
+    max_cut_db: float = DEFAULT_LOUDNESS_MAX_CUT_DB,
+    ffmpeg_bin: str = DEFAULT_LOUDNESS_FFMPEG_BIN,
+) -> tuple[bool, str | None]:
+    ffmpeg_candidate = Path(ffmpeg_bin).expanduser()
+    has_explicit_path = ffmpeg_candidate.is_absolute() or "/" in ffmpeg_bin or "\\" in ffmpeg_bin
+    if has_explicit_path:
+        if not ffmpeg_candidate.exists():
+            return (False, f"ffmpeg binary not found: {ffmpeg_candidate}")
+    elif shutil.which(ffmpeg_bin) is None:
+        return (
+            False,
+            f"ffmpeg binary '{ffmpeg_bin}' not found in PATH. Install ffmpeg or pass --ffmpeg-bin.",
+        )
+
+    ffprobe_bin = "ffprobe"
+    if has_explicit_path:
+        sibling_ffprobe = ffmpeg_candidate.with_name("ffprobe")
+        if sibling_ffprobe.exists():
+            ffprobe_bin = str(sibling_ffprobe)
+    has_ffprobe = shutil.which(ffprobe_bin) is not None or (
+        Path(ffprobe_bin).expanduser().is_absolute() and Path(ffprobe_bin).exists()
+    )
+
+    row = connection.execute(
+        """
+        SELECT media_path
+        FROM videos
+        WHERE source_id = ?
+          AND video_id = ?
+          AND has_media = 1
+          AND media_path IS NOT NULL
+        LIMIT 1
+        """,
+        (source.id, video_id),
+    ).fetchone()
+    if row is None:
+        return (False, f"{source.id}/{video_id}: missing ledger row or has_media=0")
+
+    media_path = Path(str(row[0]))
+    analyzed_at = now_utc_iso()
+    safe_boost = max(0.0, float(max_boost_db))
+    safe_cut = max(0.0, float(max_cut_db))
+
+    if not media_path.exists() or not media_path.is_file():
+        connection.execute(
+            """
+            UPDATE videos
+            SET audio_lufs = NULL,
+                audio_gain_db = NULL,
+                audio_loudness_analyzed_at = ?,
+                audio_loudness_error = ?
+            WHERE source_id = ?
+              AND video_id = ?
+            """,
+            (analyzed_at, "media file missing", source.id, video_id),
+        )
+        retry_count, next_retry_at = mark_media_retry_state(
+            connection=connection,
+            source=source,
+            video_id=video_id,
+            reason="media file missing during loudness analysis",
+            attempt_at=analyzed_at,
+        )
+        connection.commit()
+        return (
+            False,
+            f"{source.id}/{video_id}: media file missing "
+            f"(media_retry_count={retry_count} next_retry_at={next_retry_at})",
+        )
+
+    if has_ffprobe:
+        has_audio_stream, probe_error = detect_audio_stream(
+            media_path=media_path,
+            ffprobe_bin=ffprobe_bin,
+        )
+        if has_audio_stream is False:
+            connection.execute(
+                """
+                UPDATE videos
+                SET audio_lufs = NULL,
+                    audio_gain_db = 0.0,
+                    audio_loudness_analyzed_at = ?,
+                    audio_loudness_error = ''
+                WHERE source_id = ?
+                  AND video_id = ?
+                """,
+                (analyzed_at, source.id, video_id),
+            )
+            retry_count, next_retry_at = mark_media_retry_state(
+                connection=connection,
+                source=source,
+                video_id=video_id,
+                reason="no audio stream detected during loudness analysis",
+                attempt_at=analyzed_at,
+            )
+            connection.commit()
+            print(
+                f"[loudness] {source.id}/{video_id}: "
+                "no audio stream (gain=+0.00dB; "
+                f"media_retry_count={retry_count} "
+                f"next_retry_at={next_retry_at})"
+            )
+            return (True, None)
+        if has_audio_stream is None and probe_error:
+            print(
+                f"[loudness] {source.id}/{video_id}: "
+                f"ffprobe warning ({probe_error}); fallback to loudnorm",
+                file=sys.stderr,
+            )
+
+    input_lufs, error = analyze_media_loudness(
+        media_path=media_path,
+        ffmpeg_bin=ffmpeg_bin,
+        target_lufs=target_lufs,
+    )
+    if input_lufs is None:
+        connection.execute(
+            """
+            UPDATE videos
+            SET audio_lufs = NULL,
+                audio_gain_db = NULL,
+                audio_loudness_analyzed_at = ?,
+                audio_loudness_error = ?
+            WHERE source_id = ?
+              AND video_id = ?
+            """,
+            (analyzed_at, error or "loudness analysis failed", source.id, video_id),
+        )
+        connection.commit()
+        return (False, f"{source.id}/{video_id}: {error or 'loudness analysis failed'}")
+
+    raw_gain_db = target_lufs - input_lufs
+    clipped_gain_db = max(-safe_cut, min(safe_boost, raw_gain_db))
+    connection.execute(
+        """
+        UPDATE videos
+        SET audio_lufs = ?,
+            audio_gain_db = ?,
+            audio_loudness_analyzed_at = ?,
+            audio_loudness_error = ''
+        WHERE source_id = ?
+          AND video_id = ?
+        """,
+        (
+            input_lufs,
+            clipped_gain_db,
+            analyzed_at,
+            source.id,
+            video_id,
+        ),
+    )
+    connection.commit()
+    print(
+        f"[loudness] {source.id}/{video_id}: "
+        f"LUFS={input_lufs:.2f} gain={clipped_gain_db:+.2f}dB"
+    )
+    return (True, None)
 
 
 def run_loudness(
@@ -12792,8 +12971,8 @@ def parse_args() -> argparse.Namespace:
         "--stage",
         action="append",
         dest="stages",
-        choices=["media", "subs", "meta", "asr"],
-        help="Stage filter (repeatable). Defaults to media+subs+meta+asr.",
+        choices=["media", "subs", "meta", "asr", "loudness"],
+        help="Stage filter (repeatable). Defaults to media+subs+meta+asr+loudness.",
     )
     queue_worker_parser.add_argument(
         "--worker-id",
@@ -12826,7 +13005,7 @@ def parse_args() -> argparse.Namespace:
     queue_worker_parser.add_argument(
         "--no-enqueue-downstream",
         action="store_true",
-        help="Disable media->subs/meta/asr downstream work item enqueue on success.",
+        help="Disable media->subs/meta/asr/loudness downstream work item enqueue on success.",
     )
     queue_worker_parser.add_argument(
         "--once",

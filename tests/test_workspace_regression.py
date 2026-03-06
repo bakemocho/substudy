@@ -860,6 +860,7 @@ data_dir = "{source_root}"
             self.assertEqual(stage_status.get("media"), "success")
             self.assertEqual(stage_status.get("subs"), "queued")
             self.assertEqual(stage_status.get("meta"), "queued")
+            self.assertEqual(stage_status.get("loudness"), "queued")
         finally:
             connection_check.close()
 
@@ -955,6 +956,7 @@ asr_command = ["echo", "asr"]
             self.assertEqual(stage_status.get("subs"), "queued")
             self.assertEqual(stage_status.get("meta"), "queued")
             self.assertEqual(stage_status.get("asr"), "queued")
+            self.assertEqual(stage_status.get("loudness"), "queued")
         finally:
             connection_check.close()
 
@@ -1122,6 +1124,79 @@ asr_command = ["echo", "asr"]
                 WHERE source_id = ? AND stage = 'asr' AND video_id = ?
                 """,
                 (source.id, "7619999999999999999"),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "success")
+        finally:
+            connection_check.close()
+
+    def test_run_queue_worker_processes_loudness_item(self):
+        source_root = self.workspace_root / "storiesofcz_queue_worker_loudness"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="loudness",
+                video_id="7620000000000000000",
+                now_iso="2026-03-07T00:00:00+00:00",
+                priority=1,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with mock.patch.object(self.mod, "run_loudness_for_video", return_value=(True, None)) as loud_mock:
+            self.mod.run_queue_worker(
+                sources=[source],
+                db_path=self.db_path,
+                stages=["loudness"],
+                worker_id="worker-loudness",
+                lease_seconds=600,
+                poll_interval_sec=0.2,
+                max_items=1,
+                once=False,
+                dry_run=False,
+                max_attempts=3,
+                enqueue_downstream=False,
+            )
+
+        self.assertEqual(loud_mock.call_count, 1)
+        self.assertEqual(str(loud_mock.call_args.kwargs["video_id"]), "7620000000000000000")
+
+        connection_check = sqlite3.connect(str(self.db_path))
+        try:
+            row = connection_check.execute(
+                """
+                SELECT status
+                FROM work_items
+                WHERE source_id = ? AND stage = 'loudness' AND video_id = ?
+                """,
+                (source.id, "7620000000000000000"),
             ).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(str(row[0]), "success")
