@@ -24,22 +24,20 @@
 - `queue-worker` 実行中の lease keepalive（期限延長）を追加。
 - `media` 成功時に `subs/meta/asr/loudness` を downstream として自動 enqueue する連鎖を追加。
 - `subs/asr` 成功時に `translate` を downstream として自動 enqueue する連鎖を追加。
-- legacy 側の interrupted 回収は stale run のみを対象に制限し、同時実行中 run の誤回収リスクを下げた。
+- legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
 
 ### 未着手/継続中
 
-- legacy 側の `running` 回収ロジックを最終的に撤去し、queue lease に統一する。
+- なし（Phase 0-4 の当初タスクは完了）。
 
 ## 1. 背景
 
 現在の `sync/backfill` は source 単位で直列に近い実行モデルで、同一 source を別 terminal から同時実行すると競合しやすい。
 
-主な競合要因:
+主な競合要因（導入前）:
 
-- 起動時の `running` 回収が他プロセスの実行中レコードにも作用し得る  
-  (`recover_interrupted_download_runs`: `/Users/bakemocho/gitwork_bk/substudy/scripts/substudy.py:3868`)
-- source 共通の `urls.txt` を毎回上書きする  
-  (`write_urls_file`: `/Users/bakemocho/gitwork_bk/substudy/scripts/substudy.py:1006`)
+- 起動時に legacy 経路で `running` 回収を行っていたため、他プロセス実行中レコードへの誤作用余地があった（現在は撤去済み）。
+- source 共通の `urls.txt` を毎回上書きしていた（現在は run-local 一時ファイルへ移行済み）。
 - `media_archive`/`subs_archive` 共有前提で、同時更新時の整合性保証が弱い
 
 一方で、source の更新チェックは高コストであり、頻度を抑えつつ、既存 retry/ASR/loudness/translate を並列に回したい。

@@ -91,7 +91,6 @@ DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
-DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS = 6.0
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
 
@@ -1097,7 +1096,6 @@ def sync_source(
     metadata_candidate_ids: list[str] | None = None,
     run_label: str = "sync",
     respect_media_discovery_interval: bool = True,
-    recover_interrupted_runs: bool = True,
     urls_file_override: Path | None = None,
     strict_candidate_scope: bool = False,
 ) -> None:
@@ -1130,19 +1128,6 @@ def sync_source(
     else:
         run_token = f"{int(time.time())}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
         active_urls_file = source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
-    if connection is not None and not dry_run and recover_interrupted_runs:
-        recovered_any = False
-        for stage in ("media", "subs", "meta"):
-            recovered = recover_interrupted_download_runs(
-                connection=connection,
-                source_id=source.id,
-                stage=stage,
-            )
-            if recovered:
-                recovered_any = True
-                print(f"[sync] {source.id} {stage}: recovered {recovered} interrupted runs")
-        if recovered_any:
-            connection.commit()
 
     def safe_video_url(video_id: str) -> str | None:
         try:
@@ -3961,48 +3946,6 @@ def begin_download_run(
     return int(run_id)
 
 
-def recover_interrupted_download_runs(
-    connection: sqlite3.Connection,
-    source_id: str,
-    stage: str,
-    finished_at: str | None = None,
-    min_age_hours: float = DEFAULT_RUNNING_RECOVERY_MIN_AGE_HOURS,
-) -> int:
-    finished_value = finished_at or now_utc_iso()
-    safe_min_age_hours = max(0.0, float(min_age_hours))
-    cutoff_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=safe_min_age_hours)
-    cutoff_iso = cutoff_dt.replace(microsecond=0).isoformat()
-    cursor = connection.execute(
-        """
-        UPDATE download_runs
-        SET status = 'error',
-            finished_at = COALESCE(finished_at, ?),
-            exit_code = COALESCE(exit_code, 130),
-            error_message = CASE
-                WHEN error_message IS NULL OR error_message = '' THEN 'interrupted previous run'
-                ELSE error_message
-            END
-        WHERE source_id = ?
-          AND stage = ?
-          AND status = 'running'
-          AND (
-            ? <= 0
-            OR started_at IS NULL
-            OR started_at = ''
-            OR started_at <= ?
-          )
-        """,
-        (
-            finished_value,
-            source_id,
-            stage,
-            safe_min_age_hours,
-            cutoff_iso,
-        ),
-    )
-    return cursor.rowcount
-
-
 def finish_download_run(
     connection: sqlite3.Connection,
     run_id: int,
@@ -5028,7 +4971,6 @@ def process_leased_work_item(
                 metadata_candidate_ids=None,
                 run_label=run_label,
                 respect_media_discovery_interval=False,
-                recover_interrupted_runs=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
@@ -5043,7 +4985,6 @@ def process_leased_work_item(
                 metadata_candidate_ids=[video_id],
                 run_label=run_label,
                 respect_media_discovery_interval=False,
-                recover_interrupted_runs=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
@@ -5058,7 +4999,6 @@ def process_leased_work_item(
                 metadata_candidate_ids=[video_id],
                 run_label=run_label,
                 respect_media_discovery_interval=False,
-                recover_interrupted_runs=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )

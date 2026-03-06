@@ -1034,7 +1034,6 @@ data_dir = "{source_root}"
             )
 
         self.assertEqual(sync_mock.call_count, 1)
-        self.assertFalse(bool(sync_mock.call_args.kwargs["recover_interrupted_runs"]))
         self.assertTrue(bool(sync_mock.call_args.kwargs["strict_candidate_scope"]))
         self.assertEqual(sync_mock.call_args.kwargs["metadata_candidate_ids"], ["7614444444444444444"])
 
@@ -1495,7 +1494,6 @@ data_dir = "{source_root}"
                         skip_meta=False,
                         connection=connection,
                         metadata_candidate_ids=["7617777777777777777"],
-                        recover_interrupted_runs=False,
                     )
 
             self.assertEqual(len(written_paths), 1)
@@ -1504,74 +1502,6 @@ data_dir = "{source_root}"
             self.assertEqual(active_path.parent.name, "tmp")
             self.assertTrue(active_path.name.startswith("urls."))
             self.assertTrue(active_path.name.endswith(".txt"))
-        finally:
-            connection.close()
-
-    def test_recover_interrupted_download_runs_only_marks_stale_rows(self):
-        connection = sqlite3.connect(str(self.db_path))
-        try:
-            self.mod.create_schema(connection)
-            old_started_at = "2026-03-01T00:00:00+00:00"
-            recent_started_at = self.mod.now_utc_iso()
-            connection.execute(
-                """
-                INSERT INTO download_runs (
-                    source_id, stage, status, command, started_at, target_count
-                ) VALUES (?, ?, 'running', NULL, ?, 0)
-                """,
-                ("storiesofcz", "media", old_started_at),
-            )
-            connection.execute(
-                """
-                INSERT INTO download_runs (
-                    source_id, stage, status, command, started_at, target_count
-                ) VALUES (?, ?, 'running', NULL, ?, 0)
-                """,
-                ("storiesofcz", "media", recent_started_at),
-            )
-            connection.commit()
-
-            recovered_stale = self.mod.recover_interrupted_download_runs(
-                connection=connection,
-                source_id="storiesofcz",
-                stage="media",
-                finished_at="2026-03-07T01:00:00+00:00",
-                min_age_hours=24.0,
-            )
-            self.assertEqual(int(recovered_stale), 1)
-
-            rows_after_stale = connection.execute(
-                """
-                SELECT started_at, status
-                FROM download_runs
-                WHERE source_id = ? AND stage = ?
-                ORDER BY started_at ASC
-                """,
-                ("storiesofcz", "media"),
-            ).fetchall()
-            status_by_started_at = {str(started_at): str(status) for started_at, status in rows_after_stale}
-            self.assertEqual(status_by_started_at[old_started_at], "error")
-            self.assertEqual(status_by_started_at[recent_started_at], "running")
-
-            recovered_all = self.mod.recover_interrupted_download_runs(
-                connection=connection,
-                source_id="storiesofcz",
-                stage="media",
-                finished_at="2026-03-07T01:05:00+00:00",
-                min_age_hours=0.0,
-            )
-            self.assertEqual(int(recovered_all), 1)
-
-            final_rows = connection.execute(
-                """
-                SELECT status
-                FROM download_runs
-                WHERE source_id = ? AND stage = ?
-                ORDER BY run_id ASC
-                """,
-                ("storiesofcz", "media"),
-            ).fetchall()
-            self.assertEqual([str(row[0]) for row in final_rows], ["error", "error"])
         finally:
             connection.close()
 
