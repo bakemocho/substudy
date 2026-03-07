@@ -7,6 +7,7 @@ TRANSLATE_LIMIT ?= 20
 TRANSLATE_TIMEOUT ?= 300
 QUEUE_REQUEUE_ARGS ?=
 QUEUE_RECOVER_KNOWN_ARGS ?=
+QUEUE_STATUS_ARGS ?=
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 
 .PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-requeue queue-recover-known loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
@@ -42,7 +43,7 @@ downloads:
 	$(PYTHON) scripts/substudy.py downloads --config $(CONFIG)
 
 queue-status:
-	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG)
+	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_STATUS_ARGS)
 
 queue-requeue:
 	$(PYTHON) scripts/substudy.py queue-requeue --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_REQUEUE_ARGS)

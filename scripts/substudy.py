@@ -7452,6 +7452,7 @@ def show_queue_status_report(
     sources: list[SourceConfig],
     db_path: Path,
     limit: int = 20,
+    only_unresolved: bool = False,
 ) -> None:
     if not db_path.exists():
         print(f"[queue-status] no ledger DB: {db_path}")
@@ -7462,8 +7463,6 @@ def show_queue_status_report(
     now_iso = now_utc_iso()
 
     for source in sources:
-        print(f"\n=== queue-status: {source.id} ===")
-
         summary_row = connection.execute(
             """
             SELECT
@@ -7498,10 +7497,22 @@ def show_queue_status_report(
             """,
             (now_iso, now_iso, source.id),
         ).fetchone()
+        unresolved_total = 0
+        if summary_row is not None:
+            unresolved_total = (
+                int(summary_row[0] or 0)
+                + int(summary_row[1] or 0)
+                + int(summary_row[2] or 0)
+                + int(summary_row[3] or 0)
+                + int(summary_row[4] or 0)
+            )
+        if only_unresolved and unresolved_total <= 0:
+            continue
+        print(f"\n=== queue-status: {source.id} ===")
         if summary_row is not None:
             print(
                 "queue unresolved total="
-                f"{int(summary_row[0] or 0) + int(summary_row[1] or 0) + int(summary_row[2] or 0) + int(summary_row[3] or 0) + int(summary_row[4] or 0)} "
+                f"{unresolved_total} "
                 f"(queued={int(summary_row[0] or 0)} "
                 f"leased={int(summary_row[1] or 0)} "
                 f"retry_due={int(summary_row[2] or 0)} "
@@ -14044,6 +14055,11 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Max recent failed items per source.",
     )
+    queue_status_parser.add_argument(
+        "--only-unresolved",
+        action="store_true",
+        help="Show only sources that currently have unresolved queue items.",
+    )
     queue_status_parser.add_argument("--ledger-db", type=Path)
 
     queue_requeue_parser = subparsers.add_parser(
@@ -14902,6 +14918,7 @@ def main() -> int:
             sources=sources,
             db_path=ledger_db_path,
             limit=max(1, args.limit),
+            only_unresolved=bool(getattr(args, "only_unresolved", False)),
         )
         return 0
 

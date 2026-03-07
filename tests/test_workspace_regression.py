@@ -762,6 +762,89 @@ data_dir = "{source_root}"
         self.assertIn("stage=asr", rendered)
         self.assertIn("retries=1", rendered)
 
+    def test_show_queue_status_report_only_unresolved_filters_sources(self):
+        source_root_a = self.workspace_root / "storiesofcz_queue_status_only_unresolved_a"
+        source_root_b = self.workspace_root / "factswithcori_queue_status_only_unresolved_b"
+        source_root_a.mkdir(parents=True, exist_ok=True)
+        source_root_b.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root_a}"
+
+[[sources]]
+id = "factswithcori"
+platform = "tiktok"
+url = "https://www.tiktok.com/@factswithcori"
+enabled = true
+data_dir = "{source_root_b}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        source_a = by_id["storiesofcz"]
+        source_b = by_id["factswithcori"]
+
+        now_iso = "2026-03-07T00:00:00+00:00"
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.upsert_source(connection, source_a, now_iso)
+            self.mod.upsert_source(connection, source_b, now_iso)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source_a.id,
+                stage="translate",
+                video_id="7624777777777777771",
+                now_iso=now_iso,
+                priority=1,
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'dead',
+                    attempt_count = 8,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'translate' AND video_id = ?
+                """,
+                (
+                    "work item execution exception: tuple indices must be integers or slices, not str",
+                    now_iso,
+                    source_a.id,
+                    "7624777777777777771",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.mod.show_queue_status_report(
+                sources=[source_a, source_b],
+                db_path=self.db_path,
+                limit=10,
+                only_unresolved=True,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("queue-status: storiesofcz", rendered)
+        self.assertNotIn("queue-status: factswithcori", rendered)
+
     def test_requeue_work_items_filters_by_stage_status_and_error(self):
         source_root = self.workspace_root / "storiesofcz_queue_requeue"
         source_root.mkdir(parents=True, exist_ok=True)
