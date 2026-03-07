@@ -61,6 +61,7 @@ Use `make` for common operations first. Use `python3 scripts/substudy.py ...` wh
   - weak/auto network profile: `python3 scripts/substudy.py sync --config config/sources.toml --network-profile auto`
 - Run only metadata fetch (no media, no subtitles):
   - `make sync-meta-only`
+  - alias: `make sync-meta-missing`
 - Run subtitle fetch for missing subtitles (no media, no metadata):
   - `make sync-subs-missing`
 - Note:
