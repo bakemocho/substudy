@@ -7,6 +7,8 @@ cookies_from_browser = "chrome"
 # Enable when yt-dlp has available impersonation targets (requires curl_cffi).
 # Recommended: "auto" (pick first available modern browser target).
 # ytdlp_impersonate = "auto"
+# Optional: pin yt-dlp binary path for deterministic launchd/manual behavior.
+# ytdlp_bin = "/opt/homebrew/bin/yt-dlp"
 # Primary video format. If this yields no audio stream, sync will try audio donor mux fallback.
 video_format = "bv*+ba/best"
 sub_langs = "en.*,en,und"

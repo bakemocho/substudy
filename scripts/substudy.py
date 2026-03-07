@@ -390,6 +390,32 @@ def resolve_path(base: Path, raw_value: str | None, default: str) -> Path:
     return (base / candidate).resolve()
 
 
+def is_path_like_command(command: str) -> bool:
+    return "/" in command or "\\" in command
+
+
+def find_executable_command(command: str) -> str | None:
+    value = str(command or "").strip()
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute() or is_path_like_command(value):
+        if candidate.exists():
+            return str(candidate)
+        return None
+    return shutil.which(value)
+
+
+def resolve_executable_command(command: str) -> str:
+    resolved = find_executable_command(command)
+    if resolved is not None:
+        return resolved
+    value = str(command or "").strip()
+    if is_path_like_command(value):
+        return str(Path(value).expanduser())
+    return value
+
+
 def parse_optional_path(base: Path, raw_value: Any) -> Path | None:
     if raw_value in (None, ""):
         return None
@@ -788,7 +814,9 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             handle=effective_handle,
             video_url_template=source_raw.get("video_url_template"),
             video_id_regex=str(source_raw.get("video_id_regex", r"_(\d{10,})_")),
-            ytdlp_bin=str(source_raw.get("ytdlp_bin", global_raw.get("ytdlp_bin", "yt-dlp"))),
+            ytdlp_bin=resolve_executable_command(
+                str(source_raw.get("ytdlp_bin", global_raw.get("ytdlp_bin", "yt-dlp")))
+            ),
             ytdlp_impersonate=normalize_ytdlp_impersonate(
                 source_raw.get("ytdlp_impersonate", global_ytdlp_impersonate)
             ),
@@ -1531,8 +1559,8 @@ def sync_source(
             seen_evaluated_media_ids.add(video_id)
             evaluated_media_ids.append(video_id)
 
-        ffprobe_bin = shutil.which("ffprobe")
-        ffmpeg_bin = shutil.which("ffmpeg")
+        ffprobe_bin = find_executable_command("ffprobe")
+        ffmpeg_bin = find_executable_command("ffmpeg")
         media_fallback_work_dir = source.media_dir / ".audio_fallback"
         media_audio_preferred_format: str | None = None
         if connection is not None and not dry_run:
@@ -5309,7 +5337,7 @@ def process_leased_work_item(
                 video_id=video_id,
                 dry_run=False,
                 force=False,
-                ffprobe_bin=shutil.which("ffprobe"),
+                ffprobe_bin=find_executable_command("ffprobe"),
             )
             if not asr_ok:
                 return (False, asr_error or f"asr failed ({source.id}/{video_id})")
@@ -5925,7 +5953,11 @@ def run_asr_for_video(
     if not media_path.exists():
         return (False, f"{source.id}/{video_id}: media file missing ({media_path})")
 
-    ffprobe_value = ffprobe_bin if ffprobe_bin is not None else shutil.which("ffprobe")
+    ffprobe_value = (
+        ffprobe_bin
+        if ffprobe_bin is not None
+        else find_executable_command("ffprobe")
+    )
     has_valid_output = False
     if output_path_value not in (None, ""):
         output_path = Path(str(output_path_value))
@@ -6131,7 +6163,7 @@ def run_asr(
 
     connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
-    ffprobe_bin = shutil.which("ffprobe")
+    ffprobe_bin = find_executable_command("ffprobe")
 
     for source in sources:
         if not source.asr_enabled:
@@ -6509,25 +6541,26 @@ def run_loudness_for_video(
     max_cut_db: float = DEFAULT_LOUDNESS_MAX_CUT_DB,
     ffmpeg_bin: str = DEFAULT_LOUDNESS_FFMPEG_BIN,
 ) -> tuple[bool, str | None]:
-    ffmpeg_candidate = Path(ffmpeg_bin).expanduser()
-    has_explicit_path = ffmpeg_candidate.is_absolute() or "/" in ffmpeg_bin or "\\" in ffmpeg_bin
-    if has_explicit_path:
-        if not ffmpeg_candidate.exists():
+    ffmpeg_candidate = Path(str(ffmpeg_bin)).expanduser()
+    has_explicit_path = ffmpeg_candidate.is_absolute() or is_path_like_command(str(ffmpeg_bin))
+    resolved_ffmpeg_bin = find_executable_command(str(ffmpeg_bin))
+    if resolved_ffmpeg_bin is None:
+        if has_explicit_path:
             return (False, f"ffmpeg binary not found: {ffmpeg_candidate}")
-    elif shutil.which(ffmpeg_bin) is None:
         return (
             False,
             f"ffmpeg binary '{ffmpeg_bin}' not found in PATH. Install ffmpeg or pass --ffmpeg-bin.",
         )
+    ffmpeg_bin = resolved_ffmpeg_bin
 
-    ffprobe_bin = "ffprobe"
+    ffprobe_bin: str | None = None
     if has_explicit_path:
-        sibling_ffprobe = ffmpeg_candidate.with_name("ffprobe")
+        sibling_ffprobe = Path(ffmpeg_bin).expanduser().with_name("ffprobe")
         if sibling_ffprobe.exists():
             ffprobe_bin = str(sibling_ffprobe)
-    has_ffprobe = shutil.which(ffprobe_bin) is not None or (
-        Path(ffprobe_bin).expanduser().is_absolute() and Path(ffprobe_bin).exists()
-    )
+    if ffprobe_bin is None:
+        ffprobe_bin = find_executable_command("ffprobe")
+    has_ffprobe = ffprobe_bin is not None
 
     row = connection.execute(
         """
@@ -6576,7 +6609,7 @@ def run_loudness_for_video(
             f"(media_retry_count={retry_count} next_retry_at={next_retry_at})",
         )
 
-    if has_ffprobe:
+    if has_ffprobe and ffprobe_bin is not None:
         has_audio_stream, probe_error = detect_audio_stream(
             media_path=media_path,
             ffprobe_bin=ffprobe_bin,
@@ -6676,24 +6709,25 @@ def run_loudness(
     ffmpeg_bin: str = DEFAULT_LOUDNESS_FFMPEG_BIN,
 ) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg_candidate = Path(ffmpeg_bin).expanduser()
-    has_explicit_path = ffmpeg_candidate.is_absolute() or "/" in ffmpeg_bin or "\\" in ffmpeg_bin
-    if has_explicit_path:
-        if not ffmpeg_candidate.exists():
+    ffmpeg_candidate = Path(str(ffmpeg_bin)).expanduser()
+    has_explicit_path = ffmpeg_candidate.is_absolute() or is_path_like_command(str(ffmpeg_bin))
+    resolved_ffmpeg_bin = find_executable_command(str(ffmpeg_bin))
+    if resolved_ffmpeg_bin is None:
+        if has_explicit_path:
             raise RuntimeError(f"ffmpeg binary not found: {ffmpeg_candidate}")
-    elif shutil.which(ffmpeg_bin) is None:
         raise RuntimeError(
             f"ffmpeg binary '{ffmpeg_bin}' not found in PATH. "
             "Install ffmpeg or pass --ffmpeg-bin."
         )
-    ffprobe_bin = "ffprobe"
+    ffmpeg_bin = resolved_ffmpeg_bin
+    ffprobe_bin: str | None = None
     if has_explicit_path:
-        sibling_ffprobe = ffmpeg_candidate.with_name("ffprobe")
+        sibling_ffprobe = Path(ffmpeg_bin).expanduser().with_name("ffprobe")
         if sibling_ffprobe.exists():
             ffprobe_bin = str(sibling_ffprobe)
-    has_ffprobe = shutil.which(ffprobe_bin) is not None or (
-        Path(ffprobe_bin).expanduser().is_absolute() and Path(ffprobe_bin).exists()
-    )
+    if ffprobe_bin is None:
+        ffprobe_bin = find_executable_command("ffprobe")
+    has_ffprobe = ffprobe_bin is not None
 
     connection = sqlite3.connect(str(db_path), timeout=30)
     create_schema(connection)
@@ -6784,7 +6818,7 @@ def run_loudness(
                 if has_ffprobe:
                     has_audio_stream, probe_error = detect_audio_stream(
                         media_path=media_path,
-                        ffprobe_bin=ffprobe_bin,
+                        ffprobe_bin=ffprobe_bin if ffprobe_bin is not None else "ffprobe",
                     )
                     if has_audio_stream is False:
                         connection.execute(

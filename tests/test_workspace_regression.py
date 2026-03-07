@@ -220,6 +220,36 @@ enabled = true
         self.assertEqual(likes_source.url, "https://www.tiktok.com/@storiesofcz/liked")
         self.assertEqual(likes_source.origin, "managed")
 
+    def test_load_config_resolves_ytdlp_bin_to_absolute_path(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+ytdlp_bin = "yt-dlp"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        def fake_which(name):
+            if name == "yt-dlp":
+                return "/opt/homebrew/bin/yt-dlp"
+            return None
+
+        with mock.patch.object(self.mod.shutil, "which", side_effect=fake_which):
+            _, sources = self.mod.load_config(config_path)
+        self.assertEqual(sources[0].ytdlp_bin, "/opt/homebrew/bin/yt-dlp")
+
     def test_source_target_api_upsert_and_remove(self):
         config_dir = self.workspace_root / "config"
         config_dir.mkdir(parents=True, exist_ok=True)

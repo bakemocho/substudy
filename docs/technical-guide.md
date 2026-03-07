@@ -134,6 +134,9 @@ Operator note:
   - When set, substudy checks available targets from `yt-dlp --list-impersonate-targets` and applies `--impersonate`.
   - If requested target is unavailable, substudy warns once and falls back (or skips impersonation when none are available).
   - `auto` picks first available target from preferred order: `chrome -> edge -> safari -> firefox -> tor`.
+- `ytdlp_bin`
+  - Substudy resolves command names to absolute executable paths when available.
+  - For deterministic behavior across launchd/manual runs, pin explicitly (example: `/opt/homebrew/bin/yt-dlp`).
 - `asr_*`
   - ASR is primary subtitle pipeline.
   - `asr_command` can use local Whisper CLI (no OpenAI API key required).
