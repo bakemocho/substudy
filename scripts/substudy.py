@@ -6479,6 +6479,17 @@ def parse_finite_float(raw_value: Any) -> float | None:
     return parsed
 
 
+def is_negative_infinite_loudnorm_value(raw_value: Any) -> bool:
+    parsed = safe_float(raw_value)
+    return parsed is not None and math.isinf(parsed) and parsed < 0
+
+
+def is_silent_audio_loudness_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return str(error).strip().lower().startswith("silent audio detected")
+
+
 def analyze_media_loudness(
     media_path: Path,
     ffmpeg_bin: str,
@@ -6516,6 +6527,8 @@ def analyze_media_loudness(
 
     input_lufs = parse_finite_float(stats.get("input_i"))
     if input_lufs is None:
+        if is_negative_infinite_loudnorm_value(stats.get("input_i")):
+            return None, "silent audio detected (input_i=-inf)"
         return None, "invalid input_i in loudnorm output"
     return input_lufs, None
 
@@ -6672,6 +6685,34 @@ def run_loudness_for_video(
         target_lufs=target_lufs,
     )
     if input_lufs is None:
+        if is_silent_audio_loudness_error(error):
+            connection.execute(
+                """
+                UPDATE videos
+                SET audio_lufs = NULL,
+                    audio_gain_db = 0.0,
+                    audio_loudness_analyzed_at = ?,
+                    audio_loudness_error = ''
+                WHERE source_id = ?
+                  AND video_id = ?
+                """,
+                (analyzed_at, source.id, video_id),
+            )
+            retry_count, next_retry_at = mark_media_retry_state(
+                connection=connection,
+                source=source,
+                video_id=video_id,
+                reason="silent audio detected during loudness analysis",
+                attempt_at=analyzed_at,
+            )
+            connection.commit()
+            print(
+                f"[loudness] {source.id}/{video_id}: "
+                "silent audio (gain=+0.00dB; "
+                f"media_retry_count={retry_count} "
+                f"next_retry_at={next_retry_at})"
+            )
+            return (True, None)
         connection.execute(
             """
             UPDATE videos
@@ -6879,6 +6920,35 @@ def run_loudness(
                     target_lufs=target_lufs,
                 )
                 if input_lufs is None:
+                    if is_silent_audio_loudness_error(error):
+                        connection.execute(
+                            """
+                            UPDATE videos
+                            SET audio_lufs = NULL,
+                                audio_gain_db = 0.0,
+                                audio_loudness_analyzed_at = ?,
+                                audio_loudness_error = ''
+                            WHERE source_id = ?
+                              AND video_id = ?
+                            """,
+                            (analyzed_at, source.id, video_id),
+                        )
+                        retry_count, next_retry_at = mark_media_retry_state(
+                            connection=connection,
+                            source=source,
+                            video_id=video_id,
+                            reason="silent audio detected during loudness analysis",
+                            attempt_at=analyzed_at,
+                        )
+                        source_success += 1
+                        print(
+                            f"[loudness] {source.id}/{video_id}: "
+                            "silent audio (gain=+0.00dB; "
+                            f"media_retry_count={retry_count} "
+                            f"next_retry_at={next_retry_at})"
+                        )
+                        connection.commit()
+                        continue
                     connection.execute(
                         """
                         UPDATE videos
