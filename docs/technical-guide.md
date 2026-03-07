@@ -156,6 +156,7 @@ Operator note:
 - Retry delay is failure-aware:
   - Normal failures: exponential backoff from 5m up to 24h.
   - Block/forbidden signatures (`Your IP address is blocked`, `HTTP 403`, `Forbidden`): conservative cool-off (6h -> 12h -> 24h -> 36h -> 48h).
+  - Missing artifact signatures (for example `subtitle file missing after download attempt`, `* did not write a terminal download_state row`): slower structural retry (30m -> 2h -> 6h -> 12h -> 24h).
 - Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
 

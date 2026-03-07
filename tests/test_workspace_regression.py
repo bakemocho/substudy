@@ -589,6 +589,20 @@ enabled = true
         self.assertGreaterEqual(normal_delay, 295)
         self.assertLessEqual(normal_delay, 305)
 
+    def test_schedule_next_retry_iso_uses_structural_backoff_for_missing_artifact_error(self):
+        before = dt.datetime.now(dt.timezone.utc)
+        retry_at = dt.datetime.fromisoformat(
+            self.mod.schedule_next_retry_iso(
+                1,
+                error_message="subtitle file missing after download attempt",
+            )
+        )
+        after = dt.datetime.now(dt.timezone.utc)
+        delay_min = (retry_at - before).total_seconds()
+        delay_max = (retry_at - after).total_seconds()
+        self.assertGreaterEqual(delay_min, (30 * 60) - 5)
+        self.assertLessEqual(delay_max, (30 * 60) + 5)
+
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))
         try:

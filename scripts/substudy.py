@@ -108,6 +108,10 @@ RE_RETRY_BLOCKED_OR_FORBIDDEN = re.compile(
     r"(your ip address is blocked|ip blocked|http error 403|forbidden)",
     re.IGNORECASE,
 )
+RE_RETRY_MISSING_ARTIFACT = re.compile(
+    r"(subtitle file missing after download attempt|did not write a terminal download_state row)",
+    re.IGNORECASE,
+)
 
 _YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
 _YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
@@ -4224,6 +4228,13 @@ def is_blocked_or_forbidden_error(error_message: str | None) -> bool:
     return RE_RETRY_BLOCKED_OR_FORBIDDEN.search(text) is not None
 
 
+def is_missing_artifact_error(error_message: str | None) -> bool:
+    text = str(error_message or "").strip()
+    if not text:
+        return False
+    return RE_RETRY_MISSING_ARTIFACT.search(text) is not None
+
+
 def schedule_next_retry_iso(
     retry_count: int,
     error_message: str | None = None,
@@ -4233,6 +4244,11 @@ def schedule_next_retry_iso(
         blocked_backoff_seconds = (21600, 43200, 86400, 129600, 172800)
         index = min(max(0, retry_count - 1), len(blocked_backoff_seconds) - 1)
         delay_seconds = blocked_backoff_seconds[index]
+    elif is_missing_artifact_error(error_message):
+        # Structural misses (missing subtitle/meta artifacts) should not spin quickly.
+        missing_artifact_backoff_seconds = (1800, 7200, 21600, 43200, 86400)
+        index = min(max(0, retry_count - 1), len(missing_artifact_backoff_seconds) - 1)
+        delay_seconds = missing_artifact_backoff_seconds[index]
     else:
         # Exponential backoff with 5m base, capped at 24h.
         delay_seconds = min(300 * (2 ** max(0, retry_count - 1)), 86400)
