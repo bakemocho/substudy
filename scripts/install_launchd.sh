@@ -30,9 +30,6 @@ QUEUE_WORKER_POLL_SEC="${SUBSTUDY_QUEUE_WORKER_POLL_SEC:-2.0}"
 QUEUE_WORKER_MAX_ATTEMPTS="${SUBSTUDY_QUEUE_WORKER_MAX_ATTEMPTS:-8}"
 MEDIA_WORKER_MAX_ITEMS="${SUBSTUDY_MEDIA_WORKER_MAX_ITEMS:-80}"
 PIPELINE_WORKER_MAX_ITEMS="${SUBSTUDY_PIPELINE_WORKER_MAX_ITEMS:-120}"
-TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
-TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
-TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
 
 DAILY_LABEL="${LABEL_PREFIX}.daily"
 WEEKLY_LABEL="${LABEL_PREFIX}.weekly_full"
@@ -194,14 +191,7 @@ write_pipeline_worker_plist() {
     <string>asr</string>
     <string>--stage</string>
     <string>loudness</string>
-    <string>--stage</string>
-    <string>translate</string>
-    <string>--translate-target-lang</string>
-    <string>${TRANSLATE_TARGET_LANG}</string>
-    <string>--translate-source-track</string>
-    <string>${TRANSLATE_SOURCE_TRACK}</string>
-    <string>--translate-timeout-sec</string>
-    <string>${TRANSLATE_TIMEOUT}</string>
+    <string>--no-enqueue-downstream</string>
     <string>--max-items</string>
     <string>${PIPELINE_WORKER_MAX_ITEMS}</string>
     <string>--lease-sec</string>

@@ -31,6 +31,7 @@
 - `technical-guide.md` に producer/worker 分離運用（手動コマンド・install時オプション）を追記。
 - daily/weekly ランナーから `asr/loudness/translate-local` 直実行レーンを撤去し、queue-worker 駆動へ統一。
 - `queue-recover-known` を追加し、既知の回復可能障害（例: translate row_factory 回帰）を条件付きで再キュー投入できるようにした。
+- daily/weekly/launchd の pipeline worker から `translate` stage を一時除外し、`subs/asr` からの downstream `translate` enqueue も automation では停止した（`--no-enqueue-downstream`）。
 
 ### 未着手/継続中
 
@@ -273,7 +274,7 @@ lease 失効時:
    - `backfill --execution-mode queue --skip-ledger`
 2. launchd worker ジョブ（複数定義可）:
    - `queue-worker --stage media --max-items ...`
-   - `queue-worker --stage subs --stage meta --stage asr --stage loudness --stage translate`
+   - `queue-worker --stage subs --stage meta --stage asr --stage loudness --no-enqueue-downstream`（translate は一時停止中）
 3. launchd catch-up ジョブ:
    - `ledger --incremental`
    - `downloads`

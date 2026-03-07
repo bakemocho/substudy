@@ -59,6 +59,8 @@ Use `make` for common operations first. Use `python3 scripts/substudy.py ...` wh
 - Run one sync manually:
   - `make sync`
   - weak/auto network profile: `python3 scripts/substudy.py sync --config config/sources.toml --network-profile auto`
+- Note:
+  - Daily/weekly automation currently excludes queue-based `translate` processing (temporary quality hold).
 
 ### Queue failure handling and retry
 

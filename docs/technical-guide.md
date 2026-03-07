@@ -66,8 +66,8 @@ python3 scripts/substudy.py web --host 127.0.0.1 --port 8890
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
-- `scripts/run_daily_sync.sh`: daily queue wrapper (`sync/backfill --execution-mode queue` producer + `queue-worker` lanes + incremental ledger + guarded yt-dlp update check)
-- `scripts/run_weekly_full_sync.sh`: weekly queue wrapper (includes yt-dlp auto-update matching active binary, queue producer/worker flow, full ledger)
+- `scripts/run_daily_sync.sh`: daily queue wrapper (`sync/backfill --execution-mode queue` producer + `queue-worker` lanes + incremental ledger + guarded yt-dlp update check, translate stage excluded)
+- `scripts/run_weekly_full_sync.sh`: weekly queue wrapper (includes yt-dlp auto-update matching active binary, queue producer/worker flow, full ledger, translate stage excluded)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
 - `docs/local-translation-quality-lab.md`: ローカル翻訳品質の仮説検証ログ
@@ -252,8 +252,8 @@ python3 scripts/substudy.py backfill --config config/sources.toml --execution-mo
 # worker: media lane
 python3 scripts/substudy.py queue-worker --config config/sources.toml --stage media
 
-# worker: pipeline lane
-python3 scripts/substudy.py queue-worker --config config/sources.toml --stage subs --stage meta --stage asr --stage loudness --stage translate --translate-target-lang ja-local --translate-source-track auto
+# worker: pipeline lane (translate excluded)
+python3 scripts/substudy.py queue-worker --config config/sources.toml --stage subs --stage meta --stage asr --stage loudness --no-enqueue-downstream
 ```
 
 Notes:
@@ -261,6 +261,8 @@ Notes:
 - `sync/backfill --execution-mode queue` use a shared producer lock (`data/locks/producer.lock`).
 - If another producer is running, new producer runs exit immediately with lock-busy error.
 - `queue-worker` has no producer lock and is safe to run multiple instances in parallel.
+- `translate` queue processing is intentionally excluded from daily/weekly automation while local translation quality is being tuned.
+- Run translation manually when needed (`make translate-local` / `make translate-local-all`).
 - launchd worker jobs set PATH explicitly (`/opt/homebrew/bin:/usr/local/bin:...`) so `ffmpeg/ffprobe` are discoverable.
 
 Metered-link safeguards (`run_daily_sync.sh` / `run_weekly_full_sync.sh`):

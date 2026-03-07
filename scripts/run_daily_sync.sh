@@ -72,9 +72,6 @@ QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
 QUEUE_RECOVER_KNOWN_ENABLED="${SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED:-1}"
 QUEUE_RECOVER_KNOWN_PROFILES="${SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES:-all}"
 QUEUE_RECOVER_KNOWN_LIMIT="${SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT:-0}"
-TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
-TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
-TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
 YTDLP_UPDATE_MODE="${SUBSTUDY_YTDLP_UPDATE_MODE:-auto}"
 YTDLP_UV_WITH_CURL_CFFI="${SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI:-1}"
 YTDLP_UPDATE_INTERVAL_SEC="${SUBSTUDY_YTDLP_UPDATE_INTERVAL_SEC:-86400}"
@@ -468,12 +465,14 @@ try:
         """
         SELECT COUNT(*)
         FROM work_items
-        WHERE status IN ('queued', 'leased')
+        WHERE stage != 'translate'
+          AND (
+             status IN ('queued', 'leased')
            OR (
              status = 'error'
              AND next_retry_at IS NOT NULL
              AND next_retry_at <= ?
-           )
+           ))
         """,
         (now_iso,),
     ).fetchone()
@@ -534,10 +533,7 @@ if [[ "${PIPELINE_WORKER_ENABLED}" != "0" ]]; then
     --stage meta \
     --stage asr \
     --stage loudness \
-    --stage translate \
-    --translate-target-lang "${TRANSLATE_TARGET_LANG}" \
-    --translate-source-track "${TRANSLATE_SOURCE_TRACK}" \
-    --translate-timeout-sec "${TRANSLATE_TIMEOUT}" \
+    --no-enqueue-downstream \
     --max-items "${PIPELINE_WORKER_MAX_ITEMS}"
 fi
 
