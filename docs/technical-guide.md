@@ -66,8 +66,8 @@ python3 scripts/substudy.py web --host 127.0.0.1 --port 8890
 - `scripts/web/index.html`: study UI shell
 - `scripts/web/app.js`: feed/subtitle/bookmark interactions + shortcuts
 - `scripts/web/styles.css`: TikTok-style vertical feed design
-- `scripts/run_daily_sync.sh`: daily queue wrapper (`sync/backfill --execution-mode queue` producer + `queue-worker` lanes + incremental ledger)
-- `scripts/run_weekly_full_sync.sh`: weekly queue wrapper (includes `brew upgrade yt-dlp`, queue producer/worker flow, full ledger)
+- `scripts/run_daily_sync.sh`: daily queue wrapper (`sync/backfill --execution-mode queue` producer + `queue-worker` lanes + incremental ledger + guarded yt-dlp update check)
+- `scripts/run_weekly_full_sync.sh`: weekly queue wrapper (includes yt-dlp auto-update matching active binary, queue producer/worker flow, full ledger)
 - `scripts/install_launchd.sh`: install/update launchd jobs
 - `docs/subtitle-translation.md`: 字幕和訳の手順書/要件
 - `docs/local-translation-quality-lab.md`: ローカル翻訳品質の仮説検証ログ
@@ -245,6 +245,27 @@ Metered-link safeguards (`run_daily_sync.sh` / `run_weekly_full_sync.sh`):
   - `SUBSTUDY_METERED_LINK_MODE=auto|on|off`
   - `SUBSTUDY_METERED_MIN_ARCHIVE_IDS` (default: `200`)
   - `SUBSTUDY_METERED_PLAYLIST_END` (default: `40`)
+
+Daily yt-dlp update policy (`run_daily_sync.sh`):
+
+- `SUBSTUDY_YTDLP_UPDATE_MODE=auto|uv|brew|off` (default: `auto`)
+- `SUBSTUDY_YTDLP_UPDATE_INTERVAL_SEC` (default: `86400`)
+  - `daily` start時に更新要否を判定し、クールダウン内は更新をスキップ
+  - 多重起動時は `data/locks/ytdlp_update.lock` で同時更新を抑止
+- `auto`:
+  - if active `ytdlp_bin` resolves to `~/.local/bin/yt-dlp`, use `uv tool install yt-dlp --with curl-cffi --force`
+  - otherwise try `brew upgrade yt-dlp`
+- `SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI=1|0` (default: `1`)
+  - set `0` to run `uv tool install yt-dlp --force` without `curl-cffi`
+
+Weekly yt-dlp update policy (`run_weekly_full_sync.sh`):
+
+- `SUBSTUDY_YTDLP_UPDATE_MODE=auto|uv|brew|off` (default: `auto`)
+- `auto`:
+  - if active `ytdlp_bin` resolves to `~/.local/bin/yt-dlp`, use `uv tool install yt-dlp --with curl-cffi --force`
+  - otherwise try `brew upgrade yt-dlp`
+- `SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI=1|0` (default: `1`)
+  - set `0` to run `uv tool install yt-dlp --force` without `curl-cffi`
 
 ## Dictionary source prep (EIJIRO)
 

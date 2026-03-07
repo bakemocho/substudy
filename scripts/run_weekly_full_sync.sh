@@ -71,6 +71,8 @@ QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
 TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
+YTDLP_UPDATE_MODE="${SUBSTUDY_YTDLP_UPDATE_MODE:-auto}"
+YTDLP_UV_WITH_CURL_CFFI="${SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI:-1}"
 
 while (($# > 0)); do
   case "$1" in
@@ -102,6 +104,109 @@ run_substudy() {
     cmd+=("${SOURCE_ARGS[@]}")
   fi
   "${cmd[@]}"
+}
+
+resolve_configured_ytdlp_bin() {
+  "${PYTHON_BIN}" - "${CONFIG_PATH}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+config_path = Path(sys.argv[1])
+try:
+    with config_path.open("rb") as fh:
+        config = tomllib.load(fh)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+value = config.get("global", {}).get("ytdlp_bin", "")
+print(value if isinstance(value, str) else "")
+PY
+}
+
+resolve_effective_ytdlp_bin() {
+  local configured=""
+  configured="$(resolve_configured_ytdlp_bin)"
+  if [[ -n "${configured}" ]]; then
+    if [[ "${configured}" == */* ]]; then
+      if [[ -x "${configured}" ]]; then
+        printf '%s\n' "${configured}"
+        return 0
+      fi
+    elif command -v "${configured}" >/dev/null 2>&1; then
+      command -v "${configured}"
+      return 0
+    fi
+  fi
+  if command -v yt-dlp >/dev/null 2>&1; then
+    command -v yt-dlp
+    return 0
+  fi
+  printf '%s\n' ""
+}
+
+run_ytdlp_update() {
+  local mode="$1"
+  local runtime_bin="$2"
+  local use_uv="0"
+
+  case "${mode}" in
+    off)
+      echo "[weekly] yt-dlp update skipped (mode=off)"
+      return 0
+      ;;
+    auto|uv|brew)
+      ;;
+    *)
+      echo "[weekly] warning: unknown SUBSTUDY_YTDLP_UPDATE_MODE='${mode}', fallback to auto" >&2
+      mode="auto"
+      ;;
+  esac
+
+  if [[ "${mode}" == "uv" ]]; then
+    use_uv="1"
+  elif [[ "${mode}" == "auto" && "${runtime_bin}" == "${HOME}/.local/bin/yt-dlp" ]]; then
+    use_uv="1"
+  fi
+
+  if [[ "${use_uv}" == "1" ]]; then
+    if command -v uv >/dev/null 2>&1; then
+      if [[ "${YTDLP_UV_WITH_CURL_CFFI}" == "0" ]]; then
+        echo "[weekly] uv tool install yt-dlp --force"
+        if uv tool install yt-dlp --force; then
+          echo "[weekly] yt-dlp upgraded via uv"
+        else
+          echo "[weekly] warning: uv yt-dlp upgrade failed; continuing" >&2
+        fi
+      else
+        echo "[weekly] uv tool install yt-dlp --with curl-cffi --force"
+        if uv tool install yt-dlp --with curl-cffi --force; then
+          echo "[weekly] yt-dlp upgraded via uv (+curl-cffi)"
+        else
+          echo "[weekly] warning: uv yt-dlp (+curl-cffi) upgrade failed; continuing" >&2
+        fi
+      fi
+    else
+      echo "[weekly] warning: uv not found; skip uv yt-dlp upgrade" >&2
+    fi
+    return 0
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    if brew list --formula yt-dlp >/dev/null 2>&1; then
+      echo "[weekly] brew upgrade yt-dlp"
+      if brew upgrade yt-dlp; then
+        echo "[weekly] yt-dlp upgraded via brew"
+      else
+        echo "[weekly] warning: brew yt-dlp upgrade failed; continuing" >&2
+      fi
+    else
+      echo "[weekly] warning: yt-dlp is not a Homebrew formula; skip brew upgrade" >&2
+    fi
+  else
+    echo "[weekly] warning: Homebrew not found; skip brew yt-dlp upgrade" >&2
+  fi
 }
 
 route_default_field() {
@@ -234,24 +339,12 @@ if [[ "${IS_METERED_LINK}" == "1" ]]; then
   )
 fi
 
-# Keep yt-dlp fresh, but do not block weekly sync if Homebrew update fails.
-if command -v brew >/dev/null 2>&1; then
-  if brew list --formula yt-dlp >/dev/null 2>&1; then
-    echo "[weekly] brew upgrade yt-dlp"
-    if brew upgrade yt-dlp; then
-      echo "[weekly] yt-dlp upgraded"
-    else
-      echo "[weekly] warning: yt-dlp upgrade failed; continuing" >&2
-    fi
-  else
-    echo "[weekly] warning: yt-dlp is not a Homebrew formula; skip upgrade" >&2
-  fi
-else
-  echo "[weekly] warning: Homebrew not found; skip yt-dlp upgrade" >&2
-fi
-
-if command -v yt-dlp >/dev/null 2>&1; then
-  echo "[weekly] yt-dlp version: $(yt-dlp --version)"
+EFFECTIVE_YTDLP_BIN="$(resolve_effective_ytdlp_bin)"
+echo "[weekly] yt-dlp target=${EFFECTIVE_YTDLP_BIN:-not-found} update-mode=${YTDLP_UPDATE_MODE}"
+run_ytdlp_update "${YTDLP_UPDATE_MODE}" "${EFFECTIVE_YTDLP_BIN}"
+EFFECTIVE_YTDLP_BIN="$(resolve_effective_ytdlp_bin)"
+if [[ -n "${EFFECTIVE_YTDLP_BIN}" ]]; then
+  echo "[weekly] yt-dlp version: $("${EFFECTIVE_YTDLP_BIN}" --version 2>/dev/null || echo unknown)"
 fi
 
 SYNC_PID=""

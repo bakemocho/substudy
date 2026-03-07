@@ -1,7 +1,7 @@
 PYTHON ?= python3
 CONFIG ?= config/sources.toml
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index privacy-check test
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index daily daily-source privacy-check test
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -35,6 +35,16 @@ loudness:
 
 dict-index:
 	$(PYTHON) scripts/substudy.py dict-index --config $(CONFIG)
+
+daily:
+	./scripts/run_daily_sync.sh
+
+daily-source:
+	@if [ -z "$(SOURCE)" ]; then \
+		echo "error: SOURCE is required (usage: make daily-source SOURCE=<source_id>)" >&2; \
+		exit 1; \
+	fi
+	./scripts/run_daily_sync.sh --source "$(SOURCE)"
 
 privacy-check:
 	./scripts/privacy_check.sh

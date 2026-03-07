@@ -72,6 +72,11 @@ QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
 TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
+YTDLP_UPDATE_MODE="${SUBSTUDY_YTDLP_UPDATE_MODE:-auto}"
+YTDLP_UV_WITH_CURL_CFFI="${SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI:-1}"
+YTDLP_UPDATE_INTERVAL_SEC="${SUBSTUDY_YTDLP_UPDATE_INTERVAL_SEC:-86400}"
+YTDLP_UPDATE_STATE_FILE="${SUBSTUDY_YTDLP_UPDATE_STATE_FILE:-${REPO_ROOT}/data/runtime/yt_dlp_update_state}"
+YTDLP_UPDATE_LOCK_DIR="${SUBSTUDY_YTDLP_UPDATE_LOCK_DIR:-${REPO_ROOT}/data/locks/ytdlp_update.lock}"
 while (($# > 0)); do
   case "$1" in
     --source)
@@ -102,6 +107,178 @@ run_substudy() {
     cmd+=("${SOURCE_ARGS[@]}")
   fi
   "${cmd[@]}"
+}
+
+resolve_configured_ytdlp_bin() {
+  "${PYTHON_BIN}" - "${CONFIG_PATH}" <<'PY'
+from pathlib import Path
+import sys
+import tomllib
+
+config_path = Path(sys.argv[1])
+try:
+    with config_path.open("rb") as fh:
+        config = tomllib.load(fh)
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+value = config.get("global", {}).get("ytdlp_bin", "")
+print(value if isinstance(value, str) else "")
+PY
+}
+
+resolve_effective_ytdlp_bin() {
+  local configured=""
+  configured="$(resolve_configured_ytdlp_bin)"
+  if [[ -n "${configured}" ]]; then
+    if [[ "${configured}" == */* ]]; then
+      if [[ -x "${configured}" ]]; then
+        printf '%s\n' "${configured}"
+        return 0
+      fi
+    elif command -v "${configured}" >/dev/null 2>&1; then
+      command -v "${configured}"
+      return 0
+    fi
+  fi
+  if command -v yt-dlp >/dev/null 2>&1; then
+    command -v yt-dlp
+    return 0
+  fi
+  printf '%s\n' ""
+}
+
+run_ytdlp_update() {
+  local mode="$1"
+  local runtime_bin="$2"
+  local use_uv="0"
+
+  case "${mode}" in
+    off)
+      echo "[daily] yt-dlp update skipped (mode=off)"
+      return 0
+      ;;
+    auto|uv|brew)
+      ;;
+    *)
+      echo "[daily] warning: unknown SUBSTUDY_YTDLP_UPDATE_MODE='${mode}', fallback to auto" >&2
+      mode="auto"
+      ;;
+  esac
+
+  if [[ "${mode}" == "uv" ]]; then
+    use_uv="1"
+  elif [[ "${mode}" == "auto" && "${runtime_bin}" == "${HOME}/.local/bin/yt-dlp" ]]; then
+    use_uv="1"
+  fi
+
+  if [[ "${use_uv}" == "1" ]]; then
+    if command -v uv >/dev/null 2>&1; then
+      if [[ "${YTDLP_UV_WITH_CURL_CFFI}" == "0" ]]; then
+        echo "[daily] uv tool install yt-dlp --force"
+        if uv tool install yt-dlp --force; then
+          echo "[daily] yt-dlp upgraded via uv"
+        else
+          echo "[daily] warning: uv yt-dlp upgrade failed; continuing" >&2
+        fi
+      else
+        echo "[daily] uv tool install yt-dlp --with curl-cffi --force"
+        if uv tool install yt-dlp --with curl-cffi --force; then
+          echo "[daily] yt-dlp upgraded via uv (+curl-cffi)"
+        else
+          echo "[daily] warning: uv yt-dlp (+curl-cffi) upgrade failed; continuing" >&2
+        fi
+      fi
+    else
+      echo "[daily] warning: uv not found; skip uv yt-dlp upgrade" >&2
+    fi
+    return 0
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    if brew list --formula yt-dlp >/dev/null 2>&1; then
+      echo "[daily] brew upgrade yt-dlp"
+      if brew upgrade yt-dlp; then
+        echo "[daily] yt-dlp upgraded via brew"
+      else
+        echo "[daily] warning: brew yt-dlp upgrade failed; continuing" >&2
+      fi
+    else
+      echo "[daily] warning: yt-dlp is not a Homebrew formula; skip brew upgrade" >&2
+    fi
+  else
+    echo "[daily] warning: Homebrew not found; skip brew yt-dlp upgrade" >&2
+  fi
+}
+
+read_ytdlp_last_update_epoch() {
+  if [[ -f "${YTDLP_UPDATE_STATE_FILE}" ]]; then
+    cat "${YTDLP_UPDATE_STATE_FILE}" 2>/dev/null || true
+  fi
+}
+
+write_ytdlp_last_update_epoch() {
+  local now_epoch="$1"
+  mkdir -p "$(dirname "${YTDLP_UPDATE_STATE_FILE}")"
+  printf '%s\n' "${now_epoch}" > "${YTDLP_UPDATE_STATE_FILE}"
+}
+
+is_ytdlp_update_due() {
+  local interval="$1"
+  local now_epoch="$2"
+  local last_epoch=""
+  local elapsed=""
+
+  if [[ "${interval}" -le 0 ]]; then
+    return 0
+  fi
+  last_epoch="$(read_ytdlp_last_update_epoch)"
+  if ! [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  elapsed=$((now_epoch - last_epoch))
+  if ((elapsed < interval)); then
+    return 1
+  fi
+  return 0
+}
+
+run_daily_ytdlp_update_guarded() {
+  local now_epoch=""
+  local effective_bin=""
+  local rc=0
+
+  now_epoch="$(date +%s)"
+  if ! is_ytdlp_update_due "${YTDLP_UPDATE_INTERVAL_SEC}" "${now_epoch}"; then
+    echo "[daily] yt-dlp update skipped (cooldown active: ${YTDLP_UPDATE_INTERVAL_SEC}s)"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${YTDLP_UPDATE_LOCK_DIR}")"
+  if ! mkdir "${YTDLP_UPDATE_LOCK_DIR}" 2>/dev/null; then
+    echo "[daily] yt-dlp update skipped (another updater is running)"
+    return 0
+  fi
+  {
+    now_epoch="$(date +%s)"
+    if ! is_ytdlp_update_due "${YTDLP_UPDATE_INTERVAL_SEC}" "${now_epoch}"; then
+      echo "[daily] yt-dlp update skipped after lock (cooldown active)"
+      return 0
+    fi
+
+    effective_bin="$(resolve_effective_ytdlp_bin)"
+    echo "[daily] yt-dlp target=${effective_bin:-not-found} update-mode=${YTDLP_UPDATE_MODE} interval=${YTDLP_UPDATE_INTERVAL_SEC}s"
+    run_ytdlp_update "${YTDLP_UPDATE_MODE}" "${effective_bin}" || true
+    write_ytdlp_last_update_epoch "${now_epoch}"
+
+    effective_bin="$(resolve_effective_ytdlp_bin)"
+    if [[ -n "${effective_bin}" ]]; then
+      echo "[daily] yt-dlp version: $("${effective_bin}" --version 2>/dev/null || echo unknown)"
+    fi
+  } || rc=$?
+  rm -rf "${YTDLP_UPDATE_LOCK_DIR}" 2>/dev/null || true
+  return "${rc}"
 }
 
 route_default_field() {
@@ -233,6 +410,8 @@ if [[ "${IS_METERED_LINK}" == "1" ]]; then
     --metered-playlist-end "${METERED_PLAYLIST_END}"
   )
 fi
+
+run_daily_ytdlp_update_guarded
 
 SYNC_PID=""
 declare -a WORKER_PIDS=()
