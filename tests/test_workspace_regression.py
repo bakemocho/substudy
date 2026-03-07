@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import datetime as dt
 from unittest import mock
 import urllib.request
 from pathlib import Path
@@ -533,6 +534,30 @@ enabled = true
         command = captured["command"]
         self.assertIn("--impersonate", command)
         self.assertIn("chrome", command)
+
+    def test_schedule_next_retry_iso_uses_longer_backoff_for_blocked_error(self):
+        before = dt.datetime.now(dt.timezone.utc)
+        blocked_retry_at = dt.datetime.fromisoformat(
+            self.mod.schedule_next_retry_iso(
+                1,
+                error_message="ERROR: [TikTok] Your IP address is blocked from accessing this post",
+            )
+        )
+        after = dt.datetime.now(dt.timezone.utc)
+        blocked_delay_min = (blocked_retry_at - before).total_seconds()
+        blocked_delay_max = (blocked_retry_at - after).total_seconds()
+        self.assertGreaterEqual(blocked_delay_min, (6 * 3600) - 5)
+        self.assertLessEqual(blocked_delay_max, (6 * 3600) + 5)
+
+        normal_retry_at = dt.datetime.fromisoformat(
+            self.mod.schedule_next_retry_iso(
+                1,
+                error_message="temporary downloader error",
+            )
+        )
+        normal_delay = (normal_retry_at - after).total_seconds()
+        self.assertGreaterEqual(normal_delay, 295)
+        self.assertLessEqual(normal_delay, 305)
 
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))

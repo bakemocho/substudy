@@ -104,6 +104,10 @@ DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
+RE_RETRY_BLOCKED_OR_FORBIDDEN = re.compile(
+    r"(your ip address is blocked|ip blocked|http error 403|forbidden)",
+    re.IGNORECASE,
+)
 
 _YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
 _YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
@@ -2031,7 +2035,10 @@ def sync_source(
                     url=safe_video_url(video_id),
                     last_error=fallback_error,
                     retry_count=next_retry_count,
-                    next_retry_at=schedule_next_retry_iso(next_retry_count),
+                    next_retry_at=schedule_next_retry_iso(
+                        next_retry_count,
+                        error_message=fallback_error,
+                    ),
                 )
 
             if repaired_media_ids:
@@ -2326,7 +2333,10 @@ def sync_source(
                             url=safe_video_url(video_id),
                             last_error=failure_reason,
                             retry_count=next_retry_count,
-                            next_retry_at=schedule_next_retry_iso(next_retry_count),
+                            next_retry_at=schedule_next_retry_iso(
+                                next_retry_count,
+                                error_message=failure_reason,
+                            ),
                         )
 
                     finish_download_run(
@@ -2545,7 +2555,10 @@ def sync_source(
                 url=safe_video_url(video_id),
                 last_error=failure_reason,
                 retry_count=next_retry_count,
-                next_retry_at=schedule_next_retry_iso(next_retry_count),
+                next_retry_at=schedule_next_retry_iso(
+                    next_retry_count,
+                    error_message=failure_reason,
+                ),
             )
 
         finish_download_run(
@@ -4176,9 +4189,25 @@ def build_ledger(
     print(f"[ledger] sqlite ({mode}) -> {db_path}")
 
 
-def schedule_next_retry_iso(retry_count: int) -> str:
-    # Exponential backoff with 5m base, capped at 24h.
-    delay_seconds = min(300 * (2 ** max(0, retry_count - 1)), 86400)
+def is_blocked_or_forbidden_error(error_message: str | None) -> bool:
+    text = str(error_message or "").strip()
+    if not text:
+        return False
+    return RE_RETRY_BLOCKED_OR_FORBIDDEN.search(text) is not None
+
+
+def schedule_next_retry_iso(
+    retry_count: int,
+    error_message: str | None = None,
+) -> str:
+    if is_blocked_or_forbidden_error(error_message):
+        # More conservative cool-off for likely IP blocks / hard 403s.
+        blocked_backoff_seconds = (21600, 43200, 86400, 129600, 172800)
+        index = min(max(0, retry_count - 1), len(blocked_backoff_seconds) - 1)
+        delay_seconds = blocked_backoff_seconds[index]
+    else:
+        # Exponential backoff with 5m base, capped at 24h.
+        delay_seconds = min(300 * (2 ** max(0, retry_count - 1)), 86400)
     retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=delay_seconds)
     return retry_at.replace(microsecond=0).isoformat()
 
@@ -4371,7 +4400,10 @@ def mark_media_retry_state(
         next_retry_at = current_next_retry
     else:
         next_retry_count = current_retry_count + 1
-        next_retry_at = schedule_next_retry_iso(next_retry_count)
+        next_retry_at = schedule_next_retry_iso(
+            next_retry_count,
+            error_message=reason,
+        )
 
     video_url: str | None = None
     try:
@@ -5115,7 +5147,10 @@ def fail_work_item_lease(
         next_retry_at = None
     else:
         next_status = "error"
-        next_retry_at = schedule_next_retry_iso(next_attempt_count)
+        next_retry_at = schedule_next_retry_iso(
+            next_attempt_count,
+            error_message=safe_error,
+        )
 
     updated = connection.execute(
         """

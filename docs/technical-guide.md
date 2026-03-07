@@ -146,6 +146,9 @@ Operator note:
 - `download_state` table:
   - Per-video latest status for each stage.
 - Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
+- Retry delay is failure-aware:
+  - Normal failures: exponential backoff from 5m up to 24h.
+  - Block/forbidden signatures (`Your IP address is blocked`, `HTTP 403`, `Forbidden`): conservative cool-off (6h -> 12h -> 24h -> 36h -> 48h).
 - Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
 
