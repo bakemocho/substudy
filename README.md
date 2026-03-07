@@ -13,7 +13,7 @@ This repository provides a local study tool focused on:
 
 If you are new here, start with:
 
-1. `config/sources.example.toml` -> `config/sources.toml`
+1. local-only files initialization (`make init-local`)
 2. basic sync (`sync`)
 3. web UI launch (`web`)
 
@@ -22,7 +22,7 @@ If you are new here, start with:
 1. Create local config:
 
 ```bash
-cp config/sources.example.toml config/sources.toml
+make init-local
 ```
 
 2. Run incremental sync:
@@ -49,6 +49,11 @@ Open `http://127.0.0.1:8876`.
 ## Task-based command guide
 
 Use `make` for common operations first. Use `python3 scripts/substudy.py ...` when you need detailed flags.
+
+### Local bootstrap
+
+- Initialize local-only files without overwriting existing values:
+  - `make init-local`
 
 ### Daily operation
 

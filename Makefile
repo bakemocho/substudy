@@ -10,7 +10,10 @@ QUEUE_RECOVER_KNOWN_ARGS ?=
 QUEUE_STATUS_ARGS ?=
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 
-.PHONY: sync sync-dry sync-meta-only sync-meta-missing sync-subs-missing backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
+.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-subs-missing backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
+
+init-local:
+	./scripts/init_local.sh
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
