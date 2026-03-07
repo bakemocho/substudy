@@ -46,29 +46,78 @@ python3 scripts/substudy.py web --host 127.0.0.1 --port 8876
 
 Open `http://127.0.0.1:8876`.
 
-## Core commands
+## Task-based command guide
 
-- `python3 scripts/substudy.py sync`
-- `python3 scripts/substudy.py sync --network-profile auto` (weak network -> meta/subs only, strong -> media+subs+meta)
-- `python3 scripts/substudy.py backfill`
-- `python3 scripts/substudy.py ledger`
-- `python3 scripts/substudy.py asr`
-- `python3 scripts/substudy.py loudness`
-- `python3 scripts/substudy.py dict-index --dictionary-path data/eijiro-1449.utf8.txt`
-- `python3 scripts/substudy.py dict-bookmarks-export --entry-status missing --format jsonl`
-- `python3 scripts/substudy.py dict-bookmarks-import --input exports/dictionary_bookmarks_missing_*.jsonl --on-duplicate upsert`
-- `python3 scripts/substudy.py dict-bookmarks-curate --preset frequent_terms --format csv --limit 200`
-- `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200`
-- `python3 scripts/substudy.py translate-local --source storiesofcz --limit 1 --video-id <video_id>`
-- `scripts/run_llm_pipeline.sh missing-export --limit 200`
-- `scripts/run_llm_pipeline.sh missing-import`
-- `scripts/run_llm_pipeline.sh review-cards-export --limit 200`
-- `python3 scripts/substudy.py notify --kind all`
-- `python3 scripts/substudy.py notify-install-macos --interval-minutes 90 --kind all`
-- `python3 scripts/substudy.py notify-uninstall-macos`
-- `python3 scripts/substudy.py downloads --since-hours 24`
-- `python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`
-- `make test`
+Use `make` for common operations first. Use `python3 scripts/substudy.py ...` when you need detailed flags.
+
+### Daily operation
+
+- Run normal daily flow (queue producer + workers + ledger/report):
+  - `make daily`
+- Run daily flow for one source:
+  - `make daily-source SOURCE=<source_id>`
+- Run one sync manually:
+  - `make sync`
+  - weak/auto network profile: `python3 scripts/substudy.py sync --config config/sources.toml --network-profile auto`
+
+### Queue failure handling and retry
+
+- See only unresolved queue items:
+  - `make queue-status-unresolved`
+- See full queue report (including recovered history):
+  - `make queue-status`
+- Preview known recoverable failures (no DB write):
+  - `make queue-recover-known-dry`
+- Apply known recovery + show unresolved in one step:
+  - `make queue-heal`
+- Manually requeue with custom filters:
+  - `make queue-requeue QUEUE_REQUEUE_ARGS="--stage translate --status dead --error-contains 'tuple indices must be integers or slices, not str'"`
+
+### Pipeline stages
+
+- Backfill historical videos:
+  - `make backfill`
+- Retry/generate ASR:
+  - `make asr`
+- Compute loudness normalization:
+  - `make loudness`
+- Local subtitle translation:
+  - `make translate-local`
+  - process all available targets: `make translate-local-all`
+
+### Ledger and reporting
+
+- Incremental ledger update (recommended):
+  - `make ledger-inc`
+- Full ledger rebuild:
+  - `make ledger-full`
+- Download-stage report:
+  - `make downloads`
+
+### Study UI and dictionary/LLM tools
+
+- Launch web UI:
+  - `python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`
+- Build dictionary index:
+  - `python3 scripts/substudy.py dict-index --dictionary-path data/eijiro-1449.utf8.txt`
+- Export/import/curate dictionary bookmarks:
+  - `python3 scripts/substudy.py dict-bookmarks-export --entry-status missing --format jsonl`
+  - `python3 scripts/substudy.py dict-bookmarks-import --input exports/dictionary_bookmarks_missing_*.jsonl --on-duplicate upsert`
+  - `python3 scripts/substudy.py dict-bookmarks-curate --preset review_cards --format jsonl --limit 200`
+- LLM helper scripts:
+  - `scripts/run_llm_pipeline.sh missing-export --limit 200`
+  - `scripts/run_llm_pipeline.sh missing-import`
+  - `scripts/run_llm_pipeline.sh review-cards-export --limit 200`
+
+### Notifications and checks
+
+- Local notifications:
+  - `python3 scripts/substudy.py notify --kind all`
+  - `python3 scripts/substudy.py notify-install-macos --interval-minutes 90 --kind all`
+  - `python3 scripts/substudy.py notify-uninstall-macos`
+- Sanity checks:
+  - `make privacy-check`
+  - `make test`
 
 Notification note (macOS):
 
