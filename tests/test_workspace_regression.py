@@ -1588,10 +1588,16 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+        def fake_translate_local_for_video(*args, **kwargs):
+            connection_arg = kwargs.get("connection")
+            self.assertIsNotNone(connection_arg)
+            self.assertIs(connection_arg.row_factory, sqlite3.Row)
+            return (True, None)
+
         with mock.patch.object(
             self.mod,
             "run_translate_local_for_video",
-            return_value=(True, None),
+            side_effect=fake_translate_local_for_video,
         ) as translate_mock:
             self.mod.run_queue_worker(
                 sources=[source],

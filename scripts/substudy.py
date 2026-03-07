@@ -5420,6 +5420,7 @@ def run_queue_worker(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path), timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.row_factory = sqlite3.Row
     create_schema(connection)
 
     source_by_id = {source.id: source for source in sources}
