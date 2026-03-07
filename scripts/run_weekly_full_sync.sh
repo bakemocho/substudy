@@ -68,6 +68,9 @@ MEDIA_WORKER_MAX_ITEMS="${SUBSTUDY_MEDIA_WORKER_MAX_ITEMS:-0}"
 PIPELINE_WORKER_MAX_ITEMS="${SUBSTUDY_PIPELINE_WORKER_MAX_ITEMS:-0}"
 QUEUE_DRAIN_TIMEOUT_SEC="${SUBSTUDY_QUEUE_DRAIN_TIMEOUT_SEC:-1200}"
 QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
+QUEUE_RECOVER_KNOWN_ENABLED="${SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED:-1}"
+QUEUE_RECOVER_KNOWN_PROFILES="${SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES:-all}"
+QUEUE_RECOVER_KNOWN_LIMIT="${SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT:-0}"
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
 TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
@@ -476,13 +479,31 @@ echo "[weekly] 3) wait sync producer"
 wait "${SYNC_PID}"
 SYNC_PID=""
 
-echo "[weekly] 4) wait queue drain"
+echo "[weekly] 4) run queue known recovery"
+if [[ "${QUEUE_RECOVER_KNOWN_ENABLED}" != "0" ]]; then
+  RECOVER_PROFILE_ARGS=()
+  IFS=',' read -r -a _recover_profiles <<< "${QUEUE_RECOVER_KNOWN_PROFILES}"
+  for _raw_profile in "${_recover_profiles[@]}"; do
+    _profile="${_raw_profile//[[:space:]]/}"
+    [[ -n "${_profile}" ]] || continue
+    RECOVER_PROFILE_ARGS+=(--profile "${_profile}")
+  done
+  run_substudy queue-recover-known \
+    --config "${CONFIG_PATH}" \
+    --ledger-db "${LEDGER_DB}" \
+    --limit "${QUEUE_RECOVER_KNOWN_LIMIT}" \
+    "${RECOVER_PROFILE_ARGS[@]}" || true
+else
+  echo "[weekly] queue known recovery skipped (SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED=0)"
+fi
+
+echo "[weekly] 5) wait queue drain"
 wait_for_queue_drain "${QUEUE_DRAIN_TIMEOUT_SEC}" "${QUEUE_DRAIN_POLL_SEC}" || true
 
-echo "[weekly] 5) stop workers"
+echo "[weekly] 6) stop workers"
 stop_workers
 
-echo "[weekly] 6) weekly full ledger rebuild + report"
+echo "[weekly] 7) weekly full ledger rebuild + report"
 run_substudy ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}"

@@ -226,6 +226,7 @@ Optional install-time overrides:
   - `SUBSTUDY_QUEUE_WORKER_POLL_SEC`
   - `SUBSTUDY_QUEUE_WORKER_MAX_ATTEMPTS`
 - Control known-fix recovery pass in daily run:
+  - Applies to both `run_daily_sync.sh` and `run_weekly_full_sync.sh`.
   - `SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED` (`1` default, `0` to disable)
   - `SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES` (comma-separated, default `all`)
   - `SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT` (per-source limit, default `0` unlimited)
