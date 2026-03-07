@@ -10,7 +10,7 @@ QUEUE_RECOVER_KNOWN_ARGS ?=
 QUEUE_STATUS_ARGS ?=
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-requeue queue-recover-known loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -45,11 +45,23 @@ downloads:
 queue-status:
 	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_STATUS_ARGS)
 
+queue-status-unresolved:
+	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG) --only-unresolved $(QUEUE_STATUS_ARGS)
+
 queue-requeue:
 	$(PYTHON) scripts/substudy.py queue-requeue --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_REQUEUE_ARGS)
 
 queue-recover-known:
 	$(PYTHON) scripts/substudy.py queue-recover-known --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_RECOVER_KNOWN_ARGS)
+
+queue-recover-known-dry:
+	$(PYTHON) scripts/substudy.py queue-recover-known --config $(CONFIG) $(LEDGER_DB_ARG) --dry-run $(QUEUE_RECOVER_KNOWN_ARGS)
+
+queue-heal:
+	@echo "1) recover known queue failures"
+	$(PYTHON) scripts/substudy.py queue-recover-known --config $(CONFIG) $(LEDGER_DB_ARG) $(QUEUE_RECOVER_KNOWN_ARGS)
+	@echo "2) show unresolved queue failures"
+	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG) --only-unresolved --limit 20 $(QUEUE_STATUS_ARGS)
 
 loudness:
 	$(PYTHON) scripts/substudy.py loudness --config $(CONFIG)

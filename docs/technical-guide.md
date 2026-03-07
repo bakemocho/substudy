@@ -177,6 +177,11 @@ Operator note:
     `python3 scripts/substudy.py queue-recover-known --config config/sources.toml`
   - Current profile:
     - `translate-row-factory`: requeue `translate` items with tuple-index regression signature (`tuple indices must be integers or slices, not str`).
+  - Make shortcuts:
+    - `make queue-recover-known-dry`
+    - `make queue-recover-known`
+    - `make queue-status-unresolved`
+    - `make queue-heal` (recover known failures, then show unresolved)
 
 ## Reverse incremental backfill
 
