@@ -7448,6 +7448,161 @@ def show_download_report(
     connection.close()
 
 
+def show_queue_status_report(
+    sources: list[SourceConfig],
+    db_path: Path,
+    limit: int = 20,
+) -> None:
+    if not db_path.exists():
+        print(f"[queue-status] no ledger DB: {db_path}")
+        return
+
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    create_schema(connection)
+    now_iso = now_utc_iso()
+
+    for source in sources:
+        print(f"\n=== queue-status: {source.id} ===")
+
+        summary_row = connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+                COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), 0) AS leased_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_due_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND next_retry_at IS NOT NULL
+                             AND next_retry_at > ?
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_wait_count,
+                COALESCE(SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END), 0) AS dead_count
+            FROM work_items
+            WHERE source_id = ?
+            """,
+            (now_iso, now_iso, source.id),
+        ).fetchone()
+        if summary_row is not None:
+            print(
+                "queue unresolved total="
+                f"{int(summary_row[0] or 0) + int(summary_row[1] or 0) + int(summary_row[2] or 0) + int(summary_row[3] or 0) + int(summary_row[4] or 0)} "
+                f"(queued={int(summary_row[0] or 0)} "
+                f"leased={int(summary_row[1] or 0)} "
+                f"retry_due={int(summary_row[2] or 0)} "
+                f"retry_wait={int(summary_row[3] or 0)} "
+                f"dead={int(summary_row[4] or 0)})"
+            )
+
+        by_stage_rows = connection.execute(
+            """
+            SELECT
+                stage,
+                COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+                COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), 0) AS leased_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_due_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND next_retry_at IS NOT NULL
+                             AND next_retry_at > ?
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_wait_count,
+                COALESCE(SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END), 0) AS dead_count
+            FROM work_items
+            WHERE source_id = ?
+            GROUP BY stage
+            ORDER BY stage ASC
+            """,
+            (now_iso, now_iso, source.id),
+        ).fetchall()
+        if by_stage_rows:
+            print("by stage:")
+            for row in by_stage_rows:
+                print(
+                    f"  stage={row[0]} queued={int(row[1] or 0)} "
+                    f"leased={int(row[2] or 0)} "
+                    f"retry_due={int(row[3] or 0)} "
+                    f"retry_wait={int(row[4] or 0)} "
+                    f"dead={int(row[5] or 0)}"
+                )
+        else:
+            print("by stage: none")
+
+        recent_rows = connection.execute(
+            """
+            SELECT
+                id,
+                stage,
+                video_id,
+                status,
+                attempt_count,
+                COALESCE(next_retry_at, ''),
+                COALESCE(last_error, ''),
+                COALESCE(updated_at, '')
+            FROM work_items
+            WHERE source_id = ?
+              AND status IN ('error', 'dead')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (source.id, limit),
+        ).fetchall()
+        if recent_rows:
+            print("recent failures:")
+            for (
+                item_id,
+                stage,
+                video_id,
+                status,
+                attempt_count,
+                next_retry_at,
+                last_error,
+                updated_at,
+            ) in recent_rows:
+                print(
+                    f"  id={int(item_id)} stage={stage} video_id={video_id} "
+                    f"status={status} attempts={int(attempt_count or 0)} "
+                    f"next_retry_at={next_retry_at} updated_at={updated_at}"
+                )
+                if last_error:
+                    print(f"    reason: {last_error}")
+        else:
+            print("recent failures: none")
+
+    connection.close()
+
+
 def run_dict_bookmarks_export(
     db_path: Path,
     source_ids: list[str],
@@ -13627,6 +13782,20 @@ def parse_args() -> argparse.Namespace:
     )
     downloads_parser.add_argument("--ledger-db", type=Path)
 
+    queue_status_parser = subparsers.add_parser(
+        "queue-status",
+        help="Show unresolved queue work items and recent queue failures",
+    )
+    queue_status_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    queue_status_parser.add_argument("--source", action="append", dest="sources")
+    queue_status_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Max recent failed items per source.",
+    )
+    queue_status_parser.add_argument("--ledger-db", type=Path)
+
     loudness_parser = subparsers.add_parser(
         "loudness",
         help="Analyze per-video loudness and store normalization gain",
@@ -14409,6 +14578,14 @@ def main() -> int:
             sources=sources,
             db_path=ledger_db_path,
             since_hours=max(1, args.since_hours),
+            limit=max(1, args.limit),
+        )
+        return 0
+
+    if args.command == "queue-status":
+        show_queue_status_report(
+            sources=sources,
+            db_path=ledger_db_path,
             limit=max(1, args.limit),
         )
         return 0

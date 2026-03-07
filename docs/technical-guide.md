@@ -159,6 +159,9 @@ Operator note:
   - Missing artifact signatures (for example `subtitle file missing after download attempt`, `* did not write a terminal download_state row`): slower structural retry (30m -> 2h -> 6h -> 12h -> 24h).
 - Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
+- Queue failure visibility:
+  - `python3 scripts/substudy.py queue-status --config config/sources.toml --limit 30`
+  - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`) and recent `error/dead` reasons per source.
 
 ## Reverse incremental backfill
 

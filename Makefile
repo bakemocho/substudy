@@ -7,7 +7,7 @@ TRANSLATE_LIMIT ?= 20
 TRANSLATE_TIMEOUT ?= 300
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -38,6 +38,9 @@ asr-dry:
 
 downloads:
 	$(PYTHON) scripts/substudy.py downloads --config $(CONFIG)
+
+queue-status:
+	$(PYTHON) scripts/substudy.py queue-status --config $(CONFIG) $(LEDGER_DB_ARG)
 
 loudness:
 	$(PYTHON) scripts/substudy.py loudness --config $(CONFIG)

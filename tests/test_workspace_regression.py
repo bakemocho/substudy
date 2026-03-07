@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import sqlite3
 import sys
@@ -6,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import datetime as dt
+from contextlib import redirect_stdout
 from unittest import mock
 import urllib.request
 from pathlib import Path
@@ -602,6 +604,135 @@ enabled = true
         delay_max = (retry_at - after).total_seconds()
         self.assertGreaterEqual(delay_min, (30 * 60) - 5)
         self.assertLessEqual(delay_max, (30 * 60) + 5)
+
+    def test_show_queue_status_report_summarizes_due_wait_dead(self):
+        source_root = self.workspace_root / "storiesofcz_queue_status"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        now_iso = "2026-03-07T00:00:00+00:00"
+        past_iso = "2026-03-06T00:00:00+00:00"
+        future_iso = "2026-03-08T00:00:00+00:00"
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.upsert_source(connection, source, now_iso)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                video_id="7624444444444444441",
+                now_iso=now_iso,
+                priority=1,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="meta",
+                video_id="7624444444444444442",
+                now_iso=now_iso,
+                priority=1,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="media",
+                video_id="7624444444444444443",
+                now_iso=now_iso,
+                priority=1,
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'error',
+                    attempt_count = 2,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'subs' AND video_id = ?
+                """,
+                (
+                    past_iso,
+                    "subtitle file missing after download attempt",
+                    now_iso,
+                    source.id,
+                    "7624444444444444441",
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'error',
+                    attempt_count = 1,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (
+                    future_iso,
+                    "temporary metadata download error",
+                    now_iso,
+                    source.id,
+                    "7624444444444444442",
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'dead',
+                    attempt_count = 5,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'media' AND video_id = ?
+                """,
+                (
+                    "HTTP Error 403: Forbidden",
+                    now_iso,
+                    source.id,
+                    "7624444444444444443",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.mod.show_queue_status_report(
+                sources=[source],
+                db_path=self.db_path,
+                limit=10,
+            )
+
+        rendered = output.getvalue()
+        self.assertIn("queue-status: storiesofcz", rendered)
+        self.assertIn("queue unresolved total=3", rendered)
+        self.assertIn("retry_due=1", rendered)
+        self.assertIn("retry_wait=1", rendered)
+        self.assertIn("dead=1", rendered)
+        self.assertIn("subtitle file missing after download attempt", rendered)
+        self.assertIn("HTTP Error 403: Forbidden", rendered)
 
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))
