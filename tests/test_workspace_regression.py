@@ -33,6 +33,8 @@ class WorkspaceRegressionTests(unittest.TestCase):
         (self.workspace_root / "data").mkdir(parents=True, exist_ok=True)
         (self.workspace_root / "exports" / "llm").mkdir(parents=True, exist_ok=True)
         self.db_path = self.workspace_root / "data" / "master_ledger.sqlite"
+        self.mod._YTDLP_IMPERSONATE_TARGETS_CACHE.clear()
+        self.mod._YTDLP_IMPERSONATE_WARNED_KEYS.clear()
         connection = sqlite3.connect(str(self.db_path))
         try:
             self.mod.create_schema(connection)
@@ -445,6 +447,92 @@ enabled = true
         self.assertIn("--max-sleep-interval", command)
         self.assertIn("--retry-sleep", command)
         self.assertNotIn("--ignore-errors", command)
+
+    def test_resolve_impersonate_flags_auto_prefers_chrome(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+ytdlp_impersonate = "auto"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        with mock.patch.object(
+            self.mod,
+            "list_ytdlp_impersonate_targets",
+            return_value=["firefox", "chrome"],
+        ):
+            flags = self.mod.resolve_impersonate_flags(source)
+
+        self.assertEqual(flags, ["--impersonate", "chrome"])
+
+    def test_discover_playlist_window_ids_includes_impersonate_flag(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+ytdlp_impersonate = "chrome"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(command, check, capture_output, text):
+            captured["command"] = list(command)
+            return self.mod.subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout="7611111111111111111\n",
+                stderr="",
+            )
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "list_ytdlp_impersonate_targets",
+                return_value=["chrome"],
+            ),
+            mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run),
+        ):
+            ids = self.mod.discover_playlist_window_ids(
+                source=source,
+                playlist_start=1,
+                playlist_end=1,
+                dry_run=False,
+            )
+
+        self.assertEqual(ids, ["7611111111111111111"])
+        command = captured["command"]
+        self.assertIn("--impersonate", command)
+        self.assertIn("chrome", command)
 
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))

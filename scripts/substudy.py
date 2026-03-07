@@ -96,6 +96,7 @@ DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_METERED_MEDIA_MODE = "off"
 DEFAULT_METERED_MIN_ARCHIVE_IDS = 200
 DEFAULT_METERED_PLAYLIST_END = 40
+DEFAULT_YTDLP_IMPERSONATE = ""
 DEFAULT_PRODUCER_LOCK_FILE_NAME = "producer.lock"
 DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
@@ -103,6 +104,9 @@ DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
+
+_YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
+_YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
 
 
 @dataclass
@@ -131,6 +135,7 @@ class SourceConfig:
     video_url_template: str | None
     video_id_regex: str
     ytdlp_bin: str
+    ytdlp_impersonate: str | None
     cookies_browser: str | None
     cookies_file: Path | None
     video_format: str
@@ -671,6 +676,9 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
         if global_cookies_browser_raw not in (None, "")
         else None
     )
+    global_ytdlp_impersonate = normalize_ytdlp_impersonate(
+        global_raw.get("ytdlp_impersonate", DEFAULT_YTDLP_IMPERSONATE)
+    )
     global_cookies_file = parse_optional_path(cwd, global_raw.get("cookies_file"))
 
     sources_raw_base = raw.get("sources", [])
@@ -777,6 +785,9 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             video_url_template=source_raw.get("video_url_template"),
             video_id_regex=str(source_raw.get("video_id_regex", r"_(\d{10,})_")),
             ytdlp_bin=str(source_raw.get("ytdlp_bin", global_raw.get("ytdlp_bin", "yt-dlp"))),
+            ytdlp_impersonate=normalize_ytdlp_impersonate(
+                source_raw.get("ytdlp_impersonate", global_ytdlp_impersonate)
+            ),
             cookies_browser=source_cookies_browser,
             cookies_file=source_cookies_file,
             video_format=str(source_raw.get("video_format", global_raw.get("video_format", "bv*+ba/best"))),
@@ -885,6 +896,111 @@ def resolve_cookie_flags(source: SourceConfig) -> list[str]:
     if source.cookies_browser:
         return ["--cookies-from-browser", source.cookies_browser]
     return []
+
+
+def normalize_ytdlp_impersonate(raw_value: Any) -> str | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    if value.lower() in {"off", "none", "false", "0"}:
+        return None
+    return value
+
+
+def list_ytdlp_impersonate_targets(ytdlp_bin: str) -> list[str]:
+    cached = _YTDLP_IMPERSONATE_TARGETS_CACHE.get(ytdlp_bin)
+    if cached is not None:
+        return list(cached)
+
+    command = [str(ytdlp_bin), "--list-impersonate-targets"]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        _YTDLP_IMPERSONATE_TARGETS_CACHE[ytdlp_bin] = []
+        return []
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    targets: list[str] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            continue
+        if line.lower().startswith("client"):
+            continue
+        if line.startswith("-"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        target = parts[0].strip().lower()
+        if not target:
+            continue
+        if target in targets:
+            continue
+        targets.append(target)
+
+    _YTDLP_IMPERSONATE_TARGETS_CACHE[ytdlp_bin] = list(targets)
+    return targets
+
+
+def _warn_impersonate_once(
+    ytdlp_bin: str,
+    impersonate_value: str,
+    message: str,
+) -> None:
+    warn_key = (ytdlp_bin, impersonate_value)
+    if warn_key in _YTDLP_IMPERSONATE_WARNED_KEYS:
+        return
+    _YTDLP_IMPERSONATE_WARNED_KEYS.add(warn_key)
+    print(f"[yt-dlp] {message}", file=sys.stderr)
+
+
+def resolve_impersonate_flags(source: SourceConfig) -> list[str]:
+    configured = source.ytdlp_impersonate
+    if not configured:
+        return []
+
+    available_targets = list_ytdlp_impersonate_targets(source.ytdlp_bin)
+    if not available_targets:
+        _warn_impersonate_once(
+            source.ytdlp_bin,
+            configured,
+            (
+                f"{source.id}: --impersonate '{configured}' requested, but no targets are available "
+                f"for {source.ytdlp_bin}; skipping"
+            ),
+        )
+        return []
+
+    configured_stripped = str(configured).strip()
+    configured_lower = configured_stripped.lower()
+    if configured_lower == "auto":
+        for preferred in ("chrome", "edge", "safari", "firefox", "tor"):
+            if preferred in available_targets:
+                return ["--impersonate", preferred]
+        return ["--impersonate", available_targets[0]]
+
+    requested_target = configured_lower.split(":", 1)[0]
+    if requested_target in available_targets:
+        return ["--impersonate", configured_stripped]
+
+    fallback_target = available_targets[0]
+    _warn_impersonate_once(
+        source.ytdlp_bin,
+        configured_stripped,
+        (
+            f"{source.id}: --impersonate '{configured_stripped}' unavailable; "
+            f"falling back to '{fallback_target}'"
+        ),
+    )
+    return ["--impersonate", fallback_target]
 
 
 def run_command(command: list[str], dry_run: bool, raise_on_error: bool = True) -> int:
@@ -1262,6 +1378,7 @@ def sync_source(
     if effective_playlist_end is not None:
         discovery_flags.extend(["--playlist-end", str(effective_playlist_end)])
     cookie_flags = resolve_cookie_flags(source)
+    impersonate_flags = resolve_impersonate_flags(source)
     if urls_file_override is not None:
         active_urls_file = urls_file_override
     else:
@@ -1317,6 +1434,7 @@ def sync_source(
         if run_media_discovery:
             media_command = [
                 source.ytdlp_bin,
+                *impersonate_flags,
                 *cookie_flags,
                 "--download-archive",
                 str(source.media_archive),
@@ -1436,6 +1554,7 @@ def sync_source(
 
             primary_command = [
                 source.ytdlp_bin,
+                *impersonate_flags,
                 *cookie_flags,
                 "--continue",
                 "--force-overwrites",
@@ -1532,6 +1651,7 @@ def sync_source(
 
                         fallback_command = [
                             source.ytdlp_bin,
+                            *impersonate_flags,
                             *cookie_flags,
                             "--continue",
                             "--force-overwrites",
@@ -2102,6 +2222,7 @@ def sync_source(
             if resolved_subtitle_target_ids:
                 subs_command = [
                     source.ytdlp_bin,
+                    *impersonate_flags,
                     *cookie_flags,
                     "--download-archive",
                     str(source.subs_archive),
@@ -2332,6 +2453,7 @@ def sync_source(
     if resolved_metadata_target_ids:
         metadata_command = [
             source.ytdlp_bin,
+            *impersonate_flags,
             *cookie_flags,
             "--skip-download",
             "--write-info-json",
@@ -5483,9 +5605,11 @@ def discover_playlist_window_ids(
     dry_run: bool,
 ) -> list[str]:
     cookie_flags = resolve_cookie_flags(source)
+    impersonate_flags = resolve_impersonate_flags(source)
     retry_flags = build_ytdlp_retry_flags(source, include_ignore_errors=False)
     command = [
         source.ytdlp_bin,
+        *impersonate_flags,
         *cookie_flags,
         *retry_flags,
         "--flat-playlist",

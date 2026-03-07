@@ -129,6 +129,11 @@ Operator note:
 - `video_format`
   - Primary media download format.
   - If the primary file has no audio stream, `sync` keeps that video, fetches an audio donor with `-f download`, and muxes audio locally via `ffmpeg` (`-shortest`) so output duration follows the primary video length.
+- `ytdlp_impersonate`
+  - Optional yt-dlp impersonation target for request hardening (`chrome`, `edge`, `safari`, `firefox`, `tor`, or `auto`).
+  - When set, substudy checks available targets from `yt-dlp --list-impersonate-targets` and applies `--impersonate`.
+  - If requested target is unavailable, substudy warns once and falls back (or skips impersonation when none are available).
+  - `auto` picks first available target from preferred order: `chrome -> edge -> safari -> firefox -> tor`.
 - `asr_*`
   - ASR is primary subtitle pipeline.
   - `asr_command` can use local Whisper CLI (no OpenAI API key required).
