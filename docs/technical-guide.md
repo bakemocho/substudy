@@ -161,7 +161,7 @@ Operator note:
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.
 - Queue failure visibility:
   - `python3 scripts/substudy.py queue-status --config config/sources.toml --limit 30`
-  - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`) and recent `error/dead` reasons per source.
+  - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`), recent `error/dead` reasons, and `recovered by retry` (`status=success` with `attempt_count>=2`) per source.
 
 ## Reverse incremental backfill
 

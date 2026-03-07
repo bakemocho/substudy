@@ -661,6 +661,14 @@ data_dir = "{source_root}"
                 now_iso=now_iso,
                 priority=1,
             )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="asr",
+                video_id="7624444444444444444",
+                now_iso=now_iso,
+                priority=1,
+            )
             connection.execute(
                 """
                 UPDATE work_items
@@ -713,6 +721,22 @@ data_dir = "{source_root}"
                     "7624444444444444443",
                 ),
             )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'success',
+                    attempt_count = 2,
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE source_id = ? AND stage = 'asr' AND video_id = ?
+                """,
+                (
+                    now_iso,
+                    now_iso,
+                    source.id,
+                    "7624444444444444444",
+                ),
+            )
             connection.commit()
         finally:
             connection.close()
@@ -733,6 +757,10 @@ data_dir = "{source_root}"
         self.assertIn("dead=1", rendered)
         self.assertIn("subtitle file missing after download attempt", rendered)
         self.assertIn("HTTP Error 403: Forbidden", rendered)
+        self.assertIn("recovered by retry total=1", rendered)
+        self.assertIn("recent recovered:", rendered)
+        self.assertIn("stage=asr", rendered)
+        self.assertIn("retries=1", rendered)
 
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))

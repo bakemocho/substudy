@@ -7600,6 +7600,57 @@ def show_queue_status_report(
         else:
             print("recent failures: none")
 
+        recovered_summary_row = connection.execute(
+            """
+            SELECT
+                COALESCE(COUNT(*), 0)
+            FROM work_items
+            WHERE source_id = ?
+              AND status = 'success'
+              AND attempt_count >= 2
+            """,
+            (source.id,),
+        ).fetchone()
+        recovered_total = (
+            int(recovered_summary_row[0] or 0) if recovered_summary_row is not None else 0
+        )
+        print(f"recovered by retry total={recovered_total}")
+
+        recovered_rows = connection.execute(
+            """
+            SELECT
+                id,
+                stage,
+                video_id,
+                attempt_count,
+                COALESCE(updated_at, '')
+            FROM work_items
+            WHERE source_id = ?
+              AND status = 'success'
+              AND attempt_count >= 2
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (source.id, limit),
+        ).fetchall()
+        if recovered_rows:
+            print("recent recovered:")
+            for (
+                item_id,
+                stage,
+                video_id,
+                attempt_count,
+                updated_at,
+            ) in recovered_rows:
+                retries = max(0, int(attempt_count or 0) - 1)
+                print(
+                    f"  id={int(item_id)} stage={stage} video_id={video_id} "
+                    f"attempts={int(attempt_count or 0)} retries={retries} "
+                    f"updated_at={updated_at}"
+                )
+        else:
+            print("recent recovered: none")
+
     connection.close()
 
 
