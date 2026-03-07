@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -7663,10 +7663,10 @@ def requeue_work_items(
     limit: int = 0,
     dry_run: bool = False,
     reset_attempts: bool = False,
-) -> None:
+) -> tuple[int, int]:
     if not db_path.exists():
         print(f"[queue-requeue] no ledger DB: {db_path}")
-        return
+        return (0, 0)
 
     stage_filter = normalize_queue_stages(stages) if stages else []
     status_filter = [
@@ -7789,6 +7789,67 @@ def requeue_work_items(
         print(
             f"[queue-requeue] complete: selected={total_selected} requeued={total_requeued} "
             f"statuses={','.join(status_filter)} reset_attempts={str(bool(reset_attempts)).lower()}"
+        )
+    return (total_selected, total_requeued)
+
+
+QUEUE_RECOVERY_PROFILES: dict[str, dict[str, Any]] = {
+    "translate-row-factory": {
+        "description": "Recover translate queue items that failed from tuple-index row access regression",
+        "stages": ["translate"],
+        "statuses": ["error", "dead"],
+        "error_contains": "tuple indices must be integers or slices, not str",
+    },
+}
+
+
+def run_queue_recover_known(
+    sources: list[SourceConfig],
+    db_path: Path,
+    profiles: list[str] | None = None,
+    limit: int = 0,
+    dry_run: bool = False,
+    reset_attempts: bool = False,
+) -> None:
+    requested_profiles = [str(value).strip() for value in (profiles or []) if str(value).strip()]
+    if not requested_profiles or "all" in requested_profiles:
+        selected_profiles = sorted(QUEUE_RECOVERY_PROFILES.keys())
+    else:
+        selected_profiles = [name for name in requested_profiles if name in QUEUE_RECOVERY_PROFILES]
+    if not selected_profiles:
+        print("[queue-recover-known] no valid profiles selected")
+        return
+
+    total_selected = 0
+    total_requeued = 0
+    for profile_name in selected_profiles:
+        profile = QUEUE_RECOVERY_PROFILES[profile_name]
+        print(
+            f"[queue-recover-known] profile={profile_name} "
+            f"description={profile.get('description', '')}"
+        )
+        selected, requeued = requeue_work_items(
+            sources=sources,
+            db_path=db_path,
+            stages=cast(list[str], profile.get("stages") or []),
+            statuses=cast(list[str], profile.get("statuses") or []),
+            error_contains=str(profile.get("error_contains") or "").strip() or None,
+            limit=max(0, int(limit)),
+            dry_run=bool(dry_run),
+            reset_attempts=bool(reset_attempts),
+        )
+        total_selected += int(selected or 0)
+        total_requeued += int(requeued or 0)
+
+    if dry_run:
+        print(
+            f"[queue-recover-known] dry-run complete: profiles={len(selected_profiles)} "
+            f"matched={total_selected}"
+        )
+    else:
+        print(
+            f"[queue-recover-known] complete: profiles={len(selected_profiles)} "
+            f"selected={total_selected} requeued={total_requeued}"
         )
 
 
@@ -14023,6 +14084,33 @@ def parse_args() -> argparse.Namespace:
     queue_requeue_parser.add_argument("--dry-run", action="store_true")
     queue_requeue_parser.add_argument("--ledger-db", type=Path)
 
+    queue_recover_known_parser = subparsers.add_parser(
+        "queue-recover-known",
+        help="Requeue known recoverable queue failures with predefined filters",
+    )
+    queue_recover_known_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    queue_recover_known_parser.add_argument("--source", action="append", dest="sources")
+    queue_recover_known_parser.add_argument(
+        "--profile",
+        action="append",
+        dest="profiles",
+        choices=["all", *sorted(QUEUE_RECOVERY_PROFILES.keys())],
+        help="Recovery profile (repeatable). Defaults to all known profiles.",
+    )
+    queue_recover_known_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max matched items per source for each profile (0 = no limit).",
+    )
+    queue_recover_known_parser.add_argument(
+        "--reset-attempts",
+        action="store_true",
+        help="Reset attempt_count to 0 on requeue.",
+    )
+    queue_recover_known_parser.add_argument("--dry-run", action="store_true")
+    queue_recover_known_parser.add_argument("--ledger-db", type=Path)
+
     loudness_parser = subparsers.add_parser(
         "loudness",
         help="Analyze per-video loudness and store normalization gain",
@@ -14824,6 +14912,17 @@ def main() -> int:
             stages=getattr(args, "stages", None),
             statuses=getattr(args, "statuses", None),
             error_contains=str(getattr(args, "error_contains", "") or "").strip() or None,
+            limit=max(0, int(args.limit)),
+            dry_run=bool(args.dry_run),
+            reset_attempts=bool(getattr(args, "reset_attempts", False)),
+        )
+        return 0
+
+    if args.command == "queue-recover-known":
+        run_queue_recover_known(
+            sources=sources,
+            db_path=ledger_db_path,
+            profiles=getattr(args, "profiles", None),
             limit=max(0, int(args.limit)),
             dry_run=bool(args.dry_run),
             reset_attempts=bool(getattr(args, "reset_attempts", False)),

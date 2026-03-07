@@ -30,6 +30,7 @@
 - `install_launchd.sh` を producer（daily/weekly）と worker（media/pipeline）の複数ジョブ構成へ拡張。
 - `technical-guide.md` に producer/worker 分離運用（手動コマンド・install時オプション）を追記。
 - daily/weekly ランナーから `asr/loudness/translate-local` 直実行レーンを撤去し、queue-worker 駆動へ統一。
+- `queue-recover-known` を追加し、既知の回復可能障害（例: translate row_factory 回帰）を条件付きで再キュー投入できるようにした。
 
 ### 未着手/継続中
 

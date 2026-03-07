@@ -169,6 +169,13 @@ Operator note:
     `python3 scripts/substudy.py queue-requeue --config config/sources.toml --stage translate --status dead --error-contains "tuple indices must be integers or slices, not str"`
   - Optional:
     `--reset-attempts` resets `attempt_count` to `0` when requeueing.
+- Queue known-fix recovery shortcut:
+  - Dry-run all known profiles:
+    `python3 scripts/substudy.py queue-recover-known --config config/sources.toml --dry-run`
+  - Apply all known profiles:
+    `python3 scripts/substudy.py queue-recover-known --config config/sources.toml`
+  - Current profile:
+    - `translate-row-factory`: requeue `translate` items with tuple-index regression signature (`tuple indices must be integers or slices, not str`).
 
 ## Reverse incremental backfill
 
@@ -217,6 +224,10 @@ Optional install-time overrides:
   - `SUBSTUDY_QUEUE_WORKER_LEASE_SEC`
   - `SUBSTUDY_QUEUE_WORKER_POLL_SEC`
   - `SUBSTUDY_QUEUE_WORKER_MAX_ATTEMPTS`
+- Control known-fix recovery pass in daily run:
+  - `SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED` (`1` default, `0` to disable)
+  - `SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES` (comma-separated, default `all`)
+  - `SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT` (per-source limit, default `0` unlimited)
 
 Check jobs:
 

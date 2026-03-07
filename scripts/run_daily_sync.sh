@@ -69,6 +69,9 @@ MEDIA_WORKER_MAX_ITEMS="${SUBSTUDY_MEDIA_WORKER_MAX_ITEMS:-0}"
 PIPELINE_WORKER_MAX_ITEMS="${SUBSTUDY_PIPELINE_WORKER_MAX_ITEMS:-0}"
 QUEUE_DRAIN_TIMEOUT_SEC="${SUBSTUDY_QUEUE_DRAIN_TIMEOUT_SEC:-600}"
 QUEUE_DRAIN_POLL_SEC="${SUBSTUDY_QUEUE_DRAIN_POLL_SEC:-5}"
+QUEUE_RECOVER_KNOWN_ENABLED="${SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED:-1}"
+QUEUE_RECOVER_KNOWN_PROFILES="${SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES:-all}"
+QUEUE_RECOVER_KNOWN_LIMIT="${SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT:-0}"
 TRANSLATE_TARGET_LANG="${SUBSTUDY_TRANSLATE_TARGET_LANG:-ja-local}"
 TRANSLATE_SOURCE_TRACK="${SUBSTUDY_TRANSLATE_SOURCE_TRACK:-auto}"
 TRANSLATE_TIMEOUT="${SUBSTUDY_TRANSLATE_TIMEOUT:-300}"
@@ -551,13 +554,31 @@ run_substudy backfill \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" || true
 
-echo "[daily] 5) wait queue drain"
+echo "[daily] 5) run queue known recovery"
+if [[ "${QUEUE_RECOVER_KNOWN_ENABLED}" != "0" ]]; then
+  RECOVER_PROFILE_ARGS=()
+  IFS=',' read -r -a _recover_profiles <<< "${QUEUE_RECOVER_KNOWN_PROFILES}"
+  for _raw_profile in "${_recover_profiles[@]}"; do
+    _profile="${_raw_profile//[[:space:]]/}"
+    [[ -n "${_profile}" ]] || continue
+    RECOVER_PROFILE_ARGS+=(--profile "${_profile}")
+  done
+  run_substudy queue-recover-known \
+    --config "${CONFIG_PATH}" \
+    --ledger-db "${LEDGER_DB}" \
+    --limit "${QUEUE_RECOVER_KNOWN_LIMIT}" \
+    "${RECOVER_PROFILE_ARGS[@]}" || true
+else
+  echo "[daily] queue known recovery skipped (SUBSTUDY_QUEUE_RECOVER_KNOWN_ENABLED=0)"
+fi
+
+echo "[daily] 6) wait queue drain"
 wait_for_queue_drain "${QUEUE_DRAIN_TIMEOUT_SEC}" "${QUEUE_DRAIN_POLL_SEC}" || true
 
-echo "[daily] 6) stop workers"
+echo "[daily] 7) stop workers"
 stop_workers
 
-echo "[daily] 7) ledger + downloads report"
+echo "[daily] 8) ledger + downloads report"
 run_substudy ledger \
   --incremental \
   --config "${CONFIG_PATH}" \

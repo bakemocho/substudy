@@ -926,6 +926,173 @@ data_dir = "{source_root}"
         finally:
             connection_check.close()
 
+    def test_queue_recover_known_profile_requeues_expected_items(self):
+        source_root = self.workspace_root / "storiesofcz_queue_recover_known"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        now_iso = "2026-03-07T00:00:00+00:00"
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            self.mod.upsert_source(connection, source, now_iso)
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="translate",
+                video_id="7626666666666666661",
+                now_iso=now_iso,
+                priority=1,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="translate",
+                video_id="7626666666666666662",
+                now_iso=now_iso,
+                priority=1,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id=source.id,
+                stage="meta",
+                video_id="7626666666666666663",
+                now_iso=now_iso,
+                priority=1,
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'dead',
+                    attempt_count = 8,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'translate' AND video_id = ?
+                """,
+                (
+                    "2026-03-08T00:00:00+00:00",
+                    "work item execution exception: tuple indices must be integers or slices, not str",
+                    now_iso,
+                    source.id,
+                    "7626666666666666661",
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'dead',
+                    attempt_count = 8,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'translate' AND video_id = ?
+                """,
+                (
+                    "2026-03-08T00:00:00+00:00",
+                    "HTTP Error 403: Forbidden",
+                    now_iso,
+                    source.id,
+                    "7626666666666666662",
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE work_items
+                SET status = 'dead',
+                    attempt_count = 8,
+                    next_retry_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (
+                    "2026-03-08T00:00:00+00:00",
+                    "work item execution exception: tuple indices must be integers or slices, not str",
+                    now_iso,
+                    source.id,
+                    "7626666666666666663",
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.mod.run_queue_recover_known(
+            sources=[source],
+            db_path=self.db_path,
+            profiles=["translate-row-factory"],
+            limit=0,
+            dry_run=False,
+            reset_attempts=False,
+        )
+
+        connection_check = sqlite3.connect(str(self.db_path))
+        try:
+            matched_row = connection_check.execute(
+                """
+                SELECT status, next_retry_at
+                FROM work_items
+                WHERE source_id = ? AND stage = 'translate' AND video_id = ?
+                """,
+                (source.id, "7626666666666666661"),
+            ).fetchone()
+            self.assertIsNotNone(matched_row)
+            self.assertEqual(str(matched_row[0]), "queued")
+            self.assertIsNone(matched_row[1])
+
+            non_match_same_stage = connection_check.execute(
+                """
+                SELECT status, next_retry_at
+                FROM work_items
+                WHERE source_id = ? AND stage = 'translate' AND video_id = ?
+                """,
+                (source.id, "7626666666666666662"),
+            ).fetchone()
+            self.assertIsNotNone(non_match_same_stage)
+            self.assertEqual(str(non_match_same_stage[0]), "dead")
+            self.assertEqual(
+                str(non_match_same_stage[1]),
+                "2026-03-08T00:00:00+00:00",
+            )
+
+            non_match_other_stage = connection_check.execute(
+                """
+                SELECT status, next_retry_at
+                FROM work_items
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (source.id, "7626666666666666663"),
+            ).fetchone()
+            self.assertIsNotNone(non_match_other_stage)
+            self.assertEqual(str(non_match_other_stage[0]), "dead")
+            self.assertEqual(
+                str(non_match_other_stage[1]),
+                "2026-03-08T00:00:00+00:00",
+            )
+        finally:
+            connection_check.close()
+
     def test_create_schema_includes_parallel_queue_tables(self):
         connection = sqlite3.connect(str(self.db_path))
         try:
