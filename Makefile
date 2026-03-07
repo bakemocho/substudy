@@ -1,7 +1,13 @@
 PYTHON ?= python3
 CONFIG ?= config/sources.toml
+LEDGER_DB ?=
+TRANSLATE_TARGET_LANG ?= ja-local
+TRANSLATE_SOURCE_TRACK ?= auto
+TRANSLATE_LIMIT ?= 20
+TRANSLATE_TIMEOUT ?= 300
+LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 
-.PHONY: sync sync-dry backfill backfill-dry ledger ledger-inc asr asr-dry downloads loudness dict-index daily daily-source privacy-check test
+.PHONY: sync sync-dry backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
 
 sync:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
@@ -10,10 +16,13 @@ sync-dry:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) --dry-run
 
 ledger:
-	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG)
+	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) $(LEDGER_DB_ARG)
+
+ledger-full:
+	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) $(LEDGER_DB_ARG)
 
 ledger-inc:
-	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) --incremental
+	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) $(LEDGER_DB_ARG) --incremental
 
 backfill:
 	$(PYTHON) scripts/substudy.py backfill --config $(CONFIG)
@@ -35,6 +44,12 @@ loudness:
 
 dict-index:
 	$(PYTHON) scripts/substudy.py dict-index --config $(CONFIG)
+
+translate-local:
+	$(PYTHON) scripts/substudy.py translate-local --config $(CONFIG) $(LEDGER_DB_ARG) --target-lang $(TRANSLATE_TARGET_LANG) --source-track $(TRANSLATE_SOURCE_TRACK) --limit $(TRANSLATE_LIMIT) --timeout-sec $(TRANSLATE_TIMEOUT)
+
+translate-local-all:
+	$(PYTHON) scripts/substudy.py translate-local --config $(CONFIG) $(LEDGER_DB_ARG) --target-lang $(TRANSLATE_TARGET_LANG) --source-track $(TRANSLATE_SOURCE_TRACK) --limit 0 --timeout-sec $(TRANSLATE_TIMEOUT)
 
 daily:
 	./scripts/run_daily_sync.sh
