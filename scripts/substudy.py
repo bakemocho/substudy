@@ -7256,6 +7256,7 @@ def show_download_report(
     create_schema(connection)
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=since_hours)
     since_iso = since.replace(microsecond=0).isoformat()
+    now_iso = now_utc_iso()
 
     for source in sources:
         print(f"\n=== downloads: {source.id} (last {since_hours}h) ===")
@@ -7299,6 +7300,50 @@ def show_download_report(
                 if error_message:
                     print(f"  error: {error_message}")
 
+        queue_health_row = connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+                COALESCE(SUM(CASE WHEN status = 'leased' THEN 1 ELSE 0 END), 0) AS leased_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_due_count,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN status = 'error'
+                             AND next_retry_at IS NOT NULL
+                             AND next_retry_at > ?
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS retry_wait_count,
+                COALESCE(SUM(CASE WHEN status = 'dead' THEN 1 ELSE 0 END), 0) AS dead_count
+            FROM work_items
+            WHERE source_id = ?
+            """,
+            (now_iso, now_iso, source.id),
+        ).fetchone()
+        if queue_health_row is not None:
+            print(
+                "queue summary (authoritative): "
+                f"queued={int(queue_health_row[0] or 0)} "
+                f"leased={int(queue_health_row[1] or 0)} "
+                f"retry_due={int(queue_health_row[2] or 0)} "
+                f"retry_wait={int(queue_health_row[3] or 0)} "
+                f"dead={int(queue_health_row[4] or 0)}"
+            )
+
         failure_rows = connection.execute(
             """
             SELECT
@@ -7316,9 +7361,9 @@ def show_download_report(
             (source.id, limit),
         ).fetchall()
         if not failure_rows:
-            print("no pending failures")
+            print("download_state errors: none")
         else:
-            print("pending failures:")
+            print("download_state errors (legacy stage state; queue truth is work_items):")
             for stage, video_id, retry_count, last_error, next_retry_at in failure_rows:
                 print(
                     f"  stage={stage} video_id={video_id} retry_count={retry_count} "

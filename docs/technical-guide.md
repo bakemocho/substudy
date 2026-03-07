@@ -148,6 +148,10 @@ Operator note:
   - One row per sync stage execution (`media`, `subs`, `meta`) with status and counts.
 - `download_state` table:
   - Per-video latest status for each stage.
+- `work_items` table:
+  - Queue worker runtime state (`queued`, `leased`, `error`, `dead`, `success`) per `(source, stage, video)`.
+  - In queue mode, operational unresolved status should be judged from `work_items` first.
+  - `download_state` is stage state history and can retain legacy/secondary errors after queue recovery.
 - Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
 - Retry delay is failure-aware:
   - Normal failures: exponential backoff from 5m up to 24h.
