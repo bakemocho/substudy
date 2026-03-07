@@ -162,6 +162,13 @@ Operator note:
 - Queue failure visibility:
   - `python3 scripts/substudy.py queue-status --config config/sources.toml --limit 30`
   - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`), recent `error/dead` reasons, and `recovered by retry` (`status=success` with `attempt_count>=2`) per source.
+- Queue manual recovery (requeue dead/error items after fixes):
+  - Dry-run:
+    `python3 scripts/substudy.py queue-requeue --config config/sources.toml --stage translate --status dead --error-contains "tuple indices must be integers or slices, not str" --dry-run`
+  - Apply:
+    `python3 scripts/substudy.py queue-requeue --config config/sources.toml --stage translate --status dead --error-contains "tuple indices must be integers or slices, not str"`
+  - Optional:
+    `--reset-attempts` resets `attempt_count` to `0` when requeueing.
 
 ## Reverse incremental backfill
 

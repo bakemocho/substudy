@@ -7654,6 +7654,144 @@ def show_queue_status_report(
     connection.close()
 
 
+def requeue_work_items(
+    sources: list[SourceConfig],
+    db_path: Path,
+    stages: list[str] | None = None,
+    statuses: list[str] | None = None,
+    error_contains: str | None = None,
+    limit: int = 0,
+    dry_run: bool = False,
+    reset_attempts: bool = False,
+) -> None:
+    if not db_path.exists():
+        print(f"[queue-requeue] no ledger DB: {db_path}")
+        return
+
+    stage_filter = normalize_queue_stages(stages) if stages else []
+    status_filter = [
+        value
+        for value in (statuses or ["error", "dead"])
+        if value in {"queued", "leased", "error", "dead", "success"}
+    ]
+    if not status_filter:
+        status_filter = ["error", "dead"]
+
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    create_schema(connection)
+    now_iso = now_utc_iso()
+    total_selected = 0
+    total_requeued = 0
+
+    try:
+        for source in sources:
+            where_parts = ["source_id = ?"]
+            params: list[Any] = [source.id]
+
+            status_placeholders = ",".join("?" for _ in status_filter)
+            where_parts.append(f"status IN ({status_placeholders})")
+            params.extend(status_filter)
+
+            if stage_filter:
+                stage_placeholders = ",".join("?" for _ in stage_filter)
+                where_parts.append(f"stage IN ({stage_placeholders})")
+                params.extend(stage_filter)
+
+            if error_contains:
+                where_parts.append("COALESCE(last_error, '') LIKE ?")
+                params.append(f"%{error_contains}%")
+
+            select_sql = (
+                """
+                SELECT
+                    id,
+                    stage,
+                    video_id,
+                    status,
+                    attempt_count,
+                    COALESCE(last_error, '')
+                FROM work_items
+                WHERE
+                """
+                + " AND ".join(where_parts)
+                + """
+                ORDER BY updated_at ASC, id ASC
+                """
+            )
+            select_params: list[Any] = list(params)
+            if int(limit) > 0:
+                select_sql += " LIMIT ?"
+                select_params.append(max(1, int(limit)))
+
+            rows = connection.execute(select_sql, select_params).fetchall()
+            selected = len(rows)
+            total_selected += selected
+
+            print(
+                f"[queue-requeue] source={source.id} selected={selected} "
+                f"(dry_run={str(bool(dry_run)).lower()})"
+            )
+            preview_rows = rows[: min(5, selected)]
+            for (
+                item_id,
+                stage,
+                video_id,
+                status,
+                attempt_count,
+                last_error,
+            ) in preview_rows:
+                print(
+                    f"  id={int(item_id)} stage={stage} video_id={video_id} "
+                    f"status={status} attempts={int(attempt_count or 0)}"
+                )
+                if last_error:
+                    print(f"    reason: {last_error}")
+            if selected > len(preview_rows):
+                print(f"  ... and {selected - len(preview_rows)} more")
+
+            if dry_run or selected <= 0:
+                continue
+
+            ids = [int(row[0]) for row in rows]
+            id_placeholders = ",".join("?" for _ in ids)
+            set_parts = [
+                "status = 'queued'",
+                "next_retry_at = NULL",
+                "lease_owner = NULL",
+                "lease_token = NULL",
+                "lease_expires_at = NULL",
+                "updated_at = ?",
+            ]
+            if reset_attempts:
+                set_parts.append("attempt_count = 0")
+            update_sql = (
+                f"UPDATE work_items SET {', '.join(set_parts)} "
+                f"WHERE id IN ({id_placeholders})"
+            )
+            update_params: list[Any] = [now_iso]
+            update_params.extend(ids)
+            updated = connection.execute(update_sql, update_params).rowcount
+            connection.commit()
+            total_requeued += int(updated or 0)
+            print(
+                f"[queue-requeue] source={source.id} requeued={int(updated or 0)} "
+                f"(reset_attempts={str(bool(reset_attempts)).lower()})"
+            )
+    finally:
+        connection.close()
+
+    if dry_run:
+        print(
+            f"[queue-requeue] dry-run complete: matched={total_selected} "
+            f"statuses={','.join(status_filter)}"
+        )
+    else:
+        print(
+            f"[queue-requeue] complete: selected={total_selected} requeued={total_requeued} "
+            f"statuses={','.join(status_filter)} reset_attempts={str(bool(reset_attempts)).lower()}"
+        )
+
+
 def run_dict_bookmarks_export(
     db_path: Path,
     source_ids: list[str],
@@ -13847,6 +13985,44 @@ def parse_args() -> argparse.Namespace:
     )
     queue_status_parser.add_argument("--ledger-db", type=Path)
 
+    queue_requeue_parser = subparsers.add_parser(
+        "queue-requeue",
+        help="Requeue selected queue work_items (default: status error/dead)",
+    )
+    queue_requeue_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    queue_requeue_parser.add_argument("--source", action="append", dest="sources")
+    queue_requeue_parser.add_argument(
+        "--stage",
+        action="append",
+        dest="stages",
+        choices=["media", "subs", "meta", "asr", "loudness", "translate"],
+        help="Stage filter (repeatable). Defaults to all stages.",
+    )
+    queue_requeue_parser.add_argument(
+        "--status",
+        action="append",
+        dest="statuses",
+        choices=["queued", "leased", "error", "dead", "success"],
+        help="Current status filter (repeatable). Defaults to error+dead.",
+    )
+    queue_requeue_parser.add_argument(
+        "--error-contains",
+        help="Optional substring filter against last_error.",
+    )
+    queue_requeue_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max matched items per source (0 = no limit).",
+    )
+    queue_requeue_parser.add_argument(
+        "--reset-attempts",
+        action="store_true",
+        help="Reset attempt_count to 0 on requeue.",
+    )
+    queue_requeue_parser.add_argument("--dry-run", action="store_true")
+    queue_requeue_parser.add_argument("--ledger-db", type=Path)
+
     loudness_parser = subparsers.add_parser(
         "loudness",
         help="Analyze per-video loudness and store normalization gain",
@@ -14638,6 +14814,19 @@ def main() -> int:
             sources=sources,
             db_path=ledger_db_path,
             limit=max(1, args.limit),
+        )
+        return 0
+
+    if args.command == "queue-requeue":
+        requeue_work_items(
+            sources=sources,
+            db_path=ledger_db_path,
+            stages=getattr(args, "stages", None),
+            statuses=getattr(args, "statuses", None),
+            error_contains=str(getattr(args, "error_contains", "") or "").strip() or None,
+            limit=max(0, int(args.limit)),
+            dry_run=bool(args.dry_run),
+            reset_attempts=bool(getattr(args, "reset_attempts", False)),
         )
         return 0
 
