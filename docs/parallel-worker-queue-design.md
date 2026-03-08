@@ -29,6 +29,7 @@
 - block/forbidden 検知時に `source_access_state.blocked_until` を延長し、同 source の discovery と `media/subs/meta` lease を一時停止するようにした。
 - block 判定は TikTok 固有シグネチャ優先（`Your IP address is blocked from accessing this post` / `status 10204` / TikTok 文脈つき `403 Forbidden`）へ絞り、一般的な 403 で source 全体 cooldown に入りにくくした。
 - 成功した discovery / `media` / `subs` / `meta` は stale な source cooldown を解除し、`source.sleep_interval` ベースの `next_request_not_before` を更新して source 単位の短い request pacing を入れた。
+- legacy `sync` / `sync-subs-missing` / `sync-meta-missing` でも `subs` / `meta` の chunk 実行を source 間 round-robin に変更し、同一 source をまとめて drain しにくくした。
 - legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
 - `sync/backfill --execution-mode queue` に producer 共有ロックを追加し、launchd/手動の同時 producer 起動を抑止。
 - `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行し、`sync/backfill` producer と `queue-worker` 複数起動を分離。

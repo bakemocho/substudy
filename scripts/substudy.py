@@ -1477,6 +1477,772 @@ def chunk_items(items: list[Any], batch_size: int) -> list[list[Any]]:
     ]
 
 
+def build_run_local_urls_file(source: SourceConfig) -> Path:
+    run_token = f"{int(time.time())}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    return source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
+
+
+@dataclass
+class SyncSourceRunResult:
+    new_media_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChunkedYtdlpStagePlan:
+    source: SourceConfig
+    stage: str
+    active_urls_file: Path
+    build_command: Callable[[], list[str]]
+    command_template: list[str] | None
+    url_chunks: list[list[tuple[str, str]]]
+    target_ids: list[str]
+    resolved_target_ids: list[str]
+    unresolved_target_ids: list[str]
+    started_at: str
+    run_id: int | None
+    payload: dict[str, Any] = field(default_factory=dict)
+    chunk_index: int = 0
+    exit_code: int = 0
+    error: str | None = None
+    blocked_error: str | None = None
+
+
+def run_interleaved_chunked_ytdlp_stage_plans(
+    plans: list[ChunkedYtdlpStagePlan],
+    dry_run: bool,
+) -> None:
+    active_plans = [
+        plan
+        for plan in plans
+        if plan.command_template is not None and plan.url_chunks
+    ]
+    while True:
+        progress_made = False
+        for plan in active_plans:
+            if plan.error is not None or plan.chunk_index >= len(plan.url_chunks):
+                continue
+            progress_made = True
+            chunk_pairs = plan.url_chunks[plan.chunk_index]
+            chunk_urls = [url for _, url in chunk_pairs]
+            write_urls_file(plan.active_urls_file, chunk_urls)
+            if plan.chunk_index == 0:
+                command = [*cast(list[str], plan.command_template), "-a", str(plan.active_urls_file)]
+            else:
+                command = [*plan.build_command(), "-a", str(plan.active_urls_file)]
+            print(
+                f"[{plan.stage}] {plan.source.id}: chunk "
+                f"{plan.chunk_index + 1}/{len(plan.url_chunks)} "
+                f"targets={len(chunk_pairs)}"
+            )
+            try:
+                plan.exit_code, output_text = run_command_with_output(
+                    command,
+                    dry_run=dry_run,
+                )
+                if plan.exit_code != 0:
+                    plan.error = summarize_command_failure(output_text, plan.exit_code)
+            except Exception as exc:
+                plan.exit_code = 1
+                plan.error = str(exc)
+                print(
+                    f"[sync] {plan.source.id} {plan.stage} command failed: {exc}",
+                    file=sys.stderr,
+                )
+            finally:
+                plan.chunk_index += 1
+        if not progress_made:
+            break
+
+
+def prepare_subtitle_download_plan(
+    *,
+    source: SourceConfig,
+    dry_run: bool,
+    connection: sqlite3.Connection | None,
+    metadata_candidate_ids: list[str] | None,
+    new_media_ids: list[str],
+    strict_candidate_scope: bool,
+    active_urls_file: Path,
+    cookie_flags: list[str],
+    impersonate_flags: list[str],
+    safe_video_url: Callable[[str], str | None],
+    source_cooldown_active: bool,
+    source_cooldown_until: str | None,
+    suppress_skip_log: bool = False,
+) -> ChunkedYtdlpStagePlan | None:
+    subs_before_ids = set(read_archive_ids(source.subs_archive))
+    if source_cooldown_active:
+        if not suppress_skip_log:
+            print(
+                f"skip subtitles (source network cooldown until {source_cooldown_until or 'unknown'})"
+            )
+        return None
+
+    bootstrap_missing_sub_ids: list[str] = []
+    if (
+        connection is not None
+        and not dry_run
+        and not (strict_candidate_scope and metadata_candidate_ids is not None)
+    ):
+        bootstrap_missing_sub_ids = get_subtitle_missing_bootstrap_ids(
+            connection=connection,
+            source_id=source.id,
+        )
+
+    if metadata_candidate_ids is not None:
+        subtitle_candidate_ids = []
+        seen_subtitle_candidates: set[str] = set()
+        for video_id in metadata_candidate_ids:
+            if video_id in seen_subtitle_candidates:
+                continue
+            seen_subtitle_candidates.add(video_id)
+            subtitle_candidate_ids.append(video_id)
+    else:
+        subtitle_candidate_ids = list(new_media_ids)
+    for video_id in bootstrap_missing_sub_ids:
+        if video_id in subtitle_candidate_ids:
+            continue
+        subtitle_candidate_ids.append(video_id)
+
+    local_sub_ids = set(scan_subtitles(source).keys())
+    missing_sub_ids = [
+        video_id
+        for video_id in subtitle_candidate_ids
+        if video_id not in subs_before_ids and video_id not in local_sub_ids
+    ]
+
+    deferred_sub_ids: list[str] = []
+    missing_retryable_sub_ids = list(missing_sub_ids)
+    if connection is not None and not dry_run:
+        missing_retryable_sub_ids, deferred_sub_ids = split_retryable_ids(
+            connection=connection,
+            source_id=source.id,
+            stage="subs",
+            candidate_ids=missing_sub_ids,
+        )
+
+    retry_sub_ids: list[str] = []
+    if (
+        connection is not None
+        and not dry_run
+        and not (strict_candidate_scope and metadata_candidate_ids is not None)
+    ):
+        retry_sub_ids = get_due_retry_ids(connection, source.id, "subs")
+    existing_retry_sub_ids = [
+        video_id
+        for video_id in retry_sub_ids
+        if video_id in subs_before_ids or video_id in local_sub_ids
+    ]
+    retry_sub_ids = [
+        video_id
+        for video_id in retry_sub_ids
+        if video_id not in subs_before_ids and video_id not in local_sub_ids
+    ]
+
+    subtitle_target_ids: list[str] = []
+    seen_target_ids: set[str] = set()
+    for video_id in [*missing_retryable_sub_ids, *retry_sub_ids]:
+        if video_id in seen_target_ids:
+            continue
+        seen_target_ids.add(video_id)
+        subtitle_target_ids.append(video_id)
+
+    if not subtitle_target_ids:
+        if connection is not None and not dry_run:
+            subs_started_at = now_utc_iso()
+            subs_run_id = begin_download_run(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                command=None,
+                target_count=0,
+                started_at=subs_started_at,
+            )
+            for video_id in existing_retry_sub_ids:
+                upsert_download_state(
+                    connection=connection,
+                    source_id=source.id,
+                    stage="subs",
+                    video_id=video_id,
+                    status="success",
+                    run_id=subs_run_id,
+                    attempt_at=subs_started_at,
+                    url=safe_video_url(video_id),
+                    last_error=None,
+                    retry_count=0,
+                    next_retry_at=None,
+                )
+            finish_download_run(
+                connection=connection,
+                run_id=subs_run_id,
+                status="success",
+                finished_at=now_utc_iso(),
+                exit_code=0,
+                success_count=0,
+                failure_count=0,
+                error_message=None,
+            )
+            connection.commit()
+        print(
+            f"subtitle targets=0 success=0 failed=0 "
+            f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+            f"bootstrap={len(bootstrap_missing_sub_ids)}, "
+            f"deferred={len(deferred_sub_ids)}, "
+            f"skipped_existing={len(existing_retry_sub_ids)})"
+        )
+        return None
+
+    subtitle_url_pairs: list[tuple[str, str]] = []
+    unresolved_subtitle_target_ids: list[str] = []
+    for video_id in subtitle_target_ids:
+        video_url = safe_video_url(video_id)
+        if not video_url:
+            unresolved_subtitle_target_ids.append(video_id)
+            continue
+        subtitle_url_pairs.append((video_id, video_url))
+    resolved_subtitle_target_ids = [video_id for video_id, _ in subtitle_url_pairs]
+    subtitle_url_chunks = chunk_items(
+        subtitle_url_pairs,
+        DEFAULT_YTDLP_URL_BATCH_SIZE,
+    )
+
+    if dry_run:
+        print(
+            f"subtitle targets (dry-run): {len(subtitle_target_ids)} "
+            f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
+            f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
+            f"bootstrap={len(bootstrap_missing_sub_ids)}, "
+            f"deferred={len(deferred_sub_ids)})"
+        )
+
+    def build_subs_command() -> list[str]:
+        return [
+            source.ytdlp_bin,
+            *impersonate_flags,
+            *cookie_flags,
+            "--download-archive",
+            str(source.subs_archive),
+            "--continue",
+            "--no-overwrites",
+            *build_ytdlp_retry_flags(source, include_ignore_errors=True),
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            source.sub_langs,
+            "--sub-format",
+            source.sub_format,
+            "-o",
+            str(source.subs_dir / source.subs_output_template),
+            "--no-playlist",
+        ]
+
+    subs_command_template: list[str] | None = None
+    if resolved_subtitle_target_ids:
+        subs_command_template = build_subs_command()
+
+    subs_started_at = now_utc_iso()
+    subs_run_id: int | None = None
+    if connection is not None and not dry_run:
+        subs_run_id = begin_download_run(
+            connection=connection,
+            source_id=source.id,
+            stage="subs",
+            command=(
+                [*subs_command_template, "-a", str(active_urls_file)]
+                if subs_command_template is not None
+                else None
+            ),
+            target_count=len(resolved_subtitle_target_ids),
+            started_at=subs_started_at,
+        )
+        connection.commit()
+
+    return ChunkedYtdlpStagePlan(
+        source=source,
+        stage="subs",
+        active_urls_file=active_urls_file,
+        build_command=build_subs_command,
+        command_template=subs_command_template,
+        url_chunks=subtitle_url_chunks,
+        target_ids=subtitle_target_ids,
+        resolved_target_ids=resolved_subtitle_target_ids,
+        unresolved_target_ids=unresolved_subtitle_target_ids,
+        started_at=subs_started_at,
+        run_id=subs_run_id,
+        payload={
+            "new_count": len(missing_retryable_sub_ids),
+            "retry_count": len(retry_sub_ids),
+            "bootstrap_count": len(bootstrap_missing_sub_ids),
+            "deferred_count": len(deferred_sub_ids),
+            "existing_retry_ids": list(existing_retry_sub_ids),
+        },
+    )
+
+
+def finalize_subtitle_download_plan(
+    plan: ChunkedYtdlpStagePlan,
+    *,
+    dry_run: bool,
+    connection: sqlite3.Connection | None,
+    safe_video_url: Callable[[str], str | None],
+    activate_source_network_cooldown: Callable[[str | None, str | None], None] | None = None,
+) -> None:
+    if dry_run:
+        return
+
+    source = plan.source
+    subs_after_ids = set(read_archive_ids(source.subs_archive))
+    local_sub_after_ids = set(scan_subtitles(source).keys())
+    success_sub_ids = [
+        video_id
+        for video_id in plan.resolved_target_ids
+        if video_id in subs_after_ids or video_id in local_sub_after_ids
+    ]
+    failed_sub_ids = [
+        video_id
+        for video_id in plan.resolved_target_ids
+        if video_id not in subs_after_ids and video_id not in local_sub_after_ids
+    ]
+    failed_sub_ids.extend(plan.unresolved_target_ids)
+
+    existing_retry_sub_ids = [
+        str(video_id)
+        for video_id in cast(list[Any], plan.payload.get("existing_retry_ids") or [])
+    ]
+    if connection is not None:
+        for video_id in success_sub_ids:
+            upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                video_id=video_id,
+                status="success",
+                run_id=plan.run_id,
+                attempt_at=plan.started_at,
+                url=safe_video_url(video_id),
+                last_error=None,
+                retry_count=0,
+                next_retry_at=None,
+            )
+        for video_id in existing_retry_sub_ids:
+            upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                video_id=video_id,
+                status="success",
+                run_id=plan.run_id,
+                attempt_at=plan.started_at,
+                url=safe_video_url(video_id),
+                last_error=None,
+                retry_count=0,
+                next_retry_at=None,
+            )
+
+        for video_id in failed_sub_ids:
+            current = connection.execute(
+                """
+                SELECT retry_count
+                FROM download_state
+                WHERE source_id = ? AND stage = ? AND video_id = ?
+                """,
+                (source.id, "subs", video_id),
+            ).fetchone()
+            next_retry_count = (int(current[0]) if current else 0) + 1
+            if video_id in plan.unresolved_target_ids:
+                failure_reason = "cannot build video URL for subtitle download target"
+            else:
+                failure_reason = plan.error or (
+                    f"command exit code {plan.exit_code}"
+                    if plan.exit_code != 0
+                    else "subtitle file missing after download attempt"
+                )
+            next_retry_at = schedule_next_retry_iso(
+                next_retry_count,
+                error_message=failure_reason,
+            )
+            upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                video_id=video_id,
+                status="error",
+                run_id=plan.run_id,
+                attempt_at=plan.started_at,
+                url=safe_video_url(video_id),
+                last_error=failure_reason,
+                retry_count=next_retry_count,
+                next_retry_at=next_retry_at,
+            )
+            blocked_until = extend_source_network_cooldown(
+                connection=connection,
+                source_id=source.id,
+                error_message=failure_reason,
+                blocked_until=next_retry_at,
+                blocked_at=plan.started_at,
+            )
+            if blocked_until:
+                plan.blocked_error = failure_reason
+                if activate_source_network_cooldown is not None:
+                    activate_source_network_cooldown(
+                        blocked_until,
+                        failure_reason,
+                    )
+
+        subs_stage_error = None if not failed_sub_ids else (
+            "cannot build URL for some subtitle targets"
+            if plan.unresolved_target_ids and plan.error is None and plan.exit_code == 0
+            else (
+                plan.error or (
+                    f"command exit code {plan.exit_code}"
+                    if plan.exit_code != 0
+                    else "some subtitle items are still missing"
+                )
+            )
+        )
+        subs_finished_at = now_utc_iso()
+        subs_succeeded = not failed_sub_ids
+        if plan.command_template is not None:
+            record_source_network_access(
+                connection=connection,
+                source=source,
+                request_at=subs_finished_at,
+                succeeded=subs_succeeded,
+                clear_cooldown=subs_succeeded,
+                last_error=(
+                    None
+                    if subs_succeeded
+                    else (
+                        _SOURCE_ACCESS_UNSET
+                        if plan.blocked_error
+                        else subs_stage_error
+                    )
+                ),
+            )
+        finish_download_run(
+            connection=connection,
+            run_id=plan.run_id if plan.run_id is not None else -1,
+            status="success" if subs_succeeded else "error",
+            finished_at=subs_finished_at,
+            exit_code=plan.exit_code,
+            success_count=len(success_sub_ids),
+            failure_count=len(failed_sub_ids),
+            error_message=subs_stage_error,
+        )
+        connection.commit()
+
+    print(
+        f"subtitle targets={len(plan.target_ids)} "
+        f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
+        f"(resolved={len(plan.resolved_target_ids)}, unresolved={len(plan.unresolved_target_ids)}, "
+        f"new={int(plan.payload.get('new_count', 0))}, retry={int(plan.payload.get('retry_count', 0))}, "
+        f"bootstrap={int(plan.payload.get('bootstrap_count', 0))}, "
+        f"deferred={int(plan.payload.get('deferred_count', 0))}, "
+        f"skipped_existing={len(existing_retry_sub_ids)})"
+    )
+
+
+def prepare_metadata_download_plan(
+    *,
+    source: SourceConfig,
+    dry_run: bool,
+    connection: sqlite3.Connection | None,
+    metadata_candidate_ids: list[str] | None,
+    strict_candidate_scope: bool,
+    active_urls_file: Path,
+    cookie_flags: list[str],
+    impersonate_flags: list[str],
+    safe_video_url: Callable[[str], str | None],
+    source_cooldown_active: bool,
+    source_cooldown_until: str | None,
+    suppress_skip_log: bool = False,
+) -> ChunkedYtdlpStagePlan | None:
+    if source_cooldown_active:
+        if not suppress_skip_log:
+            print(
+                f"skip metadata (source network cooldown until {source_cooldown_until or 'unknown'})"
+            )
+        return None
+
+    if metadata_candidate_ids is not None:
+        archive_ids = []
+        seen_archive_ids: set[str] = set()
+        for video_id in metadata_candidate_ids:
+            if video_id in seen_archive_ids:
+                continue
+            archive_ids.append(video_id)
+            seen_archive_ids.add(video_id)
+    else:
+        media_archive_ids = read_archive_ids(source.media_archive)
+        subs_archive_ids = read_archive_ids(source.subs_archive)
+        local_media_ids = sorted(scan_media_files(source))
+        local_sub_ids = sorted(scan_subtitles(source))
+        archive_ids = []
+        seen_archive_ids = set()
+        for video_id in [*media_archive_ids, *subs_archive_ids, *local_media_ids, *local_sub_ids]:
+            if video_id in seen_archive_ids:
+                continue
+            archive_ids.append(video_id)
+            seen_archive_ids.add(video_id)
+
+    if not archive_ids:
+        if metadata_candidate_ids is None:
+            print(
+                f"no archived IDs found in {source.media_archive} or {source.subs_archive}; "
+                "skip metadata"
+            )
+        else:
+            print("no metadata candidates for this run; skip metadata")
+        return None
+
+    existing_meta_ids = list_meta_ids(source.meta_dir)
+    missing_ids = [video_id for video_id in archive_ids if video_id not in existing_meta_ids]
+    deferred_missing_ids: list[str] = []
+    missing_retryable_ids = list(missing_ids)
+    if connection is not None and not dry_run:
+        missing_retryable_ids, deferred_missing_ids = split_retryable_ids(
+            connection=connection,
+            source_id=source.id,
+            stage="meta",
+            candidate_ids=missing_ids,
+        )
+
+    retry_ids: list[str] = []
+    if (
+        connection is not None
+        and not dry_run
+        and not (strict_candidate_scope and metadata_candidate_ids is not None)
+    ):
+        retry_ids = get_due_retry_ids(connection, source.id, "meta")
+
+    metadata_target_ids: list[str] = []
+    seen_target_ids: set[str] = set()
+    for video_id in [*missing_retryable_ids, *retry_ids]:
+        if video_id in seen_target_ids:
+            continue
+        seen_target_ids.add(video_id)
+        metadata_target_ids.append(video_id)
+
+    if not metadata_target_ids:
+        print("metadata already up to date")
+        return None
+
+    metadata_url_pairs: list[tuple[str, str]] = []
+    unresolved_metadata_target_ids: list[str] = []
+    for video_id in metadata_target_ids:
+        video_url = safe_video_url(video_id)
+        if not video_url:
+            unresolved_metadata_target_ids.append(video_id)
+            continue
+        metadata_url_pairs.append((video_id, video_url))
+    resolved_metadata_target_ids = [video_id for video_id, _ in metadata_url_pairs]
+    metadata_url_chunks = chunk_items(
+        metadata_url_pairs,
+        DEFAULT_YTDLP_URL_BATCH_SIZE,
+    )
+    if dry_run:
+        print(
+            f"metadata target IDs (dry-run): {len(metadata_target_ids)} "
+            f"(resolved={len(resolved_metadata_target_ids)}, unresolved={len(unresolved_metadata_target_ids)}, "
+            f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
+            f"deferred={len(deferred_missing_ids)})"
+        )
+
+    def build_metadata_command() -> list[str]:
+        return [
+            source.ytdlp_bin,
+            *impersonate_flags,
+            *cookie_flags,
+            "--skip-download",
+            "--write-info-json",
+            "--write-description",
+            "--continue",
+            "--no-overwrites",
+            *build_ytdlp_retry_flags(source, include_ignore_errors=True),
+            "-o",
+            str(source.meta_dir / source.meta_output_template),
+            "--no-playlist",
+        ]
+
+    metadata_command_template: list[str] | None = None
+    if resolved_metadata_target_ids:
+        metadata_command_template = build_metadata_command()
+    meta_started_at = now_utc_iso()
+    meta_run_id: int | None = None
+    if connection is not None and not dry_run:
+        meta_run_id = begin_download_run(
+            connection=connection,
+            source_id=source.id,
+            stage="meta",
+            command=(
+                [*metadata_command_template, "-a", str(active_urls_file)]
+                if metadata_command_template is not None
+                else None
+            ),
+            target_count=len(resolved_metadata_target_ids),
+            started_at=meta_started_at,
+        )
+        connection.commit()
+
+    return ChunkedYtdlpStagePlan(
+        source=source,
+        stage="meta",
+        active_urls_file=active_urls_file,
+        build_command=build_metadata_command,
+        command_template=metadata_command_template,
+        url_chunks=metadata_url_chunks,
+        target_ids=metadata_target_ids,
+        resolved_target_ids=resolved_metadata_target_ids,
+        unresolved_target_ids=unresolved_metadata_target_ids,
+        started_at=meta_started_at,
+        run_id=meta_run_id,
+        payload={
+            "new_count": len(missing_retryable_ids),
+            "retry_count": len(retry_ids),
+            "deferred_count": len(deferred_missing_ids),
+        },
+    )
+
+
+def finalize_metadata_download_plan(
+    plan: ChunkedYtdlpStagePlan,
+    *,
+    dry_run: bool,
+    connection: sqlite3.Connection | None,
+    safe_video_url: Callable[[str], str | None],
+    activate_source_network_cooldown: Callable[[str | None, str | None], None] | None = None,
+) -> None:
+    if dry_run:
+        return
+
+    source = plan.source
+    post_meta_ids = list_meta_ids(source.meta_dir)
+    success_meta_ids = [
+        video_id for video_id in plan.resolved_target_ids if video_id in post_meta_ids
+    ]
+    failed_meta_ids = [
+        video_id for video_id in plan.resolved_target_ids if video_id not in post_meta_ids
+    ]
+    failed_meta_ids.extend(plan.unresolved_target_ids)
+
+    if connection is not None:
+        for video_id in success_meta_ids:
+            upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="meta",
+                video_id=video_id,
+                status="success",
+                run_id=plan.run_id,
+                attempt_at=plan.started_at,
+                url=safe_video_url(video_id),
+                last_error=None,
+                retry_count=0,
+                next_retry_at=None,
+            )
+
+        for video_id in failed_meta_ids:
+            current = connection.execute(
+                """
+                SELECT retry_count
+                FROM download_state
+                WHERE source_id = ? AND stage = ? AND video_id = ?
+                """,
+                (source.id, "meta", video_id),
+            ).fetchone()
+            next_retry_count = (int(current[0]) if current else 0) + 1
+            if video_id in plan.unresolved_target_ids:
+                failure_reason = "cannot build video URL for metadata download target"
+            else:
+                failure_reason = plan.error or (
+                    f"command exit code {plan.exit_code}"
+                    if plan.exit_code != 0
+                    else "metadata file missing after download attempt"
+                )
+            next_retry_at = schedule_next_retry_iso(
+                next_retry_count,
+                error_message=failure_reason,
+            )
+            upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="meta",
+                video_id=video_id,
+                status="error",
+                run_id=plan.run_id,
+                attempt_at=plan.started_at,
+                url=safe_video_url(video_id),
+                last_error=failure_reason,
+                retry_count=next_retry_count,
+                next_retry_at=next_retry_at,
+            )
+            blocked_until = extend_source_network_cooldown(
+                connection=connection,
+                source_id=source.id,
+                error_message=failure_reason,
+                blocked_until=next_retry_at,
+                blocked_at=plan.started_at,
+            )
+            if blocked_until:
+                plan.blocked_error = failure_reason
+                if activate_source_network_cooldown is not None:
+                    activate_source_network_cooldown(
+                        blocked_until,
+                        failure_reason,
+                    )
+
+        meta_stage_error = None if not failed_meta_ids else (
+            "cannot build URL for some metadata targets"
+            if plan.unresolved_target_ids and plan.error is None and plan.exit_code == 0
+            else (
+                plan.error or (
+                    f"command exit code {plan.exit_code}"
+                    if plan.exit_code != 0
+                    else "some metadata items are still missing"
+                )
+            )
+        )
+        meta_finished_at = now_utc_iso()
+        meta_succeeded = not failed_meta_ids
+        if plan.command_template is not None:
+            record_source_network_access(
+                connection=connection,
+                source=source,
+                request_at=meta_finished_at,
+                succeeded=meta_succeeded,
+                clear_cooldown=meta_succeeded,
+                last_error=(
+                    None
+                    if meta_succeeded
+                    else (
+                        _SOURCE_ACCESS_UNSET
+                        if plan.blocked_error
+                        else meta_stage_error
+                    )
+                ),
+            )
+        finish_download_run(
+            connection=connection,
+            run_id=plan.run_id if plan.run_id is not None else -1,
+            status="success" if meta_succeeded else "error",
+            finished_at=meta_finished_at,
+            exit_code=plan.exit_code,
+            success_count=len(success_meta_ids),
+            failure_count=len(failed_meta_ids),
+            error_message=meta_stage_error,
+        )
+        connection.commit()
+
+    print(
+        f"metadata targets={len(plan.target_ids)} "
+        f"success={len(success_meta_ids)} failed={len(failed_meta_ids)} "
+        f"(resolved={len(plan.resolved_target_ids)}, unresolved={len(plan.unresolved_target_ids)}, "
+        f"new={int(plan.payload.get('new_count', 0))}, retry={int(plan.payload.get('retry_count', 0))}, "
+        f"deferred={int(plan.payload.get('deferred_count', 0))})"
+    )
+
+
 def sync_source(
     source: SourceConfig,
     dry_run: bool,
@@ -1496,7 +2262,9 @@ def sync_source(
     metered_playlist_end: int = DEFAULT_METERED_PLAYLIST_END,
     urls_file_override: Path | None = None,
     strict_candidate_scope: bool = False,
-) -> None:
+    suppress_skip_subs_log: bool = False,
+    suppress_skip_meta_log: bool = False,
+) -> SyncSourceRunResult:
     print(f"\n=== {run_label}: {source.id} ===")
 
     source.media_dir.mkdir(parents=True, exist_ok=True)
@@ -1600,8 +2368,7 @@ def sync_source(
     if urls_file_override is not None:
         active_urls_file = urls_file_override
     else:
-        run_token = f"{int(time.time())}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        active_urls_file = source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
+        active_urls_file = build_run_local_urls_file(source)
 
     def safe_video_url(video_id: str) -> str | None:
         try:
@@ -2389,656 +3156,199 @@ def sync_source(
                 f"skip media (metered updates-only; archive_count<{max(0, int(metered_min_archive_ids))})"
             )
 
-    subs_before_ids = set(read_archive_ids(source.subs_archive))
-    if not skip_subs and not source_cooldown_active:
-        bootstrap_missing_sub_ids: list[str] = []
-        if (
-            connection is not None
-            and not dry_run
-            and not (strict_candidate_scope and metadata_candidate_ids is not None)
-        ):
-            bootstrap_missing_sub_ids = get_subtitle_missing_bootstrap_ids(
+    if not skip_subs:
+        subs_plan = prepare_subtitle_download_plan(
+            source=source,
+            dry_run=dry_run,
+            connection=connection,
+            metadata_candidate_ids=metadata_candidate_ids,
+            new_media_ids=new_media_ids,
+            strict_candidate_scope=strict_candidate_scope,
+            active_urls_file=active_urls_file,
+            cookie_flags=cookie_flags,
+            impersonate_flags=impersonate_flags,
+            safe_video_url=safe_video_url,
+            source_cooldown_active=source_cooldown_active,
+            source_cooldown_until=source_cooldown_until,
+            suppress_skip_log=suppress_skip_subs_log,
+        )
+        if subs_plan is not None:
+            run_interleaved_chunked_ytdlp_stage_plans([subs_plan], dry_run=dry_run)
+            finalize_subtitle_download_plan(
+                subs_plan,
+                dry_run=dry_run,
                 connection=connection,
-                source_id=source.id,
+                safe_video_url=safe_video_url,
+                activate_source_network_cooldown=activate_source_network_cooldown,
             )
-
-        if metadata_candidate_ids is not None:
-            subtitle_candidate_ids = []
-            seen_subtitle_candidates: set[str] = set()
-            for video_id in metadata_candidate_ids:
-                if video_id in seen_subtitle_candidates:
-                    continue
-                seen_subtitle_candidates.add(video_id)
-                subtitle_candidate_ids.append(video_id)
-        else:
-            subtitle_candidate_ids = list(new_media_ids)
-        for video_id in bootstrap_missing_sub_ids:
-            if video_id in subtitle_candidate_ids:
-                continue
-            subtitle_candidate_ids.append(video_id)
-
-        local_sub_ids = set(scan_subtitles(source).keys())
-        missing_sub_ids = [
-            video_id
-            for video_id in subtitle_candidate_ids
-            if video_id not in subs_before_ids and video_id not in local_sub_ids
-        ]
-
-        deferred_sub_ids: list[str] = []
-        missing_retryable_sub_ids = list(missing_sub_ids)
-        if connection is not None and not dry_run:
-            missing_retryable_sub_ids, deferred_sub_ids = split_retryable_ids(
-                connection=connection,
-                source_id=source.id,
-                stage="subs",
-                candidate_ids=missing_sub_ids,
-            )
-
-        retry_sub_ids: list[str] = []
-        if (
-            connection is not None
-            and not dry_run
-            and not (strict_candidate_scope and metadata_candidate_ids is not None)
-        ):
-            retry_sub_ids = get_due_retry_ids(connection, source.id, "subs")
-        existing_retry_sub_ids = [
-            video_id
-            for video_id in retry_sub_ids
-            if video_id in subs_before_ids or video_id in local_sub_ids
-        ]
-        retry_sub_ids = [
-            video_id
-            for video_id in retry_sub_ids
-            if video_id not in subs_before_ids and video_id not in local_sub_ids
-        ]
-
-        subtitle_target_ids: list[str] = []
-        seen_target_ids: set[str] = set()
-        for video_id in [*missing_retryable_sub_ids, *retry_sub_ids]:
-            if video_id in seen_target_ids:
-                continue
-            seen_target_ids.add(video_id)
-            subtitle_target_ids.append(video_id)
-
-        if not subtitle_target_ids:
-            if connection is not None and not dry_run:
-                subs_started_at = now_utc_iso()
-                subs_run_id = begin_download_run(
-                    connection=connection,
-                    source_id=source.id,
-                    stage="subs",
-                    command=None,
-                    target_count=0,
-                    started_at=subs_started_at,
-                )
-                for video_id in existing_retry_sub_ids:
-                    upsert_download_state(
-                        connection=connection,
-                        source_id=source.id,
-                        stage="subs",
-                        video_id=video_id,
-                        status="success",
-                        run_id=subs_run_id,
-                        attempt_at=subs_started_at,
-                        url=safe_video_url(video_id),
-                        last_error=None,
-                        retry_count=0,
-                        next_retry_at=None,
-                    )
-                finish_download_run(
-                    connection=connection,
-                    run_id=subs_run_id,
-                    status="success",
-                    finished_at=now_utc_iso(),
-                    exit_code=0,
-                    success_count=0,
-                    failure_count=0,
-                    error_message=None,
-                )
-                connection.commit()
-            print(
-                f"subtitle targets=0 success=0 failed=0 "
-                f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
-                f"bootstrap={len(bootstrap_missing_sub_ids)}, "
-                f"deferred={len(deferred_sub_ids)}, "
-                f"skipped_existing={len(existing_retry_sub_ids)})"
-            )
-        else:
-            subtitle_url_pairs: list[tuple[str, str]] = []
-            unresolved_subtitle_target_ids: list[str] = []
-            for video_id in subtitle_target_ids:
-                video_url = safe_video_url(video_id)
-                if not video_url:
-                    unresolved_subtitle_target_ids.append(video_id)
-                    continue
-                subtitle_url_pairs.append((video_id, video_url))
-            resolved_subtitle_target_ids = [video_id for video_id, _ in subtitle_url_pairs]
-            subtitle_url_chunks = chunk_items(
-                subtitle_url_pairs,
-                DEFAULT_YTDLP_URL_BATCH_SIZE,
-            )
-
-            if dry_run:
-                print(
-                    f"subtitle targets (dry-run): {len(subtitle_target_ids)} "
-                    f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
-                    f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
-                    f"bootstrap={len(bootstrap_missing_sub_ids)}, "
-                    f"deferred={len(deferred_sub_ids)})"
-                )
-            def build_subs_command() -> list[str]:
-                return [
-                    source.ytdlp_bin,
-                    *impersonate_flags,
-                    *cookie_flags,
-                    "--download-archive",
-                    str(source.subs_archive),
-                    "--continue",
-                    "--no-overwrites",
-                    *build_ytdlp_retry_flags(source, include_ignore_errors=True),
-                    "--skip-download",
-                    "--write-subs",
-                    "--write-auto-subs",
-                    "--sub-langs",
-                    source.sub_langs,
-                    "--sub-format",
-                    source.sub_format,
-                    "-o",
-                    str(source.subs_dir / source.subs_output_template),
-                    "--no-playlist",
-                ]
-            subs_command_template: list[str] | None = None
-            if resolved_subtitle_target_ids:
-                subs_command_template = build_subs_command()
-
-            subs_started_at = now_utc_iso()
-            subs_run_id: int | None = None
-            if connection is not None and not dry_run:
-                subs_run_id = begin_download_run(
-                    connection=connection,
-                    source_id=source.id,
-                    stage="subs",
-                    command=(
-                        [*subs_command_template, "-a", str(active_urls_file)]
-                        if subs_command_template is not None
-                        else None
-                    ),
-                    target_count=len(resolved_subtitle_target_ids),
-                    started_at=subs_started_at,
-                )
-                connection.commit()
-
-            subs_exit_code = 0
-            subs_error: str | None = None
-            subs_blocked_error: str | None = None
-            if subs_command_template is not None:
-                chunk_count = len(subtitle_url_chunks)
-                for chunk_index, chunk_pairs in enumerate(subtitle_url_chunks, start=1):
-                    chunk_urls = [url for _, url in chunk_pairs]
-                    write_urls_file(active_urls_file, chunk_urls)
-                    if chunk_index == 1:
-                        subs_command = [*subs_command_template, "-a", str(active_urls_file)]
-                    else:
-                        subs_command = [*build_subs_command(), "-a", str(active_urls_file)]
-                    print(
-                        f"[subs] {source.id}: chunk {chunk_index}/{chunk_count} "
-                        f"targets={len(chunk_pairs)}"
-                    )
-                    try:
-                        subs_exit_code, subs_output = run_command_with_output(
-                            subs_command,
-                            dry_run=dry_run,
-                        )
-                        if subs_exit_code != 0:
-                            subs_error = summarize_command_failure(
-                                subs_output,
-                                subs_exit_code,
-                            )
-                            break
-                    except Exception as exc:
-                        subs_exit_code = 1
-                        subs_error = str(exc)
-                        print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
-                        break
-
-            if not dry_run:
-                subs_after_ids = set(read_archive_ids(source.subs_archive))
-                local_sub_after_ids = set(scan_subtitles(source).keys())
-                success_sub_ids = [
-                    video_id
-                    for video_id in resolved_subtitle_target_ids
-                    if video_id in subs_after_ids or video_id in local_sub_after_ids
-                ]
-                failed_sub_ids = [
-                    video_id
-                    for video_id in resolved_subtitle_target_ids
-                    if video_id not in subs_after_ids and video_id not in local_sub_after_ids
-                ]
-                failed_sub_ids.extend(unresolved_subtitle_target_ids)
-
-                if connection is not None:
-                    for video_id in success_sub_ids:
-                        upsert_download_state(
-                            connection=connection,
-                            source_id=source.id,
-                            stage="subs",
-                            video_id=video_id,
-                            status="success",
-                            run_id=subs_run_id,
-                            attempt_at=subs_started_at,
-                            url=safe_video_url(video_id),
-                            last_error=None,
-                            retry_count=0,
-                            next_retry_at=None,
-                        )
-                    for video_id in existing_retry_sub_ids:
-                        upsert_download_state(
-                            connection=connection,
-                            source_id=source.id,
-                            stage="subs",
-                            video_id=video_id,
-                            status="success",
-                            run_id=subs_run_id,
-                            attempt_at=subs_started_at,
-                            url=safe_video_url(video_id),
-                            last_error=None,
-                            retry_count=0,
-                            next_retry_at=None,
-                        )
-
-                    for video_id in failed_sub_ids:
-                        current = connection.execute(
-                            """
-                            SELECT retry_count
-                            FROM download_state
-                            WHERE source_id = ? AND stage = ? AND video_id = ?
-                            """,
-                            (source.id, "subs", video_id),
-                        ).fetchone()
-                        next_retry_count = (int(current[0]) if current else 0) + 1
-                        if video_id in unresolved_subtitle_target_ids:
-                            failure_reason = "cannot build video URL for subtitle download target"
-                        else:
-                            failure_reason = subs_error or (
-                                f"command exit code {subs_exit_code}"
-                                if subs_exit_code != 0
-                                else "subtitle file missing after download attempt"
-                            )
-                        next_retry_at = schedule_next_retry_iso(
-                            next_retry_count,
-                            error_message=failure_reason,
-                        )
-                        upsert_download_state(
-                            connection=connection,
-                            source_id=source.id,
-                            stage="subs",
-                            video_id=video_id,
-                            status="error",
-                            run_id=subs_run_id,
-                            attempt_at=subs_started_at,
-                            url=safe_video_url(video_id),
-                            last_error=failure_reason,
-                            retry_count=next_retry_count,
-                            next_retry_at=next_retry_at,
-                        )
-                        blocked_until = extend_source_network_cooldown(
-                            connection=connection,
-                            source_id=source.id,
-                            error_message=failure_reason,
-                            blocked_until=next_retry_at,
-                            blocked_at=subs_started_at,
-                        )
-                        if blocked_until:
-                            subs_blocked_error = failure_reason
-                            activate_source_network_cooldown(
-                                blocked_until=blocked_until,
-                                reason=failure_reason,
-                            )
-
-                    subs_stage_error = None if not failed_sub_ids else (
-                        "cannot build URL for some subtitle targets"
-                        if unresolved_subtitle_target_ids and subs_error is None and subs_exit_code == 0
-                        else (
-                            subs_error or (
-                                f"command exit code {subs_exit_code}"
-                                if subs_exit_code != 0
-                                else "some subtitle items are still missing"
-                            )
-                        )
-                    )
-                    subs_finished_at = now_utc_iso()
-                    subs_succeeded = not failed_sub_ids
-                    if subs_command_template is not None:
-                        record_source_network_access(
-                            connection=connection,
-                            source=source,
-                            request_at=subs_finished_at,
-                            succeeded=subs_succeeded,
-                            clear_cooldown=subs_succeeded,
-                            last_error=(
-                                None
-                                if subs_succeeded
-                                else (
-                                    _SOURCE_ACCESS_UNSET
-                                    if subs_blocked_error
-                                    else subs_stage_error
-                                )
-                            ),
-                        )
-                    finish_download_run(
-                        connection=connection,
-                        run_id=subs_run_id if subs_run_id is not None else -1,
-                        status="success" if subs_succeeded else "error",
-                        finished_at=subs_finished_at,
-                        exit_code=subs_exit_code,
-                        success_count=len(success_sub_ids),
-                        failure_count=len(failed_sub_ids),
-                        error_message=subs_stage_error,
-                    )
-                    connection.commit()
-
-                print(
-                    f"subtitle targets={len(subtitle_target_ids)} "
-                    f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
-                    f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
-                    f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
-                    f"bootstrap={len(bootstrap_missing_sub_ids)}, "
-                    f"deferred={len(deferred_sub_ids)}, "
-                    f"skipped_existing={len(existing_retry_sub_ids)})"
-                )
-    else:
-        if skip_subs:
-            print("skip subtitles")
-        else:
-            print(
-                f"skip subtitles (source network cooldown until {source_cooldown_until or 'unknown'})"
-            )
+    elif not suppress_skip_subs_log:
+        print("skip subtitles")
 
     if skip_meta:
-        print("skip metadata")
-        return
-    if source_cooldown_active:
-        print(
-            f"skip metadata (source network cooldown until {source_cooldown_until or 'unknown'})"
-        )
-        return
+        if not suppress_skip_meta_log:
+            print("skip metadata")
+        return SyncSourceRunResult(new_media_ids=new_media_ids)
 
-    if metadata_candidate_ids is not None:
-        archive_ids = []
-        seen_archive_ids: set[str] = set()
-        for video_id in metadata_candidate_ids:
-            if video_id in seen_archive_ids:
-                continue
-            archive_ids.append(video_id)
-            seen_archive_ids.add(video_id)
-    else:
-        media_archive_ids = read_archive_ids(source.media_archive)
-        subs_archive_ids = read_archive_ids(source.subs_archive)
-        local_media_ids = sorted(scan_media_files(source))
-        local_sub_ids = sorted(scan_subtitles(source))
-        archive_ids = []
-        seen_archive_ids = set()
-        for video_id in [*media_archive_ids, *subs_archive_ids, *local_media_ids, *local_sub_ids]:
-            if video_id in seen_archive_ids:
-                continue
-            archive_ids.append(video_id)
-            seen_archive_ids.add(video_id)
-
-    if not archive_ids:
-        if metadata_candidate_ids is None:
-            print(
-                f"no archived IDs found in {source.media_archive} or {source.subs_archive}; "
-                "skip metadata"
-            )
-        else:
-            print("no metadata candidates for this run; skip metadata")
-        return
-
-    existing_meta_ids = list_meta_ids(source.meta_dir)
-    missing_ids = [video_id for video_id in archive_ids if video_id not in existing_meta_ids]
-    deferred_missing_ids: list[str] = []
-    missing_retryable_ids = list(missing_ids)
-    if connection is not None and not dry_run:
-        missing_retryable_ids, deferred_missing_ids = split_retryable_ids(
-            connection=connection,
-            source_id=source.id,
-            stage="meta",
-            candidate_ids=missing_ids,
-        )
-
-    retry_ids: list[str] = []
-    if (
-        connection is not None
-        and not dry_run
-        and not (strict_candidate_scope and metadata_candidate_ids is not None)
-    ):
-        retry_ids = get_due_retry_ids(connection, source.id, "meta")
-
-    metadata_target_ids: list[str] = []
-    seen_target_ids: set[str] = set()
-    for video_id in [*missing_retryable_ids, *retry_ids]:
-        if video_id in seen_target_ids:
-            continue
-        seen_target_ids.add(video_id)
-        metadata_target_ids.append(video_id)
-
-    if not metadata_target_ids:
-        print("metadata already up to date")
-        return
-
-    metadata_url_pairs: list[tuple[str, str]] = []
-    unresolved_metadata_target_ids: list[str] = []
-    for video_id in metadata_target_ids:
-        video_url = safe_video_url(video_id)
-        if not video_url:
-            unresolved_metadata_target_ids.append(video_id)
-            continue
-        metadata_url_pairs.append((video_id, video_url))
-    resolved_metadata_target_ids = [video_id for video_id, _ in metadata_url_pairs]
-    metadata_url_chunks = chunk_items(
-        metadata_url_pairs,
-        DEFAULT_YTDLP_URL_BATCH_SIZE,
+    meta_plan = prepare_metadata_download_plan(
+        source=source,
+        dry_run=dry_run,
+        connection=connection,
+        metadata_candidate_ids=metadata_candidate_ids,
+        strict_candidate_scope=strict_candidate_scope,
+        active_urls_file=active_urls_file,
+        cookie_flags=cookie_flags,
+        impersonate_flags=impersonate_flags,
+        safe_video_url=safe_video_url,
+        source_cooldown_active=source_cooldown_active,
+        source_cooldown_until=source_cooldown_until,
+        suppress_skip_log=suppress_skip_meta_log,
     )
-    if dry_run:
-        print(
-            f"metadata target IDs (dry-run): {len(metadata_target_ids)} "
-            f"(resolved={len(resolved_metadata_target_ids)}, unresolved={len(unresolved_metadata_target_ids)}, "
-            f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
-            f"deferred={len(deferred_missing_ids)})"
-        )
-
-    def build_metadata_command() -> list[str]:
-        return [
-            source.ytdlp_bin,
-            *impersonate_flags,
-            *cookie_flags,
-            "--skip-download",
-            "--write-info-json",
-            "--write-description",
-            "--continue",
-            "--no-overwrites",
-            *build_ytdlp_retry_flags(source, include_ignore_errors=True),
-            "-o",
-            str(source.meta_dir / source.meta_output_template),
-            "--no-playlist",
-        ]
-    metadata_command_template: list[str] | None = None
-    if resolved_metadata_target_ids:
-        metadata_command_template = build_metadata_command()
-    meta_started_at = now_utc_iso()
-    meta_run_id: int | None = None
-    if connection is not None and not dry_run:
-        meta_run_id = begin_download_run(
+    if meta_plan is not None:
+        run_interleaved_chunked_ytdlp_stage_plans([meta_plan], dry_run=dry_run)
+        finalize_metadata_download_plan(
+            meta_plan,
+            dry_run=dry_run,
             connection=connection,
-            source_id=source.id,
-            stage="meta",
-            command=(
-                [*metadata_command_template, "-a", str(active_urls_file)]
-                if metadata_command_template is not None
-                else None
-            ),
-            target_count=len(resolved_metadata_target_ids),
-            started_at=meta_started_at,
+            safe_video_url=safe_video_url,
+            activate_source_network_cooldown=activate_source_network_cooldown,
         )
-        connection.commit()
+    return SyncSourceRunResult(new_media_ids=new_media_ids)
 
-    meta_exit_code = 0
-    meta_error: str | None = None
-    meta_blocked_error: str | None = None
-    if metadata_command_template is not None:
-        chunk_count = len(metadata_url_chunks)
-        for chunk_index, chunk_pairs in enumerate(metadata_url_chunks, start=1):
-            chunk_urls = [url for _, url in chunk_pairs]
-            write_urls_file(active_urls_file, chunk_urls)
-            if chunk_index == 1:
-                metadata_command = [*metadata_command_template, "-a", str(active_urls_file)]
-            else:
-                metadata_command = [*build_metadata_command(), "-a", str(active_urls_file)]
-            print(
-                f"[meta] {source.id}: chunk {chunk_index}/{chunk_count} "
-                f"targets={len(chunk_pairs)}"
-            )
-            try:
-                meta_exit_code, meta_output = run_command_with_output(
-                    metadata_command,
-                    dry_run=dry_run,
-                )
-                if meta_exit_code != 0:
-                    meta_error = summarize_command_failure(
-                        meta_output,
-                        meta_exit_code,
-                    )
-                    break
-            except Exception as exc:
-                meta_exit_code = 1
-                meta_error = str(exc)
-                print(f"[sync] {source.id} metadata command failed: {exc}", file=sys.stderr)
-                break
 
-    if dry_run:
-        return
-
-    post_meta_ids = list_meta_ids(source.meta_dir)
-    success_meta_ids = [video_id for video_id in resolved_metadata_target_ids if video_id in post_meta_ids]
-    failed_meta_ids = [
-        video_id for video_id in resolved_metadata_target_ids if video_id not in post_meta_ids
-    ]
-    failed_meta_ids.extend(unresolved_metadata_target_ids)
-
-    if connection is not None:
-        for video_id in success_meta_ids:
-            upsert_download_state(
-                connection=connection,
-                source_id=source.id,
-                stage="meta",
-                video_id=video_id,
-                status="success",
-                run_id=meta_run_id,
-                attempt_at=meta_started_at,
-                url=safe_video_url(video_id),
-                last_error=None,
-                retry_count=0,
-                next_retry_at=None,
-            )
-
-        for video_id in failed_meta_ids:
-            current = connection.execute(
-                """
-                SELECT retry_count
-                FROM download_state
-                WHERE source_id = ? AND stage = ? AND video_id = ?
-                """,
-                (source.id, "meta", video_id),
-            ).fetchone()
-            next_retry_count = (int(current[0]) if current else 0) + 1
-            if video_id in unresolved_metadata_target_ids:
-                failure_reason = "cannot build video URL for metadata download target"
-            else:
-                failure_reason = meta_error or (
-                    f"command exit code {meta_exit_code}"
-                    if meta_exit_code != 0
-                    else "metadata file missing after download attempt"
-                )
-            next_retry_at = schedule_next_retry_iso(
-                next_retry_count,
-                error_message=failure_reason,
-            )
-            upsert_download_state(
-                connection=connection,
-                source_id=source.id,
-                stage="meta",
-                video_id=video_id,
-                status="error",
-                run_id=meta_run_id,
-                attempt_at=meta_started_at,
-                url=safe_video_url(video_id),
-                last_error=failure_reason,
-                retry_count=next_retry_count,
-                next_retry_at=next_retry_at,
-            )
-            blocked_until = extend_source_network_cooldown(
-                connection=connection,
-                source_id=source.id,
-                error_message=failure_reason,
-                blocked_until=next_retry_at,
-                blocked_at=meta_started_at,
-            )
-            if blocked_until:
-                meta_blocked_error = failure_reason
-                activate_source_network_cooldown(
-                    blocked_until=blocked_until,
-                    reason=failure_reason,
-                )
-
-        meta_stage_error = None if not failed_meta_ids else (
-            "cannot build URL for some metadata targets"
-            if unresolved_metadata_target_ids and meta_error is None and meta_exit_code == 0
-            else (
-                meta_error or (
-                    f"command exit code {meta_exit_code}"
-                    if meta_exit_code != 0
-                    else "some metadata items are still missing"
-                )
-            )
+def run_legacy_sync_sources(
+    *,
+    sources: list[SourceConfig],
+    dry_run: bool,
+    skip_media: bool,
+    skip_subs: bool,
+    skip_meta: bool,
+    connection: sqlite3.Connection | None,
+    metered_media_mode: str,
+    metered_min_archive_ids: int,
+    metered_playlist_end: int,
+) -> None:
+    source_results: dict[str, SyncSourceRunResult] = {}
+    for source in sources:
+        source_results[source.id] = sync_source(
+            source=source,
+            dry_run=dry_run,
+            skip_media=skip_media,
+            skip_subs=True,
+            skip_meta=True,
+            connection=connection,
+            metered_media_mode=metered_media_mode,
+            metered_min_archive_ids=metered_min_archive_ids,
+            metered_playlist_end=metered_playlist_end,
+            suppress_skip_subs_log=not skip_subs,
+            suppress_skip_meta_log=not skip_meta,
         )
-        meta_finished_at = now_utc_iso()
-        meta_succeeded = not failed_meta_ids
-        if metadata_command_template is not None:
-            record_source_network_access(
-                connection=connection,
+
+    if not skip_subs:
+        subtitle_plans: list[ChunkedYtdlpStagePlan] = []
+        for source in sources:
+            source_cooldown_active = False
+            source_cooldown_until: str | None = None
+            if connection is not None and not dry_run:
+                (
+                    source_cooldown_active,
+                    _remaining_hours,
+                    source_cooldown_until,
+                    _source_cooldown_reason,
+                ) = get_source_network_cooldown_state(
+                    connection=connection,
+                    source_id=source.id,
+                )
+
+            def safe_video_url(video_id: str, *, _source: SourceConfig = source) -> str | None:
+                try:
+                    return build_video_url(_source, video_id)
+                except ValueError:
+                    return None
+
+            subtitle_plan = prepare_subtitle_download_plan(
                 source=source,
-                request_at=meta_finished_at,
-                succeeded=meta_succeeded,
-                clear_cooldown=meta_succeeded,
-                last_error=(
-                    None
-                    if meta_succeeded
-                    else (
-                        _SOURCE_ACCESS_UNSET
-                        if meta_blocked_error
-                        else meta_stage_error
-                    )
-                ),
+                dry_run=dry_run,
+                connection=connection,
+                metadata_candidate_ids=None,
+                new_media_ids=source_results.get(source.id, SyncSourceRunResult()).new_media_ids,
+                strict_candidate_scope=False,
+                active_urls_file=build_run_local_urls_file(source),
+                cookie_flags=resolve_cookie_flags(source),
+                impersonate_flags=resolve_impersonate_flags(source),
+                safe_video_url=safe_video_url,
+                source_cooldown_active=source_cooldown_active,
+                source_cooldown_until=source_cooldown_until,
             )
-        finish_download_run(
-            connection=connection,
-            run_id=meta_run_id if meta_run_id is not None else -1,
-            status="success" if meta_succeeded else "error",
-            finished_at=meta_finished_at,
-            exit_code=meta_exit_code,
-            success_count=len(success_meta_ids),
-            failure_count=len(failed_meta_ids),
-            error_message=meta_stage_error,
-        )
-        connection.commit()
+            if subtitle_plan is not None:
+                subtitle_plans.append(subtitle_plan)
 
-    print(
-        f"metadata targets={len(metadata_target_ids)} "
-        f"success={len(success_meta_ids)} failed={len(failed_meta_ids)} "
-        f"(resolved={len(resolved_metadata_target_ids)}, unresolved={len(unresolved_metadata_target_ids)}, "
-        f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
-        f"deferred={len(deferred_missing_ids)})"
-    )
+        run_interleaved_chunked_ytdlp_stage_plans(subtitle_plans, dry_run=dry_run)
+        for plan in subtitle_plans:
+            def safe_video_url(video_id: str, *, _source: SourceConfig = plan.source) -> str | None:
+                try:
+                    return build_video_url(_source, video_id)
+                except ValueError:
+                    return None
+
+            finalize_subtitle_download_plan(
+                plan,
+                dry_run=dry_run,
+                connection=connection,
+                safe_video_url=safe_video_url,
+            )
+
+    if not skip_meta:
+        metadata_plans: list[ChunkedYtdlpStagePlan] = []
+        for source in sources:
+            source_cooldown_active = False
+            source_cooldown_until: str | None = None
+            if connection is not None and not dry_run:
+                (
+                    source_cooldown_active,
+                    _remaining_hours,
+                    source_cooldown_until,
+                    _source_cooldown_reason,
+                ) = get_source_network_cooldown_state(
+                    connection=connection,
+                    source_id=source.id,
+                )
+
+            def safe_video_url(video_id: str, *, _source: SourceConfig = source) -> str | None:
+                try:
+                    return build_video_url(_source, video_id)
+                except ValueError:
+                    return None
+
+            metadata_plan = prepare_metadata_download_plan(
+                source=source,
+                dry_run=dry_run,
+                connection=connection,
+                metadata_candidate_ids=None,
+                strict_candidate_scope=False,
+                active_urls_file=build_run_local_urls_file(source),
+                cookie_flags=resolve_cookie_flags(source),
+                impersonate_flags=resolve_impersonate_flags(source),
+                safe_video_url=safe_video_url,
+                source_cooldown_active=source_cooldown_active,
+                source_cooldown_until=source_cooldown_until,
+            )
+            if metadata_plan is not None:
+                metadata_plans.append(metadata_plan)
+
+        run_interleaved_chunked_ytdlp_stage_plans(metadata_plans, dry_run=dry_run)
+        for plan in metadata_plans:
+            def safe_video_url(video_id: str, *, _source: SourceConfig = plan.source) -> str | None:
+                try:
+                    return build_video_url(_source, video_id)
+                except ValueError:
+                    return None
+
+            finalize_metadata_download_plan(
+                plan,
+                dry_run=dry_run,
+                connection=connection,
+                safe_video_url=safe_video_url,
+            )
 
 
 def normalize_upload_date(raw_value: Any) -> str | None:
@@ -15994,18 +16304,17 @@ def main() -> int:
             sync_connection.execute("PRAGMA journal_mode=WAL")
             create_schema(sync_connection)
         try:
-            for source in run_sources:
-                sync_source(
-                    source=source,
-                    dry_run=args.dry_run,
-                    skip_media=effective_skip_media,
-                    skip_subs=args.skip_subs,
-                    skip_meta=args.skip_meta,
-                    connection=sync_connection,
-                    metered_media_mode=metered_media_mode,
-                    metered_min_archive_ids=metered_min_archive_ids,
-                    metered_playlist_end=metered_playlist_end,
-                )
+            run_legacy_sync_sources(
+                sources=run_sources,
+                dry_run=bool(args.dry_run),
+                skip_media=bool(effective_skip_media),
+                skip_subs=bool(args.skip_subs),
+                skip_meta=bool(args.skip_meta),
+                connection=sync_connection,
+                metered_media_mode=metered_media_mode,
+                metered_min_archive_ids=metered_min_archive_ids,
+                metered_playlist_end=metered_playlist_end,
+            )
         finally:
             if sync_connection is not None:
                 sync_connection.close()

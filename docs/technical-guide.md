@@ -155,6 +155,7 @@ Operator note:
   - `media` queue priority is source-fair: newly discovered IDs are interleaved across sources instead of enqueued as one source-local burst.
   - `queue-worker` lease selection also avoids repeating the same source when another source has a ready head item, reducing same-source streaks.
   - `media/subs/meta` lease selection also respects `source_access_state.next_request_not_before`, so a source that just finished a network stage is briefly paced before the next network stage is leased.
+- Legacy `sync` mode also interleaves `subs` / `meta` yt-dlp chunks across sources (`A1 -> B1 -> C1 -> A2 ...`) instead of draining one source completely before moving to the next.
 - `source_access_state` table:
   - Per-source network cooldown and pacing state for remote `media/subs/meta` traffic.
   - Active cooldown suppresses new discovery and prevents `media/subs/meta` lease selection for that source until `blocked_until`.

@@ -2887,6 +2887,201 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_run_legacy_sync_sources_round_robins_subtitle_chunks_by_source(self):
+        alpha_root = self.workspace_root / "alpha_subs_rr"
+        beta_root = self.workspace_root / "beta_subs_rr"
+        alpha_root.mkdir(parents=True, exist_ok=True)
+        beta_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+data_dir = "{alpha_root}"
+
+[[sources]]
+id = "beta"
+platform = "tiktok"
+url = "https://www.tiktok.com/@beta"
+enabled = true
+data_dir = "{beta_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        alpha = by_id["alpha"]
+        beta = by_id["beta"]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-09T00:00:00+00:00"
+            for source in (alpha, beta):
+                for index in range(1, 7):
+                    video_id = f"76177777777777777{index:02d}{0 if source.id == 'alpha' else 1}"
+                    connection.execute(
+                        """
+                        INSERT INTO videos(source_id, video_id, media_path, has_media, has_subtitles, synced_at)
+                        VALUES (?, ?, ?, 1, 0, ?)
+                        """,
+                        (source.id, video_id, str(source.media_dir / f"{video_id}.mp4"), now_iso),
+                    )
+            connection.commit()
+
+            def fake_run_command(command, dry_run=False):
+                self.assertFalse(dry_run)
+                args = list(command)
+                template = str(args[args.index("-o") + 1])
+                urls_path = Path(args[args.index("-a") + 1])
+                for url in urls_path.read_text(encoding="utf-8").splitlines():
+                    video_id = url.rstrip("/").rsplit("/", 1)[-1]
+                    subtitle_path = Path(
+                        template
+                        .replace("%(id)s", video_id)
+                        .replace("%(language)s", "eng-US")
+                        .replace("%(ext)s", "vtt")
+                    )
+                    subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+                    subtitle_path.write_text(
+                        "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+                        encoding="utf-8",
+                    )
+                return (0, "")
+
+            stdout_capture = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "run_command_with_output", side_effect=fake_run_command),
+                redirect_stdout(stdout_capture),
+            ):
+                self.mod.run_legacy_sync_sources(
+                    sources=[alpha, beta],
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=False,
+                    skip_meta=True,
+                    connection=connection,
+                    metered_media_mode="off",
+                    metered_min_archive_ids=0,
+                    metered_playlist_end=5,
+                )
+        finally:
+            connection.close()
+
+        output = stdout_capture.getvalue()
+        alpha_chunk_1 = output.index("[subs] alpha: chunk 1/2")
+        beta_chunk_1 = output.index("[subs] beta: chunk 1/2")
+        alpha_chunk_2 = output.index("[subs] alpha: chunk 2/2")
+        beta_chunk_2 = output.index("[subs] beta: chunk 2/2")
+        self.assertLess(alpha_chunk_1, beta_chunk_1)
+        self.assertLess(beta_chunk_1, alpha_chunk_2)
+        self.assertLess(alpha_chunk_2, beta_chunk_2)
+
+    def test_run_legacy_sync_sources_round_robins_metadata_chunks_by_source(self):
+        alpha_root = self.workspace_root / "alpha_meta_rr"
+        beta_root = self.workspace_root / "beta_meta_rr"
+        alpha_root.mkdir(parents=True, exist_ok=True)
+        beta_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+data_dir = "{alpha_root}"
+
+[[sources]]
+id = "beta"
+platform = "tiktok"
+url = "https://www.tiktok.com/@beta"
+enabled = true
+data_dir = "{beta_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        alpha = by_id["alpha"]
+        beta = by_id["beta"]
+
+        for source in (alpha, beta):
+            source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+            source.media_archive.write_text(
+                "\n".join(
+                    f"tiktok 76188888888888888{index:02d}{0 if source.id == 'alpha' else 1}"
+                    for index in range(1, 7)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+
+            def fake_run_command(command, dry_run=False):
+                self.assertFalse(dry_run)
+                args = list(command)
+                template = str(args[args.index("-o") + 1])
+                urls_path = Path(args[args.index("-a") + 1])
+                for url in urls_path.read_text(encoding="utf-8").splitlines():
+                    video_id = url.rstrip("/").rsplit("/", 1)[-1]
+                    meta_path = Path(
+                        template
+                        .replace("%(id)s", video_id)
+                        .replace("%(ext)s", "info.json")
+                    )
+                    meta_path.parent.mkdir(parents=True, exist_ok=True)
+                    meta_path.write_text("{}", encoding="utf-8")
+                return (0, "")
+
+            stdout_capture = io.StringIO()
+            with (
+                mock.patch.object(self.mod, "run_command_with_output", side_effect=fake_run_command),
+                redirect_stdout(stdout_capture),
+            ):
+                self.mod.run_legacy_sync_sources(
+                    sources=[alpha, beta],
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                    metered_media_mode="off",
+                    metered_min_archive_ids=0,
+                    metered_playlist_end=5,
+                )
+        finally:
+            connection.close()
+
+        output = stdout_capture.getvalue()
+        alpha_chunk_1 = output.index("[meta] alpha: chunk 1/2")
+        beta_chunk_1 = output.index("[meta] beta: chunk 1/2")
+        alpha_chunk_2 = output.index("[meta] alpha: chunk 2/2")
+        beta_chunk_2 = output.index("[meta] beta: chunk 2/2")
+        self.assertLess(alpha_chunk_1, beta_chunk_1)
+        self.assertLess(beta_chunk_1, alpha_chunk_2)
+        self.assertLess(alpha_chunk_2, beta_chunk_2)
+
     def test_sync_source_skips_retry_subtitle_when_local_file_exists(self):
         source_root = self.workspace_root / "storiesofcz_subs_retry_existing"
         source_root.mkdir(parents=True, exist_ok=True)
