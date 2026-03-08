@@ -11524,6 +11524,286 @@ def collect_workspace_review_and_missing_rows(
     return (review_cards, missing_cards)
 
 
+def is_workspace_ja_subtitle(language: str | None, subtitle_path: str | None) -> bool:
+    normalized = str(language or "").strip().lower()
+    path_value = str(subtitle_path or "").strip().lower()
+    return (
+        normalized == "ja"
+        or normalized.startswith("ja-")
+        or ".ja." in path_value
+    )
+
+
+def is_workspace_english_subtitle(language: str | None, subtitle_path: str | None) -> bool:
+    if is_workspace_ja_subtitle(language, subtitle_path):
+        return False
+    normalized = str(language or "").strip().lower()
+    if normalized and language_rank_for_translation_source(normalized, "ja") <= 2:
+        return True
+    path_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(subtitle_path or "").strip().lower())
+        if token
+    }
+    return bool(path_tokens & {"en", "eng", "english"})
+
+
+def build_workspace_source_processing_summary(source_id: str = "") -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "total_videos": 0,
+        "complete_count": 0,
+        "pending_total": 0,
+        "english_subtitles_ready": 0,
+        "english_subtitles_missing": 0,
+        "source_text_ready": 0,
+        "source_text_missing": 0,
+        "ja_subtitles_ready": 0,
+        "ja_subtitles_missing": 0,
+        "meta_ready": 0,
+        "meta_missing": 0,
+        "media_ready": 0,
+        "media_missing": 0,
+        "asr_ready": 0,
+        "asr_pending": 0,
+        "loudness_ready": 0,
+        "loudness_pending": 0,
+        "pipeline_buckets": {
+            "complete": 0,
+            "ja_pending": 0,
+            "loudness_pending": 0,
+            "source_text_pending": 0,
+            "meta_media_pending": 0,
+        },
+    }
+
+
+def accumulate_workspace_source_processing_summary(
+    target: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    count_keys = (
+        "total_videos",
+        "complete_count",
+        "pending_total",
+        "english_subtitles_ready",
+        "english_subtitles_missing",
+        "source_text_ready",
+        "source_text_missing",
+        "ja_subtitles_ready",
+        "ja_subtitles_missing",
+        "meta_ready",
+        "meta_missing",
+        "media_ready",
+        "media_missing",
+        "asr_ready",
+        "asr_pending",
+        "loudness_ready",
+        "loudness_pending",
+    )
+    for key in count_keys:
+        target[key] = int(target.get(key, 0)) + int(summary.get(key, 0))
+    target_buckets = cast(dict[str, Any], target.get("pipeline_buckets") or {})
+    source_buckets = cast(dict[str, Any], summary.get("pipeline_buckets") or {})
+    for bucket_key in (
+        "complete",
+        "ja_pending",
+        "loudness_pending",
+        "source_text_pending",
+        "meta_media_pending",
+    ):
+        target_buckets[bucket_key] = int(target_buckets.get(bucket_key, 0)) + int(
+            source_buckets.get(bucket_key, 0)
+        )
+    target["pipeline_buckets"] = target_buckets
+
+
+def collect_workspace_source_processing_summary(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+) -> dict[str, Any]:
+    requested_source_ids = sorted(
+        {
+            str(source_id).strip()
+            for source_id in source_ids
+            if str(source_id).strip()
+        }
+    )
+    source_filter_sql = ""
+    source_params: tuple[Any, ...] = ()
+    if requested_source_ids:
+        placeholders = ",".join("?" for _ in requested_source_ids)
+        source_filter_sql = f"WHERE source_id IN ({placeholders})"
+        source_params = tuple(requested_source_ids)
+
+    video_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            video_id,
+            COALESCE(meta_path, '') AS meta_path,
+            COALESCE(has_media, 0) AS has_media,
+            COALESCE(audio_loudness_analyzed_at, '') AS audio_loudness_analyzed_at
+        FROM videos
+        {source_filter_sql}
+        ORDER BY source_id ASC, video_id ASC
+        """,
+        source_params,
+    ).fetchall()
+
+    subtitle_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            video_id,
+            COALESCE(language, '') AS language,
+            COALESCE(subtitle_path, '') AS subtitle_path
+        FROM subtitles
+        {source_filter_sql}
+        ORDER BY source_id ASC, video_id ASC, subtitle_path ASC
+        """,
+        source_params,
+    ).fetchall()
+
+    asr_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            video_id
+        FROM asr_runs
+        WHERE LOWER(COALESCE(status, '')) = 'success'
+          {"AND source_id IN (" + ",".join("?" for _ in requested_source_ids) + ")" if requested_source_ids else ""}
+        ORDER BY source_id ASC, video_id ASC
+        """,
+        source_params,
+    ).fetchall()
+
+    summaries_by_source: dict[str, dict[str, Any]] = {
+        source_id: build_workspace_source_processing_summary(source_id)
+        for source_id in requested_source_ids
+    }
+    video_flags_by_key: dict[tuple[str, str], dict[str, bool | str]] = {}
+
+    for row in video_rows:
+        source_id = str(row["source_id"] or "").strip()
+        video_id = str(row["video_id"] or "").strip()
+        if not source_id or not video_id:
+            continue
+        summaries_by_source.setdefault(
+            source_id,
+            build_workspace_source_processing_summary(source_id),
+        )
+        video_flags_by_key[(source_id, video_id)] = {
+            "meta_ready": bool(str(row["meta_path"] or "").strip()),
+            "media_ready": bool(int(row["has_media"] or 0)),
+            "loudness_ready": bool(str(row["audio_loudness_analyzed_at"] or "").strip()),
+            "has_english_subtitle": False,
+            "has_ja_subtitle": False,
+            "has_asr": False,
+        }
+
+    for row in subtitle_rows:
+        source_id = str(row["source_id"] or "").strip()
+        video_id = str(row["video_id"] or "").strip()
+        flags = video_flags_by_key.get((source_id, video_id))
+        if flags is None:
+            continue
+        language = str(row["language"] or "")
+        subtitle_path = str(row["subtitle_path"] or "")
+        if is_workspace_ja_subtitle(language, subtitle_path):
+            flags["has_ja_subtitle"] = True
+            continue
+        if is_workspace_english_subtitle(language, subtitle_path):
+            flags["has_english_subtitle"] = True
+
+    for row in asr_rows:
+        source_id = str(row["source_id"] or "").strip()
+        video_id = str(row["video_id"] or "").strip()
+        flags = video_flags_by_key.get((source_id, video_id))
+        if flags is None:
+            continue
+        flags["has_asr"] = True
+
+    for (source_id, _video_id), flags in video_flags_by_key.items():
+        summary = summaries_by_source.setdefault(
+            source_id,
+            build_workspace_source_processing_summary(source_id),
+        )
+        meta_ready = bool(flags["meta_ready"])
+        media_ready = bool(flags["media_ready"])
+        english_ready = bool(flags["has_english_subtitle"])
+        ja_ready = bool(flags["has_ja_subtitle"])
+        asr_ready = bool(flags["has_asr"])
+        source_text_ready = bool(english_ready or asr_ready)
+        loudness_ready = bool(flags["loudness_ready"]) if media_ready else False
+
+        summary["total_videos"] = int(summary["total_videos"]) + 1
+        summary["meta_ready"] = int(summary["meta_ready"]) + int(meta_ready)
+        summary["meta_missing"] = int(summary["meta_missing"]) + int(not meta_ready)
+        summary["media_ready"] = int(summary["media_ready"]) + int(media_ready)
+        summary["media_missing"] = int(summary["media_missing"]) + int(not media_ready)
+        summary["english_subtitles_ready"] = int(summary["english_subtitles_ready"]) + int(
+            english_ready
+        )
+        summary["english_subtitles_missing"] = int(
+            summary["english_subtitles_missing"]
+        ) + int(not english_ready)
+        summary["source_text_ready"] = int(summary["source_text_ready"]) + int(source_text_ready)
+        summary["source_text_missing"] = int(summary["source_text_missing"]) + int(
+            not source_text_ready
+        )
+        summary["ja_subtitles_ready"] = int(summary["ja_subtitles_ready"]) + int(ja_ready)
+        summary["ja_subtitles_missing"] = int(summary["ja_subtitles_missing"]) + int(not ja_ready)
+
+        if media_ready:
+            summary["asr_ready"] = int(summary["asr_ready"]) + int(asr_ready)
+            summary["asr_pending"] = int(summary["asr_pending"]) + int(not asr_ready)
+            summary["loudness_ready"] = int(summary["loudness_ready"]) + int(loudness_ready)
+            summary["loudness_pending"] = int(summary["loudness_pending"]) + int(
+                not loudness_ready
+            )
+
+        bucket_key = "complete"
+        if not meta_ready or not media_ready:
+            bucket_key = "meta_media_pending"
+        elif not source_text_ready:
+            bucket_key = "source_text_pending"
+        elif not ja_ready:
+            bucket_key = "ja_pending"
+        elif not loudness_ready:
+            bucket_key = "loudness_pending"
+
+        bucket_counts = cast(dict[str, Any], summary["pipeline_buckets"])
+        bucket_counts[bucket_key] = int(bucket_counts.get(bucket_key, 0)) + 1
+        if bucket_key == "complete":
+            summary["complete_count"] = int(summary["complete_count"]) + 1
+
+    summaries: list[dict[str, Any]] = list(summaries_by_source.values())
+    for summary in summaries:
+        summary["pending_total"] = max(
+            0,
+            int(summary["total_videos"]) - int(summary["complete_count"]),
+        )
+
+    summaries.sort(
+        key=lambda item: (
+            -int(item["pending_total"]),
+            -int(item["total_videos"]),
+            str(item["source_id"]),
+        )
+    )
+
+    totals = build_workspace_source_processing_summary()
+    for summary in summaries:
+        accumulate_workspace_source_processing_summary(totals, summary)
+    totals["source_count"] = len(summaries)
+
+    return {
+        "sources": summaries,
+        "totals": totals,
+    }
+
+
 def collect_workspace_download_monitor(
     connection: sqlite3.Connection,
     source_ids: list[str],
@@ -12747,6 +13027,10 @@ def build_web_handler(
                     run_limit=run_limit,
                     pending_limit=pending_limit,
                 )
+                source_processing = collect_workspace_source_processing_summary(
+                    connection=connection,
+                    source_ids=source_scope,
+                )
                 import_monitor = collect_workspace_import_monitor(
                     connection=connection,
                     source_ids=source_scope,
@@ -12769,6 +13053,7 @@ def build_web_handler(
                     "review_cards": review_cards,
                     "missing_entries": missing_entries,
                     "download_monitor": download_monitor,
+                    "source_processing": source_processing,
                     "import_monitor": import_monitor,
                     "artifacts": artifacts,
                 }

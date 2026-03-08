@@ -266,6 +266,7 @@ const state = {
   workspaceReviewCards: [],
   workspaceMissingEntries: [],
   workspaceDownloadMonitor: null,
+  workspaceSourceProcessing: null,
   workspaceImportMonitor: null,
   workspaceArtifacts: [],
   sourceTargets: [],
@@ -327,6 +328,8 @@ const elements = {
   workspaceSummary: document.getElementById("workspaceSummary"),
   workspaceReviewList: document.getElementById("workspaceReviewList"),
   workspaceMissingList: document.getElementById("workspaceMissingList"),
+  workspaceSourceProcessingSummary: document.getElementById("workspaceSourceProcessingSummary"),
+  workspaceSourceProcessingList: document.getElementById("workspaceSourceProcessingList"),
   workspaceDownloadSummary: document.getElementById("workspaceDownloadSummary"),
   workspaceDownloadRuns: document.getElementById("workspaceDownloadRuns"),
   workspacePendingFailures: document.getElementById("workspacePendingFailures"),
@@ -353,6 +356,14 @@ const elements = {
   jumpResults: document.getElementById("jumpResults"),
   statusBar: document.getElementById("statusBar"),
 };
+
+const WORKSPACE_SOURCE_PIPELINE_BUCKETS = [
+  { key: "complete", label: "完了", color: "#69d8a7" },
+  { key: "ja_pending", label: "JA/Claude待ち", color: "#83aaff" },
+  { key: "loudness_pending", label: "loudness待ち", color: "#ffd36c" },
+  { key: "source_text_pending", label: "英字幕/ASR待ち", color: "#ff9a73" },
+  { key: "meta_media_pending", label: "meta/media待ち", color: "#ff7e96" },
+];
 
 function mountDictionaryOverlayIntoAppShell() {
   const host = elements.appShell instanceof HTMLElement ? elements.appShell : null;
@@ -6982,6 +6993,7 @@ function resetWorkspaceState() {
   state.workspaceReviewCards = [];
   state.workspaceMissingEntries = [];
   state.workspaceDownloadMonitor = null;
+  state.workspaceSourceProcessing = null;
   state.workspaceImportMonitor = null;
   state.workspaceArtifacts = [];
 }
@@ -7286,6 +7298,199 @@ function renderWorkspaceList(container, items, renderItem, emptyMessage) {
     if (row) {
       container.appendChild(row);
     }
+  }
+}
+
+function buildWorkspaceSourceChartBackground(segments) {
+  const safeSegments = Array.isArray(segments) ? segments.filter((segment) => Number(segment?.value || 0) > 0) : [];
+  const total = safeSegments.reduce((sum, segment) => sum + Number(segment?.value || 0), 0);
+  if (total <= 0) {
+    return "conic-gradient(rgba(143, 164, 235, 0.12) 0deg 360deg)";
+  }
+  let startDeg = 0;
+  const stops = [];
+  for (const segment of safeSegments) {
+    const value = Number(segment?.value || 0);
+    if (value <= 0) {
+      continue;
+    }
+    const endDeg = startDeg + ((value / total) * 360);
+    stops.push(`${String(segment?.color || "#7da3ff")} ${startDeg.toFixed(2)}deg ${endDeg.toFixed(2)}deg`);
+    startDeg = endDeg;
+  }
+  if (startDeg < 360) {
+    stops.push(`rgba(143, 164, 235, 0.12) ${startDeg.toFixed(2)}deg 360deg`);
+  }
+  return `conic-gradient(${stops.join(", ")})`;
+}
+
+function createWorkspaceSourceMetric(label, value, accentClass = "") {
+  const metric = document.createElement("div");
+  metric.className = "workspace-source-metric";
+  if (accentClass) {
+    metric.classList.add(accentClass);
+  }
+
+  const valueNode = document.createElement("span");
+  valueNode.className = "workspace-source-metric-value";
+  valueNode.textContent = String(Number(value || 0));
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "workspace-source-metric-label";
+  labelNode.textContent = label;
+
+  metric.appendChild(valueNode);
+  metric.appendChild(labelNode);
+  return metric;
+}
+
+function buildWorkspaceSourceSummaryCard(summary) {
+  const card = document.createElement("article");
+  card.className = "workspace-source-status-card";
+
+  const head = document.createElement("div");
+  head.className = "workspace-source-status-head";
+
+  const title = document.createElement("p");
+  title.className = "workspace-item-title";
+  title.textContent = String(summary?.source_id || "(unknown)");
+
+  const badge = document.createElement("span");
+  badge.className = "workspace-badge";
+  badge.textContent = `完了 ${Number(summary?.complete_count || 0)}/${Number(summary?.total_videos || 0)}`;
+
+  head.appendChild(title);
+  head.appendChild(badge);
+
+  const body = document.createElement("div");
+  body.className = "workspace-source-status-body";
+
+  const chartWrap = document.createElement("div");
+  chartWrap.className = "workspace-source-chart-wrap";
+
+  const chart = document.createElement("div");
+  chart.className = "workspace-source-chart";
+  const segments = WORKSPACE_SOURCE_PIPELINE_BUCKETS.map((bucket) => ({
+    ...bucket,
+    value: Number(summary?.pipeline_buckets?.[bucket.key] || 0),
+  }));
+  chart.style.background = buildWorkspaceSourceChartBackground(segments);
+  chart.setAttribute(
+    "aria-label",
+    segments
+      .map((segment) => `${segment.label}:${segment.value}`)
+      .join(" / ")
+  );
+
+  const chartHole = document.createElement("div");
+  chartHole.className = "workspace-source-chart-hole";
+
+  const chartValue = document.createElement("span");
+  chartValue.className = "workspace-source-chart-value";
+  chartValue.textContent = String(Number(summary?.total_videos || 0));
+
+  const chartLabel = document.createElement("span");
+  chartLabel.className = "workspace-source-chart-label";
+  chartLabel.textContent = "videos";
+
+  chartHole.appendChild(chartValue);
+  chartHole.appendChild(chartLabel);
+  chart.appendChild(chartHole);
+
+  const chartMeta = document.createElement("p");
+  chartMeta.className = "workspace-item-meta";
+  chartMeta.textContent = `pending:${Number(summary?.pending_total || 0)} • source_text:${Number(summary?.source_text_ready || 0)}/${Number(summary?.total_videos || 0)}`;
+
+  chartWrap.appendChild(chart);
+  chartWrap.appendChild(chartMeta);
+
+  const detail = document.createElement("div");
+  detail.className = "workspace-source-status-detail";
+
+  const legend = document.createElement("div");
+  legend.className = "workspace-source-legend";
+  for (const segment of segments) {
+    const item = document.createElement("div");
+    item.className = "workspace-source-legend-item";
+
+    const swatch = document.createElement("span");
+    swatch.className = "workspace-source-legend-swatch";
+    swatch.style.background = String(segment.color || "#7da3ff");
+
+    const text = document.createElement("span");
+    text.textContent = `${segment.label} ${Number(segment.value || 0)}`;
+
+    item.appendChild(swatch);
+    item.appendChild(text);
+    legend.appendChild(item);
+  }
+
+  const metrics = document.createElement("div");
+  metrics.className = "workspace-source-metrics";
+  metrics.appendChild(
+    createWorkspaceSourceMetric("英字幕未DL", Number(summary?.english_subtitles_missing || 0), "warn")
+  );
+  metrics.appendChild(
+    createWorkspaceSourceMetric("JA/Claude字幕", Number(summary?.ja_subtitles_ready || 0), "ok")
+  );
+  metrics.appendChild(
+    createWorkspaceSourceMetric("loudness未処理", Number(summary?.loudness_pending || 0), "warn")
+  );
+  metrics.appendChild(
+    createWorkspaceSourceMetric("meta未取得", Number(summary?.meta_missing || 0))
+  );
+  metrics.appendChild(
+    createWorkspaceSourceMetric("media未取得", Number(summary?.media_missing || 0))
+  );
+  metrics.appendChild(
+    createWorkspaceSourceMetric("字幕/ASR不足", Number(summary?.source_text_missing || 0))
+  );
+
+  detail.appendChild(legend);
+  detail.appendChild(metrics);
+
+  body.appendChild(chartWrap);
+  body.appendChild(detail);
+
+  card.appendChild(head);
+  card.appendChild(body);
+  return card;
+}
+
+function renderWorkspaceSourceProcessing() {
+  if (elements.workspaceSourceProcessingList) {
+    elements.workspaceSourceProcessingList.textContent = "";
+  }
+
+  const sourceProcessing = state.workspaceSourceProcessing || {};
+  const totals = sourceProcessing?.totals || {};
+  const sources = Array.isArray(sourceProcessing?.sources) ? sourceProcessing.sources : [];
+  const sourceCount = Number(totals?.source_count || sources.length || 0);
+  const totalVideos = Number(totals?.total_videos || 0);
+  const completeCount = Number(totals?.complete_count || 0);
+  const pendingTotal = Number(totals?.pending_total || 0);
+
+  if (elements.workspaceSourceProcessingSummary) {
+    if (sourceCount <= 0 || totalVideos <= 0) {
+      elements.workspaceSourceProcessingSummary.textContent = "source集計対象の動画がまだありません。";
+    } else {
+      elements.workspaceSourceProcessingSummary.textContent = `${sourceCount} source • videos=${totalVideos} • complete=${completeCount} • pending=${pendingTotal}`;
+    }
+  }
+
+  if (!elements.workspaceSourceProcessingList) {
+    return;
+  }
+  if (sources.length <= 0) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "source集計対象の動画がまだありません。";
+    elements.workspaceSourceProcessingList.appendChild(empty);
+    return;
+  }
+
+  for (const summary of sources) {
+    elements.workspaceSourceProcessingList.appendChild(buildWorkspaceSourceSummaryCard(summary));
   }
 }
 
@@ -7720,6 +7925,7 @@ function renderWorkspacePanels() {
     (item) => renderWorkspaceMissingItem(item),
     "未登録語はありません。"
   );
+  renderWorkspaceSourceProcessing();
   renderWorkspaceDownloadRuns();
   renderWorkspacePendingFailures();
   renderWorkspaceImportRuns();
@@ -7760,6 +7966,7 @@ async function loadWorkspaceData(options = {}) {
   state.workspaceReviewCards = Array.isArray(payload.review_cards) ? payload.review_cards : [];
   state.workspaceMissingEntries = Array.isArray(payload.missing_entries) ? payload.missing_entries : [];
   state.workspaceDownloadMonitor = payload.download_monitor || null;
+  state.workspaceSourceProcessing = payload.source_processing || null;
   state.workspaceImportMonitor = payload.import_monitor || null;
   state.workspaceArtifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
   renderWorkspacePanels();

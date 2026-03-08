@@ -155,6 +155,98 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertEqual(monitor["latest"]["row_count"], 0)
         self.assertGreaterEqual(len(monitor["recent_runs"]), 1)
 
+    def test_collect_workspace_source_processing_summary(self):
+        now_iso = dt.datetime(2026, 3, 9, 1, 2, tzinfo=dt.timezone.utc).isoformat()
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.executemany(
+                """
+                INSERT INTO sources(source_id, platform, url, data_dir, updated_at)
+                VALUES (?, 'tiktok', ?, ?, ?)
+                """,
+                [
+                    ("alpha", "https://example.com/@alpha", "alpha", now_iso),
+                    ("beta", "https://example.com/@beta", "beta", now_iso),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    meta_path,
+                    has_media,
+                    audio_loudness_analyzed_at,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("alpha", "complete", "/tmp/complete.info.json", 1, now_iso, now_iso),
+                    ("alpha", "eng-missing", "/tmp/eng-missing.info.json", 1, "", now_iso),
+                    ("alpha", "ja-missing", "/tmp/ja-missing.info.json", 1, "", now_iso),
+                    ("alpha", "loudness-pending", "/tmp/loudness.info.json", 1, "", now_iso),
+                    ("alpha", "media-missing", "", 0, "", now_iso),
+                    ("beta", "asr-only", "/tmp/asr-only.info.json", 1, "", now_iso),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    ("alpha", "complete", "eng-US", "/tmp/complete.eng-US.vtt", "vtt"),
+                    ("alpha", "complete", "ja", "/tmp/complete.ja.vtt", "vtt"),
+                    ("alpha", "ja-missing", "en", "/tmp/ja-missing.en.vtt", "vtt"),
+                    ("alpha", "loudness-pending", "en", "/tmp/loudness.en.vtt", "vtt"),
+                    ("alpha", "loudness-pending", "ja", "/tmp/loudness.ja.vtt", "vtt"),
+                ],
+            )
+            connection.execute(
+                """
+                INSERT INTO asr_runs(source_id, video_id, status, updated_at)
+                VALUES (?, ?, 'success', ?)
+                """,
+                ("beta", "asr-only", now_iso),
+            )
+            connection.commit()
+
+            summary = self.mod.collect_workspace_source_processing_summary(
+                connection=connection,
+                source_ids=[],
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(summary["totals"]["source_count"], 2)
+        self.assertEqual(summary["totals"]["total_videos"], 6)
+        self.assertEqual(summary["totals"]["complete_count"], 1)
+
+        by_source = {row["source_id"]: row for row in summary["sources"]}
+        alpha = by_source["alpha"]
+        self.assertEqual(alpha["total_videos"], 5)
+        self.assertEqual(alpha["english_subtitles_missing"], 2)
+        self.assertEqual(alpha["ja_subtitles_ready"], 2)
+        self.assertEqual(alpha["loudness_pending"], 3)
+        self.assertEqual(alpha["meta_missing"], 1)
+        self.assertEqual(alpha["media_missing"], 1)
+        self.assertEqual(alpha["complete_count"], 1)
+        self.assertEqual(alpha["pipeline_buckets"]["complete"], 1)
+        self.assertEqual(alpha["pipeline_buckets"]["source_text_pending"], 1)
+        self.assertEqual(alpha["pipeline_buckets"]["ja_pending"], 1)
+        self.assertEqual(alpha["pipeline_buckets"]["loudness_pending"], 1)
+        self.assertEqual(alpha["pipeline_buckets"]["meta_media_pending"], 1)
+
+        beta = by_source["beta"]
+        self.assertEqual(beta["total_videos"], 1)
+        self.assertEqual(beta["english_subtitles_missing"], 1)
+        self.assertEqual(beta["source_text_ready"], 1)
+        self.assertEqual(beta["asr_ready"], 1)
+        self.assertEqual(beta["ja_subtitles_ready"], 0)
+        self.assertEqual(beta["pipeline_buckets"]["ja_pending"], 1)
+
     def test_artifact_open_and_download_headers(self):
         artifact_path = self.workspace_root / "exports" / "llm" / "sample.jsonl"
         artifact_body = '{"hello":"world"}\n'
