@@ -494,7 +494,11 @@ enabled = true
                 stderr="",
             )
 
-        with mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run):
+        with (
+            mock.patch.object(self.mod.random, "uniform", return_value=1.5),
+            mock.patch.object(self.mod.random, "random", return_value=1.0),
+            mock.patch.object(self.mod.subprocess, "run", side_effect=fake_run),
+        ):
             ids = self.mod.discover_playlist_window_ids(
                 source=source,
                 playlist_start=1,
@@ -505,11 +509,70 @@ enabled = true
         self.assertEqual(ids, ["7611111111111111111", "7612222222222222222"])
         command = captured["command"]
         self.assertIn("--sleep-requests", command)
-        self.assertIn("1.25", command)
+        self.assertIn("1.5", command)
         self.assertIn("--sleep-interval", command)
         self.assertIn("--max-sleep-interval", command)
         self.assertIn("--retry-sleep", command)
         self.assertNotIn("--ignore-errors", command)
+
+    def test_compute_effective_sleep_requests_seconds_can_add_long_pause(self):
+        source = self.mod.SourceConfig(
+            id="storiesofcz",
+            platform="tiktok",
+            url="https://www.tiktok.com/@storiesofcz",
+            watch_kind="posts",
+            target_handle=None,
+            enabled=True,
+            data_dir=self.workspace_root,
+            media_dir=self.workspace_root / "media",
+            subs_dir=self.workspace_root / "subs",
+            meta_dir=self.workspace_root / "meta",
+            media_archive=self.workspace_root / "archives" / "media.txt",
+            subs_archive=self.workspace_root / "archives" / "subs.txt",
+            urls_file=self.workspace_root / "archives" / "urls.txt",
+            handle="storiesofcz",
+            video_url_template=None,
+            video_id_regex=r"_(\d{10,})_",
+            ytdlp_bin="yt-dlp",
+            ytdlp_impersonate=None,
+            cookies_browser=None,
+            cookies_file=None,
+            video_format="bv*+ba/best",
+            sub_langs="en",
+            sub_format="vtt",
+            sleep_interval=2,
+            max_sleep_interval=6,
+            retry_sleep=5,
+            sleep_requests=3.0,
+            media_discovery_interval_hours=24.0,
+            playlist_end=200,
+            break_on_existing=False,
+            break_per_input=False,
+            lazy_playlist=False,
+            backfill_enabled=False,
+            backfill_start=None,
+            backfill_window=200,
+            backfill_windows_per_run=1,
+            asr_enabled=False,
+            asr_dir=self.workspace_root / "asr",
+            asr_command=[],
+            asr_max_per_run=20,
+            asr_timeout_sec=0,
+            asr_prefer_exts=["srt", "vtt"],
+            media_output_template="%(id)s.%(ext)s",
+            subs_output_template="%(id)s.%(language)s.%(ext)s",
+            meta_output_template="%(id)s.%(ext)s",
+            origin="config",
+        )
+
+        with (
+            mock.patch.object(self.mod.random, "uniform", side_effect=[3.2, 1.8]),
+            mock.patch.object(self.mod.random, "random", return_value=0.0),
+        ):
+            effective = self.mod.compute_effective_sleep_requests_seconds(source)
+
+        self.assertEqual(effective, 5.0)
+        self.assertEqual(self.mod.format_ytdlp_sleep_seconds(effective), "5.0")
 
     def test_resolve_impersonate_flags_auto_prefers_chrome(self):
         config_dir = self.workspace_root / "config"

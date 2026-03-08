@@ -102,6 +102,10 @@ DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
+DEFAULT_SLEEP_REQUESTS_JITTER_RATIO = 0.35
+DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_CHANCE = 0.18
+DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MIN_SEC = 1.0
+DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MAX_SEC = 2.5
 _SOURCE_ACCESS_UNSET = object()
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
@@ -1427,8 +1431,41 @@ def build_ytdlp_retry_flags(
         ]
     )
     if source.sleep_requests > 0:
-        flags.extend(["--sleep-requests", str(source.sleep_requests)])
+        flags.extend(
+            [
+                "--sleep-requests",
+                format_ytdlp_sleep_seconds(
+                    compute_effective_sleep_requests_seconds(source)
+                ),
+            ]
+        )
     return flags
+
+
+def format_ytdlp_sleep_seconds(seconds: float) -> str:
+    normalized = max(0.0, float(seconds))
+    rendered = f"{normalized:.2f}".rstrip("0").rstrip(".")
+    if "." not in rendered:
+        rendered = f"{rendered}.0"
+    return rendered
+
+
+def compute_effective_sleep_requests_seconds(source: SourceConfig) -> float:
+    base_seconds = max(0.0, float(source.sleep_requests))
+    if base_seconds <= 0:
+        return 0.0
+
+    lower_bound = max(0.1, base_seconds * (1.0 - DEFAULT_SLEEP_REQUESTS_JITTER_RATIO))
+    upper_bound = max(lower_bound, base_seconds * (1.0 + DEFAULT_SLEEP_REQUESTS_JITTER_RATIO))
+    effective_seconds = random.uniform(lower_bound, upper_bound)
+
+    if random.random() < DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_CHANCE:
+        effective_seconds += random.uniform(
+            DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MIN_SEC,
+            DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MAX_SEC,
+        )
+
+    return round(effective_seconds, 2)
 
 
 def sync_source(
