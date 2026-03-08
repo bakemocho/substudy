@@ -76,11 +76,35 @@ GROUP BY language, ext ORDER BY 3 DESC;
 
 1. 翻訳対象ファイルを列挙する（動画あり・未翻訳・指定ソースのみ）。
 
+> **セッション開始時に必ず実行すること。** `has_media = 1` を含まない残り数確認は実態と乖離するため、必ず下記クエリで件数を把握してから翻訳に入る。
+
 ```bash
 cd /path/to/substudy
 mkdir -p logs
 python3 scripts/substudy.py ledger --config config/sources.toml --incremental
 SOURCE_ID="storiesofcz"   # ← 対象ソースに合わせて変更
+
+# 残り件数の確認（動画ありのみ）
+sqlite3 data/master_ledger.sqlite "
+SELECT s.source_id, COUNT(DISTINCT s.video_id) AS remaining
+FROM subtitles s
+JOIN videos v ON v.source_id = s.source_id AND v.video_id = s.video_id
+WHERE v.has_media = 1
+  AND s.source_id = '${SOURCE_ID}'
+  AND s.language NOT LIKE 'ja%'
+  AND s.subtitle_path IS NOT NULL AND s.subtitle_path <> ''
+  AND lower(COALESCE(s.ext, '')) IN ('srt', 'vtt')
+  AND NOT EXISTS (
+    SELECT 1 FROM translation_runs tr
+    WHERE tr.source_id = s.source_id
+      AND tr.video_id = s.video_id
+      AND tr.target_lang = 'ja'
+      AND tr.status = 'active'
+  )
+GROUP BY s.source_id;
+"
+
+# 翻訳対象ファイル一覧を出力
 sqlite3 data/master_ledger.sqlite "
 SELECT DISTINCT s.source_id, s.video_id, s.subtitle_path
 FROM subtitles s
@@ -312,7 +336,7 @@ INSERT INTO translation_runs (
   agent, method, method_version, summary,
   status, started_at, finished_at, created_at
 ) VALUES (
-  :source_id, :video_id, 'en', 'ja',
+  :source_id, :video_id, :source_lang, 'ja',
   :source_path, :output_path, :cue_count, :cue_match,
   :agent, :method, :method_version, :summary,
   'active', :started_at, :finished_at, :created_at
