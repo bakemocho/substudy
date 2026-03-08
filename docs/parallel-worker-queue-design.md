@@ -1,9 +1,9 @@
 # 並列ワーカー化設計書（同一source同時実行対応）
 
-更新日: 2026-03-07  
+更新日: 2026-03-08  
 状態: In Progress（Phase 0-4 と launchd/manual 分離ステップを実装済み、運用検証中）
 
-## 0. 実装進捗（2026-03-07）
+## 0. 実装進捗（2026-03-08）
 
 ### 実装済み
 
@@ -24,6 +24,8 @@
 - `queue-worker` 実行中の lease keepalive（期限延長）を追加。
 - `media` 成功時に `subs/meta/asr/loudness` を downstream として自動 enqueue する連鎖を追加。
 - `subs/asr` 成功時に `translate` を downstream として自動 enqueue する連鎖を追加。
+- `media` queue priority を source-fair に変更し、複数 source の新規動画が interleave されるようにした。
+- `queue-worker` は lease 時に source ごとの先頭候補を比較し、可能なら直前と異なる source を選ぶようにした。
 - legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
 - `sync/backfill --execution-mode queue` に producer 共有ロックを追加し、launchd/手動の同時 producer 起動を抑止。
 - `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行し、`sync/backfill` producer と `queue-worker` 複数起動を分離。
@@ -168,6 +170,8 @@ lease 失効時:
 - `source_poll_state.next_poll_at` を参照し、未到達なら discovery をスキップ。
 - 既定 `poll_interval_hours=24`。
 - backfill は別経路として扱い、必要に応じてこの制約をバイパス可能にする。
+- discovery を通過した source でも、queue への `media` 投入順は source 単位で固めず interleave する。
+- worker 側も ready item の source 偏りを緩和し、同一 source の連続処理をなるべく避ける。
 
 ## 10. 既存コマンドとの対応
 

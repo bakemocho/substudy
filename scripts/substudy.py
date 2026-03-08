@@ -4722,19 +4722,26 @@ def enqueue_media_work_items(
     source_id: str,
     video_ids: list[str],
     now_iso: str,
+    source_slot: int = 0,
+    source_stride: int = 1,
+    priority_base: int = 0,
 ) -> tuple[int, int, int, int]:
     inserted = 0
     requeued = 0
     updated = 0
     kept = 0
+    normalized_stride = max(1, int(source_stride))
+    normalized_slot = max(0, int(source_slot)) % normalized_stride
+    normalized_base = max(0, int(priority_base))
     for index, video_id in enumerate(video_ids):
+        priority = normalized_base + normalized_slot + (index * normalized_stride)
         action = enqueue_work_item(
             connection=connection,
             source_id=source_id,
             stage="media",
             video_id=video_id,
             now_iso=now_iso,
-            priority=index,
+            priority=priority,
             payload_json=None,
         )
         if action == "inserted":
@@ -4756,6 +4763,8 @@ def enqueue_source_media_discovery(
     playlist_start: int | None = None,
     playlist_end: int | None = None,
     enforce_poll_interval: bool = True,
+    source_slot: int = 0,
+    source_stride: int = 1,
 ) -> tuple[int, int, int]:
     now_dt = dt.datetime.now(dt.timezone.utc)
     now_iso = now_dt.replace(microsecond=0).isoformat()
@@ -4825,6 +4834,8 @@ def enqueue_source_media_discovery(
         source_id=source.id,
         video_ids=discovered_ids,
         now_iso=now_iso,
+        source_slot=source_slot,
+        source_stride=source_stride,
     )
     next_poll_iso = compute_next_poll_at_iso(
         poll_interval_hours=interval_hours if interval_hours > 0 else 24.0,
@@ -5012,6 +5023,7 @@ def lease_next_work_item(
     lease_seconds: int = DEFAULT_QUEUE_LEASE_SEC,
     now_dt: dt.datetime | None = None,
     max_scan_attempts: int = 12,
+    avoid_source_id: str | None = None,
 ) -> dict[str, Any] | None:
     normalized_stages = normalize_queue_stages(stages)
     if not normalized_stages:
@@ -5028,8 +5040,61 @@ def lease_next_work_item(
         lease_token = uuid.uuid4().hex
 
         connection.execute("BEGIN IMMEDIATE")
+        candidate_params: list[Any] = [*normalized_stages, now_iso]
+        order_by = "priority ASC, updated_at ASC, id ASC"
+        if avoid_source_id:
+            order_by = (
+                "CASE WHEN source_id = ? THEN 1 ELSE 0 END ASC, "
+                "priority ASC, updated_at ASC, id ASC"
+            )
+            candidate_params.append(str(avoid_source_id))
+
         row = connection.execute(
             f"""
+            WITH eligible AS (
+                SELECT
+                    id,
+                    source_id,
+                    stage,
+                    video_id,
+                    priority,
+                    attempt_count,
+                    COALESCE(payload_json, '') AS payload_json,
+                    updated_at
+                FROM work_items
+                WHERE stage IN ({placeholders})
+                  AND status IN ('queued', 'error')
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ),
+            source_head AS (
+                SELECT
+                    eligible.id,
+                    eligible.source_id,
+                    eligible.stage,
+                    eligible.video_id,
+                    eligible.priority,
+                    eligible.attempt_count,
+                    eligible.payload_json,
+                    eligible.updated_at
+                FROM eligible
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM eligible AS other
+                    WHERE other.source_id = eligible.source_id
+                      AND (
+                          other.priority < eligible.priority
+                          OR (
+                              other.priority = eligible.priority
+                              AND other.updated_at < eligible.updated_at
+                          )
+                          OR (
+                              other.priority = eligible.priority
+                              AND other.updated_at = eligible.updated_at
+                              AND other.id < eligible.id
+                          )
+                      )
+                )
+            )
             SELECT
                 id,
                 source_id,
@@ -5037,15 +5102,12 @@ def lease_next_work_item(
                 video_id,
                 priority,
                 attempt_count,
-                COALESCE(payload_json, '')
-            FROM work_items
-            WHERE stage IN ({placeholders})
-              AND status IN ('queued', 'error')
-              AND (next_retry_at IS NULL OR next_retry_at <= ?)
-            ORDER BY priority ASC, updated_at ASC, id ASC
+                payload_json
+            FROM source_head
+            ORDER BY {order_by}
             LIMIT 1
             """,
-            (*normalized_stages, now_iso),
+            candidate_params,
         ).fetchone()
         if row is None:
             connection.commit()
@@ -5454,6 +5516,7 @@ def run_queue_worker(
     processed = 0
     success_count = 0
     failure_count = 0
+    last_leased_source_id: str | None = None
     print(
         f"[queue-worker] start worker_id={worker_id_value} "
         f"stages={','.join(normalized_stages)} "
@@ -5485,6 +5548,7 @@ def run_queue_worker(
                 worker_id=worker_id_value,
                 stages=normalized_stages,
                 lease_seconds=safe_lease_seconds,
+                avoid_source_id=last_leased_source_id,
             )
             if leased_item is None:
                 if once:
@@ -5500,6 +5564,7 @@ def run_queue_worker(
             stage = str(leased_item["stage"])
             video_id = str(leased_item["video_id"])
             lease_token = str(leased_item["lease_token"])
+            last_leased_source_id = source_id
             print(
                 f"[queue-worker] leased id={item_id} source={source_id} "
                 f"stage={stage} video_id={video_id}"
@@ -7156,7 +7221,8 @@ def run_backfill(
     any_work = False
 
     try:
-        for source in sources:
+        source_priority_stride = max(1, len(sources))
+        for source_index, source in enumerate(sources):
             if not source.backfill_enabled:
                 print(f"[backfill] {source.id}: disabled")
                 continue
@@ -7266,6 +7332,8 @@ def run_backfill(
                         source_id=source.id,
                         video_ids=window_ids,
                         now_iso=now_iso,
+                        source_slot=source_index,
+                        source_stride=source_priority_stride,
                     )
                     connection.commit()
                     print(
@@ -14793,7 +14861,8 @@ def main() -> int:
                         if bool(args.skip_media):
                             print("[sync-queue] media discovery skipped by explicit --skip-media")
                         else:
-                            for source in run_sources:
+                            source_priority_stride = max(1, len(run_sources))
+                            for source_index, source in enumerate(run_sources):
                                 source_playlist_end = source.playlist_end
                                 if metered_media_mode == "updates-only":
                                     media_archive_count = len(read_archive_ids(source.media_archive))
@@ -14822,6 +14891,8 @@ def main() -> int:
                                         playlist_start=1,
                                         playlist_end=source_playlist_end,
                                         enforce_poll_interval=True,
+                                        source_slot=source_index,
+                                        source_stride=source_priority_stride,
                                     )
                                 except Exception as exc:
                                     print(

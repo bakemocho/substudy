@@ -630,9 +630,10 @@ data_dir = "{source_root}"
         _, sources = self.mod.load_config(config_path)
         source = sources[0]
 
-        now_iso = "2026-03-07T00:00:00+00:00"
-        past_iso = "2026-03-06T00:00:00+00:00"
-        future_iso = "2026-03-08T00:00:00+00:00"
+        now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        now_iso = now_dt.isoformat()
+        past_iso = (now_dt - dt.timedelta(days=1)).isoformat()
+        future_iso = (now_dt + dt.timedelta(days=1)).isoformat()
         connection = sqlite3.connect(str(self.db_path))
         try:
             self.mod.create_schema(connection)
@@ -1420,6 +1421,113 @@ data_dir = "{source_root}"
             self.assertEqual(int(row[1]), 1)
             self.assertIsNone(row[2])
             self.assertIsNone(row[3])
+        finally:
+            connection.close()
+
+    def test_enqueue_media_work_items_interleaves_sources_by_priority(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-07T00:00:00+00:00"
+            self.mod.enqueue_media_work_items(
+                connection=connection,
+                source_id="source-a",
+                video_ids=["7611000000000000001", "7611000000000000002", "7611000000000000003"],
+                now_iso=now_iso,
+                source_slot=0,
+                source_stride=2,
+            )
+            self.mod.enqueue_media_work_items(
+                connection=connection,
+                source_id="source-b",
+                video_ids=["7622000000000000001", "7622000000000000002", "7622000000000000003"],
+                now_iso=now_iso,
+                source_slot=1,
+                source_stride=2,
+            )
+            connection.commit()
+
+            rows = connection.execute(
+                """
+                SELECT source_id, video_id, priority
+                FROM work_items
+                WHERE stage = 'media'
+                ORDER BY priority ASC, id ASC
+                """
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    ("source-a", "7611000000000000001", 0),
+                    ("source-b", "7622000000000000001", 1),
+                    ("source-a", "7611000000000000002", 2),
+                    ("source-b", "7622000000000000002", 3),
+                    ("source-a", "7611000000000000003", 4),
+                    ("source-b", "7622000000000000003", 5),
+                ],
+            )
+        finally:
+            connection.close()
+
+    def test_lease_next_work_item_avoids_same_source_when_possible(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-07T00:00:00+00:00"
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-a",
+                stage="meta",
+                video_id="7613000000000000001",
+                now_iso=now_iso,
+                priority=0,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-a",
+                stage="meta",
+                video_id="7613000000000000002",
+                now_iso=now_iso,
+                priority=1,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-b",
+                stage="meta",
+                video_id="7624000000000000001",
+                now_iso=now_iso,
+                priority=10,
+            )
+            connection.commit()
+
+            leased_1 = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-a",
+                stages=["meta"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased_1)
+            self.assertEqual(str(leased_1["source_id"]), "source-a")
+
+            leased_2 = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-b",
+                stages=["meta"],
+                lease_seconds=600,
+                avoid_source_id="source-a",
+            )
+            self.assertIsNotNone(leased_2)
+            self.assertEqual(str(leased_2["source_id"]), "source-b")
+
+            leased_3 = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-c",
+                stages=["meta"],
+                lease_seconds=600,
+                avoid_source_id="source-b",
+            )
+            self.assertIsNotNone(leased_3)
+            self.assertEqual(str(leased_3["source_id"]), "source-a")
         finally:
             connection.close()
 

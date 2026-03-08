@@ -152,6 +152,8 @@ Operator note:
   - Queue worker runtime state (`queued`, `leased`, `error`, `dead`, `success`) per `(source, stage, video)`.
   - In queue mode, operational unresolved status should be judged from `work_items` first.
   - `download_state` is stage state history and can retain legacy/secondary errors after queue recovery.
+  - `media` queue priority is source-fair: newly discovered IDs are interleaved across sources instead of enqueued as one source-local burst.
+  - `queue-worker` lease selection also avoids repeating the same source when another source has a ready head item, reducing same-source streaks.
 - Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
 - Retry delay is failure-aware:
   - Normal failures: exponential backoff from 5m up to 24h.
