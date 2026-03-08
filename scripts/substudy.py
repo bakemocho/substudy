@@ -102,6 +102,7 @@ DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
+DEFAULT_YTDLP_URL_BATCH_SIZE = 5
 DEFAULT_SLEEP_REQUESTS_JITTER_RATIO = 0.35
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_CHANCE = 0.18
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MIN_SEC = 1.0
@@ -1468,6 +1469,14 @@ def compute_effective_sleep_requests_seconds(source: SourceConfig) -> float:
     return round(effective_seconds, 2)
 
 
+def chunk_items(items: list[Any], batch_size: int) -> list[list[Any]]:
+    safe_batch_size = max(1, int(batch_size))
+    return [
+        list(items[index:index + safe_batch_size])
+        for index in range(0, len(items), safe_batch_size)
+    ]
+
+
 def sync_source(
     source: SourceConfig,
     dry_run: bool,
@@ -2432,6 +2441,16 @@ def sync_source(
             and not (strict_candidate_scope and metadata_candidate_ids is not None)
         ):
             retry_sub_ids = get_due_retry_ids(connection, source.id, "subs")
+        existing_retry_sub_ids = [
+            video_id
+            for video_id in retry_sub_ids
+            if video_id in subs_before_ids or video_id in local_sub_ids
+        ]
+        retry_sub_ids = [
+            video_id
+            for video_id in retry_sub_ids
+            if video_id not in subs_before_ids and video_id not in local_sub_ids
+        ]
 
         subtitle_target_ids: list[str] = []
         seen_target_ids: set[str] = set()
@@ -2452,6 +2471,20 @@ def sync_source(
                     target_count=0,
                     started_at=subs_started_at,
                 )
+                for video_id in existing_retry_sub_ids:
+                    upsert_download_state(
+                        connection=connection,
+                        source_id=source.id,
+                        stage="subs",
+                        video_id=video_id,
+                        status="success",
+                        run_id=subs_run_id,
+                        attempt_at=subs_started_at,
+                        url=safe_video_url(video_id),
+                        last_error=None,
+                        retry_count=0,
+                        next_retry_at=None,
+                    )
                 finish_download_run(
                     connection=connection,
                     run_id=subs_run_id,
@@ -2467,7 +2500,8 @@ def sync_source(
                 f"subtitle targets=0 success=0 failed=0 "
                 f"(new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
                 f"bootstrap={len(bootstrap_missing_sub_ids)}, "
-                f"deferred={len(deferred_sub_ids)})"
+                f"deferred={len(deferred_sub_ids)}, "
+                f"skipped_existing={len(existing_retry_sub_ids)})"
             )
         else:
             subtitle_url_pairs: list[tuple[str, str]] = []
@@ -2479,7 +2513,10 @@ def sync_source(
                     continue
                 subtitle_url_pairs.append((video_id, video_url))
             resolved_subtitle_target_ids = [video_id for video_id, _ in subtitle_url_pairs]
-            subtitle_urls = [url for _, url in subtitle_url_pairs]
+            subtitle_url_chunks = chunk_items(
+                subtitle_url_pairs,
+                DEFAULT_YTDLP_URL_BATCH_SIZE,
+            )
 
             if dry_run:
                 print(
@@ -2489,12 +2526,8 @@ def sync_source(
                     f"bootstrap={len(bootstrap_missing_sub_ids)}, "
                     f"deferred={len(deferred_sub_ids)})"
                 )
-            elif subtitle_urls:
-                write_urls_file(active_urls_file, subtitle_urls)
-
-            subs_command: list[str] | None = None
-            if resolved_subtitle_target_ids:
-                subs_command = [
+            def build_subs_command() -> list[str]:
+                return [
                     source.ytdlp_bin,
                     *impersonate_flags,
                     *cookie_flags,
@@ -2502,7 +2535,7 @@ def sync_source(
                     str(source.subs_archive),
                     "--continue",
                     "--no-overwrites",
-                    *retry_flags,
+                    *build_ytdlp_retry_flags(source, include_ignore_errors=True),
                     "--skip-download",
                     "--write-subs",
                     "--write-auto-subs",
@@ -2513,9 +2546,10 @@ def sync_source(
                     "-o",
                     str(source.subs_dir / source.subs_output_template),
                     "--no-playlist",
-                    "-a",
-                    str(active_urls_file),
                 ]
+            subs_command_template: list[str] | None = None
+            if resolved_subtitle_target_ids:
+                subs_command_template = build_subs_command()
 
             subs_started_at = now_utc_iso()
             subs_run_id: int | None = None
@@ -2524,7 +2558,11 @@ def sync_source(
                     connection=connection,
                     source_id=source.id,
                     stage="subs",
-                    command=subs_command,
+                    command=(
+                        [*subs_command_template, "-a", str(active_urls_file)]
+                        if subs_command_template is not None
+                        else None
+                    ),
                     target_count=len(resolved_subtitle_target_ids),
                     started_at=subs_started_at,
                 )
@@ -2533,21 +2571,35 @@ def sync_source(
             subs_exit_code = 0
             subs_error: str | None = None
             subs_blocked_error: str | None = None
-            if subs_command is not None:
-                try:
-                    subs_exit_code, subs_output = run_command_with_output(
-                        subs_command,
-                        dry_run=dry_run,
+            if subs_command_template is not None:
+                chunk_count = len(subtitle_url_chunks)
+                for chunk_index, chunk_pairs in enumerate(subtitle_url_chunks, start=1):
+                    chunk_urls = [url for _, url in chunk_pairs]
+                    write_urls_file(active_urls_file, chunk_urls)
+                    if chunk_index == 1:
+                        subs_command = [*subs_command_template, "-a", str(active_urls_file)]
+                    else:
+                        subs_command = [*build_subs_command(), "-a", str(active_urls_file)]
+                    print(
+                        f"[subs] {source.id}: chunk {chunk_index}/{chunk_count} "
+                        f"targets={len(chunk_pairs)}"
                     )
-                    if subs_exit_code != 0:
-                        subs_error = summarize_command_failure(
-                            subs_output,
-                            subs_exit_code,
+                    try:
+                        subs_exit_code, subs_output = run_command_with_output(
+                            subs_command,
+                            dry_run=dry_run,
                         )
-                except Exception as exc:
-                    subs_exit_code = 1
-                    subs_error = str(exc)
-                    print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
+                        if subs_exit_code != 0:
+                            subs_error = summarize_command_failure(
+                                subs_output,
+                                subs_exit_code,
+                            )
+                            break
+                    except Exception as exc:
+                        subs_exit_code = 1
+                        subs_error = str(exc)
+                        print(f"[sync] {source.id} subs command failed: {exc}", file=sys.stderr)
+                        break
 
             if not dry_run:
                 subs_after_ids = set(read_archive_ids(source.subs_archive))
@@ -2566,6 +2618,20 @@ def sync_source(
 
                 if connection is not None:
                     for video_id in success_sub_ids:
+                        upsert_download_state(
+                            connection=connection,
+                            source_id=source.id,
+                            stage="subs",
+                            video_id=video_id,
+                            status="success",
+                            run_id=subs_run_id,
+                            attempt_at=subs_started_at,
+                            url=safe_video_url(video_id),
+                            last_error=None,
+                            retry_count=0,
+                            next_retry_at=None,
+                        )
+                    for video_id in existing_retry_sub_ids:
                         upsert_download_state(
                             connection=connection,
                             source_id=source.id,
@@ -2642,7 +2708,7 @@ def sync_source(
                     )
                     subs_finished_at = now_utc_iso()
                     subs_succeeded = not failed_sub_ids
-                    if subs_command is not None:
+                    if subs_command_template is not None:
                         record_source_network_access(
                             connection=connection,
                             source=source,
@@ -2677,7 +2743,8 @@ def sync_source(
                     f"(resolved={len(resolved_subtitle_target_ids)}, unresolved={len(unresolved_subtitle_target_ids)}, "
                     f"new={len(missing_retryable_sub_ids)}, retry={len(retry_sub_ids)}, "
                     f"bootstrap={len(bootstrap_missing_sub_ids)}, "
-                    f"deferred={len(deferred_sub_ids)})"
+                    f"deferred={len(deferred_sub_ids)}, "
+                    f"skipped_existing={len(existing_retry_sub_ids)})"
                 )
     else:
         if skip_subs:
@@ -2768,7 +2835,10 @@ def sync_source(
             continue
         metadata_url_pairs.append((video_id, video_url))
     resolved_metadata_target_ids = [video_id for video_id, _ in metadata_url_pairs]
-    urls = [url for _, url in metadata_url_pairs]
+    metadata_url_chunks = chunk_items(
+        metadata_url_pairs,
+        DEFAULT_YTDLP_URL_BATCH_SIZE,
+    )
     if dry_run:
         print(
             f"metadata target IDs (dry-run): {len(metadata_target_ids)} "
@@ -2776,12 +2846,9 @@ def sync_source(
             f"new={len(missing_retryable_ids)}, retry={len(retry_ids)}, "
             f"deferred={len(deferred_missing_ids)})"
         )
-    elif urls:
-        write_urls_file(active_urls_file, urls)
 
-    metadata_command: list[str] | None = None
-    if resolved_metadata_target_ids:
-        metadata_command = [
+    def build_metadata_command() -> list[str]:
+        return [
             source.ytdlp_bin,
             *impersonate_flags,
             *cookie_flags,
@@ -2790,13 +2857,14 @@ def sync_source(
             "--write-description",
             "--continue",
             "--no-overwrites",
-            *retry_flags,
+            *build_ytdlp_retry_flags(source, include_ignore_errors=True),
             "-o",
             str(source.meta_dir / source.meta_output_template),
             "--no-playlist",
-            "-a",
-            str(active_urls_file),
         ]
+    metadata_command_template: list[str] | None = None
+    if resolved_metadata_target_ids:
+        metadata_command_template = build_metadata_command()
     meta_started_at = now_utc_iso()
     meta_run_id: int | None = None
     if connection is not None and not dry_run:
@@ -2804,7 +2872,11 @@ def sync_source(
             connection=connection,
             source_id=source.id,
             stage="meta",
-            command=metadata_command,
+            command=(
+                [*metadata_command_template, "-a", str(active_urls_file)]
+                if metadata_command_template is not None
+                else None
+            ),
             target_count=len(resolved_metadata_target_ids),
             started_at=meta_started_at,
         )
@@ -2813,21 +2885,35 @@ def sync_source(
     meta_exit_code = 0
     meta_error: str | None = None
     meta_blocked_error: str | None = None
-    if metadata_command is not None:
-        try:
-            meta_exit_code, meta_output = run_command_with_output(
-                metadata_command,
-                dry_run=dry_run,
+    if metadata_command_template is not None:
+        chunk_count = len(metadata_url_chunks)
+        for chunk_index, chunk_pairs in enumerate(metadata_url_chunks, start=1):
+            chunk_urls = [url for _, url in chunk_pairs]
+            write_urls_file(active_urls_file, chunk_urls)
+            if chunk_index == 1:
+                metadata_command = [*metadata_command_template, "-a", str(active_urls_file)]
+            else:
+                metadata_command = [*build_metadata_command(), "-a", str(active_urls_file)]
+            print(
+                f"[meta] {source.id}: chunk {chunk_index}/{chunk_count} "
+                f"targets={len(chunk_pairs)}"
             )
-            if meta_exit_code != 0:
-                meta_error = summarize_command_failure(
-                    meta_output,
-                    meta_exit_code,
+            try:
+                meta_exit_code, meta_output = run_command_with_output(
+                    metadata_command,
+                    dry_run=dry_run,
                 )
-        except Exception as exc:
-            meta_exit_code = 1
-            meta_error = str(exc)
-            print(f"[sync] {source.id} metadata command failed: {exc}", file=sys.stderr)
+                if meta_exit_code != 0:
+                    meta_error = summarize_command_failure(
+                        meta_output,
+                        meta_exit_code,
+                    )
+                    break
+            except Exception as exc:
+                meta_exit_code = 1
+                meta_error = str(exc)
+                print(f"[sync] {source.id} metadata command failed: {exc}", file=sys.stderr)
+                break
 
     if dry_run:
         return
@@ -2917,7 +3003,7 @@ def sync_source(
         )
         meta_finished_at = now_utc_iso()
         meta_succeeded = not failed_meta_ids
-        if metadata_command is not None:
+        if metadata_command_template is not None:
             record_source_network_access(
                 connection=connection,
                 source=source,

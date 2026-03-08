@@ -2725,6 +2725,153 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_sync_source_subtitles_are_chunked_into_multiple_ytdlp_runs(self):
+        source_root = self.workspace_root / "storiesofcz_subs_chunked"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+sleep_requests = 1.25
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            candidate_ids = [
+                "7617777777777777701",
+                "7617777777777777702",
+                "7617777777777777703",
+                "7617777777777777704",
+                "7617777777777777705",
+                "7617777777777777706",
+            ]
+
+            with (
+                mock.patch.object(self.mod.random, "uniform", side_effect=[0.9, 1.1, 2.2]),
+                mock.patch.object(self.mod.random, "random", return_value=1.0),
+                mock.patch.object(
+                    self.mod,
+                    "run_command_with_output",
+                    return_value=(0, ""),
+                ) as run_command_mock,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=False,
+                    skip_meta=True,
+                    connection=connection,
+                    metadata_candidate_ids=candidate_ids,
+                    strict_candidate_scope=True,
+                )
+
+            self.assertEqual(run_command_mock.call_count, 2)
+            first_command = list(run_command_mock.call_args_list[0].args[0])
+            second_command = list(run_command_mock.call_args_list[1].args[0])
+            self.assertIn("--sleep-requests", first_command)
+            self.assertIn("--sleep-requests", second_command)
+            first_sleep = first_command[first_command.index("--sleep-requests") + 1]
+            second_sleep = second_command[second_command.index("--sleep-requests") + 1]
+            self.assertEqual(first_sleep, "1.1")
+            self.assertEqual(second_sleep, "2.2")
+        finally:
+            connection.close()
+
+    def test_sync_source_skips_retry_subtitle_when_local_file_exists(self):
+        source_root = self.workspace_root / "storiesofcz_subs_retry_existing"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        video_id = "7617999999999999999"
+        source.subs_dir.mkdir(parents=True, exist_ok=True)
+        (source.subs_dir / f"{video_id}.eng-US.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            failed_at = "2026-03-08T00:00:00+00:00"
+            self.mod.upsert_download_state(
+                connection=connection,
+                source_id=source.id,
+                stage="subs",
+                video_id=video_id,
+                status="error",
+                run_id=None,
+                attempt_at=failed_at,
+                url=self.mod.build_video_url(source, video_id),
+                last_error="subtitle file missing after download attempt",
+                retry_count=2,
+                next_retry_at=None,
+            )
+            connection.commit()
+
+            with mock.patch.object(self.mod, "run_command_with_output") as run_command_mock:
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=False,
+                    skip_meta=True,
+                    connection=connection,
+                )
+
+            run_command_mock.assert_not_called()
+            row = connection.execute(
+                """
+                SELECT status, retry_count, last_error, next_retry_at
+                FROM download_state
+                WHERE source_id = ? AND stage = 'subs' AND video_id = ?
+                """,
+                (source.id, video_id),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "success")
+            self.assertEqual(int(row[1]), 0)
+            self.assertIsNone(row[2])
+            self.assertIsNone(row[3])
+        finally:
+            connection.close()
+
     def test_sync_source_defers_media_discovery_with_recent_attempt(self):
         source_root = self.workspace_root / "storiesofcz"
         source_root.mkdir(parents=True, exist_ok=True)
