@@ -154,6 +154,9 @@ Operator note:
   - `download_state` is stage state history and can retain legacy/secondary errors after queue recovery.
   - `media` queue priority is source-fair: newly discovered IDs are interleaved across sources instead of enqueued as one source-local burst.
   - `queue-worker` lease selection also avoids repeating the same source when another source has a ready head item, reducing same-source streaks.
+- `source_access_state` table:
+  - Per-source network cooldown state for block/forbidden signatures.
+  - Active cooldown suppresses new discovery and prevents `media/subs/meta` lease selection for that source until `blocked_until`.
 - Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
 - Retry delay is failure-aware:
   - Normal failures: exponential backoff from 5m up to 24h.
@@ -164,7 +167,7 @@ Operator note:
 - Queue failure visibility:
   - `python3 scripts/substudy.py queue-status --config config/sources.toml --limit 30`
   - `python3 scripts/substudy.py queue-status --config config/sources.toml --only-unresolved --limit 30`
-  - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`), recent `error/dead` reasons, and `recovered by retry` (`status=success` with `attempt_count>=2`) per source.
+  - Reports unresolved queue counts (`queued`, `leased`, `retry_due`, `retry_wait`, `dead`), active source network cooldowns, recent `error/dead` reasons, and `recovered by retry` (`status=success` with `attempt_count>=2`) per source.
 - Queue manual recovery (requeue dead/error items after fixes):
   - Dry-run:
     `python3 scripts/substudy.py queue-requeue --config config/sources.toml --stage translate --status dead --error-contains "tuple indices must be integers or slices, not str" --dry-run`

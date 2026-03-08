@@ -7,7 +7,7 @@
 
 ### 実装済み
 
-- DB スキーマに `work_items` / `source_poll_state` / `worker_heartbeats` を追加。
+- DB スキーマに `work_items` / `source_poll_state` / `source_access_state` / `worker_heartbeats` を追加。
 - `sync` / `backfill` に `--execution-mode legacy|queue` を追加。
 - `sync --execution-mode queue` で source ごとの discovery を実行し、`work_items(stage=media)` へ投入。
 - `source_poll_state.next_poll_at` を使った source ごとの discovery 間隔制御（既定 24h）を実装。
@@ -26,6 +26,7 @@
 - `subs/asr` 成功時に `translate` を downstream として自動 enqueue する連鎖を追加。
 - `media` queue priority を source-fair に変更し、複数 source の新規動画が interleave されるようにした。
 - `queue-worker` は lease 時に source ごとの先頭候補を比較し、可能なら直前と異なる source を選ぶようにした。
+- block/forbidden 検知時に `source_access_state.blocked_until` を延長し、同 source の discovery と `media/subs/meta` lease を一時停止するようにした。
 - legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
 - `sync/backfill --execution-mode queue` に producer 共有ロックを追加し、launchd/手動の同時 producer 起動を抑止。
 - `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行し、`sync/backfill` producer と `queue-worker` 複数起動を分離。
@@ -172,6 +173,7 @@ lease 失効時:
 - backfill は別経路として扱い、必要に応じてこの制約をバイパス可能にする。
 - discovery を通過した source でも、queue への `media` 投入順は source 単位で固めず interleave する。
 - worker 側も ready item の source 偏りを緩和し、同一 source の連続処理をなるべく避ける。
+- block/forbidden 反応が出た source は `source_access_state` で一定時間 cooling し、その間は discovery/lease の両方で回避する。
 
 ## 10. 既存コマンドとの対応
 

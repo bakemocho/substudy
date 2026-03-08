@@ -738,6 +738,14 @@ data_dir = "{source_root}"
                     "7624444444444444444",
                 ),
             )
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id=source.id,
+                blocked_until=future_iso,
+                last_blocked_at=now_iso,
+                last_error="ERROR: [TikTok] Your IP address is blocked from accessing this post",
+                updated_at=now_iso,
+            )
             connection.commit()
         finally:
             connection.close()
@@ -752,6 +760,8 @@ data_dir = "{source_root}"
 
         rendered = output.getvalue()
         self.assertIn("queue-status: storiesofcz", rendered)
+        self.assertIn("source network cooldown:", rendered)
+        self.assertIn(f"until={future_iso}", rendered)
         self.assertIn("queue unresolved total=3", rendered)
         self.assertIn("retry_due=1", rendered)
         self.assertIn("retry_wait=1", rendered)
@@ -1189,6 +1199,7 @@ data_dir = "{source_root}"
             }
             self.assertIn("work_items", tables)
             self.assertIn("source_poll_state", tables)
+            self.assertIn("source_access_state", tables)
             self.assertIn("worker_heartbeats", tables)
         finally:
             connection.close()
@@ -1369,6 +1380,64 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_enqueue_source_media_discovery_skips_active_network_cooldown(self):
+        source_root = self.workspace_root / "storiesofcz_queue_blocked"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            now_iso = now_dt.isoformat()
+            blocked_until = (now_dt + dt.timedelta(hours=6)).isoformat()
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id=source.id,
+                blocked_until=blocked_until,
+                last_blocked_at=now_iso,
+                last_error="ERROR: [TikTok] Your IP address is blocked from accessing this post",
+                updated_at=now_iso,
+            )
+            connection.commit()
+
+            with mock.patch.object(
+                self.mod,
+                "discover_playlist_window_ids",
+                return_value=["7611111111111111111"],
+            ) as discover_mock:
+                discovered, inserted, requeued = self.mod.enqueue_source_media_discovery(
+                    connection=connection,
+                    source=source,
+                    dry_run=False,
+                    run_label="sync-queue",
+                    enforce_poll_interval=True,
+                )
+            self.assertEqual((discovered, inserted, requeued), (0, 0, 0))
+            self.assertEqual(discover_mock.call_count, 0)
+        finally:
+            connection.close()
+
     def test_lease_next_work_item_and_complete_success(self):
         connection = sqlite3.connect(str(self.db_path))
         try:
@@ -1473,7 +1542,8 @@ data_dir = "{source_root}"
         connection = sqlite3.connect(str(self.db_path))
         try:
             self.mod.create_schema(connection)
-            now_iso = "2026-03-07T00:00:00+00:00"
+            now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            now_iso = now_dt.isoformat()
             self.mod.enqueue_work_item(
                 connection=connection,
                 source_id="source-a",
@@ -1528,6 +1598,49 @@ data_dir = "{source_root}"
             )
             self.assertIsNotNone(leased_3)
             self.assertEqual(str(leased_3["source_id"]), "source-a")
+        finally:
+            connection.close()
+
+    def test_lease_next_work_item_skips_network_stage_for_blocked_source(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            now_iso = now_dt.isoformat()
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-a",
+                stage="media",
+                video_id="7615000000000000001",
+                now_iso=now_iso,
+                priority=0,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-b",
+                stage="media",
+                video_id="7625000000000000001",
+                now_iso=now_iso,
+                priority=10,
+            )
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id="source-a",
+                blocked_until=(now_dt + dt.timedelta(hours=6)).isoformat(),
+                last_blocked_at=now_iso,
+                last_error="ERROR: [TikTok] Your IP address is blocked from accessing this post",
+                updated_at=now_iso,
+            )
+            connection.commit()
+
+            leased = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-media",
+                stages=["media"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased)
+            self.assertEqual(str(leased["source_id"]), "source-b")
         finally:
             connection.close()
 
@@ -2367,7 +2480,7 @@ data_dir = "{source_root}"
                 written_paths.append(Path(path))
 
             with mock.patch.object(self.mod, "write_urls_file", side_effect=fake_write_urls):
-                with mock.patch.object(self.mod, "run_command", return_value=0):
+                with mock.patch.object(self.mod, "run_command_with_output", return_value=(0, "")):
                     self.mod.sync_source(
                         source=source,
                         dry_run=False,
@@ -2424,7 +2537,7 @@ data_dir = "{source_root}"
             )
             connection.commit()
 
-            with mock.patch.object(self.mod, "run_command") as run_command_mock:
+            with mock.patch.object(self.mod, "run_command_with_output") as run_command_mock:
                 self.mod.sync_source(
                     source=source,
                     dry_run=False,
@@ -2488,7 +2601,7 @@ data_dir = "{source_root}"
         connection = sqlite3.connect(str(self.db_path))
         try:
             self.mod.create_schema(connection)
-            with mock.patch.object(self.mod, "run_command") as run_command_mock:
+            with mock.patch.object(self.mod, "run_command_with_output") as run_command_mock:
                 self.mod.sync_source(
                     source=source,
                     dry_run=False,
@@ -2548,7 +2661,7 @@ data_dir = "{source_root}"
         connection = sqlite3.connect(str(self.db_path))
         try:
             self.mod.create_schema(connection)
-            with mock.patch.object(self.mod, "run_command", return_value=0) as run_command_mock:
+            with mock.patch.object(self.mod, "run_command_with_output", return_value=(0, "")) as run_command_mock:
                 self.mod.sync_source(
                     source=source,
                     dry_run=False,

@@ -1049,6 +1049,46 @@ def run_command(command: list[str], dry_run: bool, raise_on_error: bool = True) 
     return completed.returncode
 
 
+def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str]:
+    print("$", shlex.join(command))
+    if dry_run:
+        return (0, "")
+
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    stdout_text = completed.stdout or ""
+    stderr_text = completed.stderr or ""
+    if stdout_text:
+        sys.stdout.write(stdout_text)
+    if stderr_text:
+        sys.stderr.write(stderr_text)
+    combined_output = "\n".join(
+        part.strip()
+        for part in (stderr_text, stdout_text)
+        if str(part or "").strip()
+    )
+    return (completed.returncode, combined_output)
+
+
+def summarize_command_failure(output_text: str | None, exit_code: int) -> str:
+    lines = [
+        line.strip()
+        for line in str(output_text or "").splitlines()
+        if line.strip()
+    ]
+    for line in reversed(lines):
+        lowered = line.lower()
+        if lowered.startswith("error:") or "blocked" in lowered or "forbidden" in lowered:
+            return line[:4000]
+    if lines:
+        return lines[-1][:4000]
+    return f"command exit code {exit_code}"
+
+
 def probe_network_quality(
     probe_url: str,
     timeout_sec: int,
@@ -1362,6 +1402,7 @@ def sync_source(
     metadata_candidate_ids: list[str] | None = None,
     run_label: str = "sync",
     respect_media_discovery_interval: bool = True,
+    respect_source_cooldown: bool = True,
     metered_media_mode: str = DEFAULT_METERED_MEDIA_MODE,
     metered_min_archive_ids: int = DEFAULT_METERED_MIN_ARCHIVE_IDS,
     metered_playlist_end: int = DEFAULT_METERED_PLAYLIST_END,
@@ -1377,6 +1418,33 @@ def sync_source(
     source.subs_archive.parent.mkdir(parents=True, exist_ok=True)
 
     bootstrap_missing_archives(source, dry_run=dry_run)
+
+    source_cooldown_active = False
+    source_cooldown_remaining_hours = 0.0
+    source_cooldown_until: str | None = None
+    source_cooldown_reason: str | None = None
+    if (
+        respect_source_cooldown
+        and connection is not None
+        and not dry_run
+    ):
+        (
+            source_cooldown_active,
+            source_cooldown_remaining_hours,
+            source_cooldown_until,
+            source_cooldown_reason,
+        ) = get_source_network_cooldown_state(
+            connection=connection,
+            source_id=source.id,
+        )
+        if source_cooldown_active:
+            print(
+                f"[network-cooldown] {source.id}: active until="
+                f"{source_cooldown_until or 'unknown'} "
+                f"remaining={source_cooldown_remaining_hours:.2f}h"
+            )
+            if source_cooldown_reason:
+                print(f"[network-cooldown] {source.id}: reason={source_cooldown_reason}")
 
     media_before_ids = set(read_archive_ids(source.media_archive))
     configured_playlist_end = playlist_end if playlist_end is not None else source.playlist_end
@@ -1438,7 +1506,7 @@ def sync_source(
             seen_media_candidate_ids.add(video_id_value)
             normalized_media_candidate_ids.append(video_id_value)
 
-    if not skip_media and not metered_skip_media:
+    if not skip_media and not metered_skip_media and not source_cooldown_active:
         media_discovery_state_key = f"media_discovery_last_attempt:{source.id}"
         run_media_discovery = media_candidate_ids is None
         media_discovery_remaining_hours: float | None = None
@@ -1520,12 +1588,31 @@ def sync_source(
         media_error: str | None = None
         if media_command is not None:
             try:
-                media_exit_code = run_command(media_command, dry_run=dry_run, raise_on_error=False)
+                media_exit_code, media_output = run_command_with_output(
+                    media_command,
+                    dry_run=dry_run,
+                )
+                if media_exit_code != 0:
+                    media_error = summarize_command_failure(
+                        media_output,
+                        media_exit_code,
+                    )
             except Exception as exc:
                 media_exit_code = 1
                 media_error = str(exc)
                 print(f"[sync] {source.id} media command failed: {exc}", file=sys.stderr)
             if connection is not None and not dry_run:
+                if media_error:
+                    extend_source_network_cooldown(
+                        connection=connection,
+                        source_id=source.id,
+                        error_message=media_error,
+                        blocked_until=schedule_next_retry_iso(
+                            1,
+                            error_message=media_error,
+                        ),
+                        blocked_at=media_started_at,
+                    )
                 set_app_state_value(
                     connection,
                     media_discovery_state_key,
@@ -1607,16 +1694,15 @@ def sync_source(
                 video_url,
             ]
             try:
-                primary_exit_code = run_command(
+                primary_exit_code, primary_output = run_command_with_output(
                     primary_command,
                     dry_run=False,
-                    raise_on_error=False,
                 )
             except Exception as exc:
                 return None, f"primary download command exception: {exc}"
 
             if primary_exit_code != 0:
-                return None, f"primary download command exit code {primary_exit_code}"
+                return None, summarize_command_failure(primary_output, primary_exit_code)
 
             refreshed_media_path = find_media_file_for_video(source, video_id)
             if refreshed_media_path is None or not refreshed_media_path.exists():
@@ -1700,10 +1786,9 @@ def sync_source(
                             video_url,
                         ]
                         try:
-                            fallback_exit_code = run_command(
+                            fallback_exit_code, fallback_output = run_command_with_output(
                                 fallback_command,
                                 dry_run=False,
-                                raise_on_error=False,
                             )
                         except Exception as exc:
                             download_errors.append(
@@ -1713,7 +1798,8 @@ def sync_source(
 
                         if fallback_exit_code != 0:
                             download_errors.append(
-                                f"{candidate_format}: exit code {fallback_exit_code}"
+                                f"{candidate_format}: "
+                                f"{summarize_command_failure(fallback_output, fallback_exit_code)}"
                             )
                             continue
                         if not donor_media_path.exists():
@@ -2056,6 +2142,10 @@ def sync_source(
                     (source.id, "media", video_id),
                 ).fetchone()
                 next_retry_count = (int(current[0]) if current else 0) + 1
+                next_retry_at = schedule_next_retry_iso(
+                    next_retry_count,
+                    error_message=fallback_error,
+                )
                 upsert_download_state(
                     connection=connection,
                     source_id=source.id,
@@ -2067,10 +2157,14 @@ def sync_source(
                     url=safe_video_url(video_id),
                     last_error=fallback_error,
                     retry_count=next_retry_count,
-                    next_retry_at=schedule_next_retry_iso(
-                        next_retry_count,
-                        error_message=fallback_error,
-                    ),
+                    next_retry_at=next_retry_at,
+                )
+                extend_source_network_cooldown(
+                    connection=connection,
+                    source_id=source.id,
+                    error_message=fallback_error,
+                    blocked_until=next_retry_at,
+                    blocked_at=media_started_at,
                 )
 
             if repaired_media_ids:
@@ -2140,13 +2234,17 @@ def sync_source(
     else:
         if skip_media:
             print("skip media")
+        elif source_cooldown_active:
+            print(
+                f"skip media (source network cooldown until {source_cooldown_until or 'unknown'})"
+            )
         else:
             print(
                 f"skip media (metered updates-only; archive_count<{max(0, int(metered_min_archive_ids))})"
             )
 
     subs_before_ids = set(read_archive_ids(source.subs_archive))
-    if not skip_subs:
+    if not skip_subs and not source_cooldown_active:
         bootstrap_missing_sub_ids: list[str] = []
         if (
             connection is not None
@@ -2299,7 +2397,15 @@ def sync_source(
             subs_error: str | None = None
             if subs_command is not None:
                 try:
-                    subs_exit_code = run_command(subs_command, dry_run=dry_run, raise_on_error=False)
+                    subs_exit_code, subs_output = run_command_with_output(
+                        subs_command,
+                        dry_run=dry_run,
+                    )
+                    if subs_exit_code != 0:
+                        subs_error = summarize_command_failure(
+                            subs_output,
+                            subs_exit_code,
+                        )
                 except Exception as exc:
                     subs_exit_code = 1
                     subs_error = str(exc)
@@ -2354,6 +2460,10 @@ def sync_source(
                                 if subs_exit_code != 0
                                 else "subtitle file missing after download attempt"
                             )
+                        next_retry_at = schedule_next_retry_iso(
+                            next_retry_count,
+                            error_message=failure_reason,
+                        )
                         upsert_download_state(
                             connection=connection,
                             source_id=source.id,
@@ -2365,10 +2475,14 @@ def sync_source(
                             url=safe_video_url(video_id),
                             last_error=failure_reason,
                             retry_count=next_retry_count,
-                            next_retry_at=schedule_next_retry_iso(
-                                next_retry_count,
-                                error_message=failure_reason,
-                            ),
+                            next_retry_at=next_retry_at,
+                        )
+                        extend_source_network_cooldown(
+                            connection=connection,
+                            source_id=source.id,
+                            error_message=failure_reason,
+                            blocked_until=next_retry_at,
+                            blocked_at=subs_started_at,
                         )
 
                     finish_download_run(
@@ -2402,10 +2516,20 @@ def sync_source(
                     f"deferred={len(deferred_sub_ids)})"
                 )
     else:
-        print("skip subtitles")
+        if skip_subs:
+            print("skip subtitles")
+        else:
+            print(
+                f"skip subtitles (source network cooldown until {source_cooldown_until or 'unknown'})"
+            )
 
     if skip_meta:
         print("skip metadata")
+        return
+    if source_cooldown_active:
+        print(
+            f"skip metadata (source network cooldown until {source_cooldown_until or 'unknown'})"
+        )
         return
 
     if metadata_candidate_ids is not None:
@@ -2526,7 +2650,15 @@ def sync_source(
     meta_error: str | None = None
     if metadata_command is not None:
         try:
-            meta_exit_code = run_command(metadata_command, dry_run=dry_run, raise_on_error=False)
+            meta_exit_code, meta_output = run_command_with_output(
+                metadata_command,
+                dry_run=dry_run,
+            )
+            if meta_exit_code != 0:
+                meta_error = summarize_command_failure(
+                    meta_output,
+                    meta_exit_code,
+                )
         except Exception as exc:
             meta_exit_code = 1
             meta_error = str(exc)
@@ -2576,6 +2708,10 @@ def sync_source(
                     if meta_exit_code != 0
                     else "metadata file missing after download attempt"
                 )
+            next_retry_at = schedule_next_retry_iso(
+                next_retry_count,
+                error_message=failure_reason,
+            )
             upsert_download_state(
                 connection=connection,
                 source_id=source.id,
@@ -2587,10 +2723,14 @@ def sync_source(
                 url=safe_video_url(video_id),
                 last_error=failure_reason,
                 retry_count=next_retry_count,
-                next_retry_at=schedule_next_retry_iso(
-                    next_retry_count,
-                    error_message=failure_reason,
-                ),
+                next_retry_at=next_retry_at,
+            )
+            extend_source_network_cooldown(
+                connection=connection,
+                source_id=source.id,
+                error_message=failure_reason,
+                blocked_until=next_retry_at,
+                blocked_at=meta_started_at,
             )
 
         finish_download_run(
@@ -3055,6 +3195,18 @@ def create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_source_poll_state_next
             ON source_poll_state(next_poll_at, updated_at);
+
+        CREATE TABLE IF NOT EXISTS source_access_state (
+            source_id TEXT PRIMARY KEY,
+            blocked_until TEXT,
+            last_blocked_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_access_state_blocked_until
+            ON source_access_state(blocked_until, updated_at);
 
         CREATE TABLE IF NOT EXISTS worker_heartbeats (
             worker_id TEXT PRIMARY KEY,
@@ -4468,6 +4620,13 @@ def mark_media_retry_state(
         retry_count=next_retry_count,
         next_retry_at=next_retry_at,
     )
+    extend_source_network_cooldown(
+        connection=connection,
+        source_id=source.id,
+        error_message=reason,
+        blocked_until=next_retry_at,
+        blocked_at=attempt_value,
+    )
     return next_retry_count, next_retry_at
 
 
@@ -4542,6 +4701,108 @@ def compute_next_poll_at_iso(
     base_dt = from_dt or dt.datetime.now(dt.timezone.utc)
     next_dt = base_dt + dt.timedelta(hours=safe_hours)
     return next_dt.replace(microsecond=0).isoformat()
+
+
+def get_source_network_cooldown_state(
+    connection: sqlite3.Connection,
+    source_id: str,
+    now_dt: dt.datetime | None = None,
+) -> tuple[bool, float, str | None, str | None]:
+    now_value = now_dt or dt.datetime.now(dt.timezone.utc)
+    row = connection.execute(
+        """
+        SELECT blocked_until, COALESCE(last_error, '')
+        FROM source_access_state
+        WHERE source_id = ?
+        """,
+        (source_id,),
+    ).fetchone()
+    if row is None or row[0] in (None, ""):
+        return False, 0.0, None, None
+
+    blocked_until_text = str(row[0])
+    blocked_until_dt = parse_iso_datetime_utc(blocked_until_text)
+    last_error = str(row[1] or "").strip() or None
+    if blocked_until_dt is None or now_value >= blocked_until_dt:
+        return False, 0.0, blocked_until_text, last_error
+
+    remaining_hours = max(0.0, (blocked_until_dt - now_value).total_seconds() / 3600.0)
+    return True, remaining_hours, blocked_until_text, last_error
+
+
+def upsert_source_access_state(
+    connection: sqlite3.Connection,
+    source_id: str,
+    blocked_until: str | None,
+    last_blocked_at: str | None,
+    last_error: str | None,
+    updated_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO source_access_state (
+            source_id,
+            blocked_until,
+            last_blocked_at,
+            last_error,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            blocked_until = excluded.blocked_until,
+            last_blocked_at = excluded.last_blocked_at,
+            last_error = excluded.last_error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            source_id,
+            blocked_until,
+            last_blocked_at,
+            last_error,
+            updated_at,
+        ),
+    )
+
+
+def extend_source_network_cooldown(
+    connection: sqlite3.Connection,
+    source_id: str,
+    error_message: str | None,
+    blocked_until: str | None = None,
+    blocked_at: str | None = None,
+) -> str | None:
+    if not is_blocked_or_forbidden_error(error_message):
+        return None
+
+    blocked_at_value = str(blocked_at or now_utc_iso())
+    next_blocked_until = str(
+        blocked_until
+        or schedule_next_retry_iso(
+            1,
+            error_message=error_message,
+        )
+    )
+    current = connection.execute(
+        """
+        SELECT blocked_until
+        FROM source_access_state
+        WHERE source_id = ?
+        """,
+        (source_id,),
+    ).fetchone()
+    if current is not None and current[0] not in (None, ""):
+        current_blocked_until = str(current[0])
+        if current_blocked_until > next_blocked_until:
+            next_blocked_until = current_blocked_until
+
+    upsert_source_access_state(
+        connection=connection,
+        source_id=source_id,
+        blocked_until=next_blocked_until,
+        last_blocked_at=blocked_at_value,
+        last_error=error_message,
+        updated_at=blocked_at_value,
+    )
+    return next_blocked_until
 
 
 def should_poll_source_discovery(
@@ -4770,6 +5031,23 @@ def enqueue_source_media_discovery(
     now_iso = now_dt.replace(microsecond=0).isoformat()
     interval_hours = max(0.0, float(source.media_discovery_interval_hours))
 
+    cooldown_active, cooldown_remaining_hours, cooldown_until, cooldown_reason = (
+        get_source_network_cooldown_state(
+            connection=connection,
+            source_id=source.id,
+            now_dt=now_dt,
+        )
+    )
+    if cooldown_active:
+        print(
+            f"[{run_label}] {source.id}: network cooldown active "
+            f"(blocked_until={cooldown_until or 'unknown'}, "
+            f"remaining={cooldown_remaining_hours:.2f}h)"
+        )
+        if cooldown_reason:
+            print(f"[{run_label}] {source.id}: cooldown reason={cooldown_reason}")
+        return 0, 0, 0
+
     should_poll = True
     remaining_hours = 0.0
     next_poll_at = None
@@ -4809,6 +5087,18 @@ def enqueue_source_media_discovery(
             from_dt=now_dt,
         )
         if not dry_run:
+            blocked_until = extend_source_network_cooldown(
+                connection=connection,
+                source_id=source.id,
+                error_message=str(exc),
+                blocked_until=schedule_next_retry_iso(
+                    1,
+                    error_message=str(exc),
+                ),
+                blocked_at=now_iso,
+            )
+            if blocked_until and blocked_until > next_poll_iso:
+                next_poll_iso = blocked_until
             upsert_source_poll_state(
                 connection=connection,
                 source_id=source.id,
@@ -5040,7 +5330,7 @@ def lease_next_work_item(
         lease_token = uuid.uuid4().hex
 
         connection.execute("BEGIN IMMEDIATE")
-        candidate_params: list[Any] = [*normalized_stages, now_iso]
+        candidate_params: list[Any] = [*normalized_stages, now_iso, now_iso]
         order_by = "priority ASC, updated_at ASC, id ASC"
         if avoid_source_id:
             order_by = (
@@ -5065,6 +5355,16 @@ def lease_next_work_item(
                 WHERE stage IN ({placeholders})
                   AND status IN ('queued', 'error')
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  AND (
+                      stage NOT IN ('media', 'subs', 'meta')
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM source_access_state AS access
+                          WHERE access.source_id = work_items.source_id
+                            AND access.blocked_until IS NOT NULL
+                            AND access.blocked_until > ?
+                      )
+                  )
             ),
             source_head AS (
                 SELECT
@@ -5377,6 +5677,7 @@ def process_leased_work_item(
                 metadata_candidate_ids=None,
                 run_label=run_label,
                 respect_media_discovery_interval=False,
+                respect_source_cooldown=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
@@ -5391,6 +5692,7 @@ def process_leased_work_item(
                 metadata_candidate_ids=[video_id],
                 run_label=run_label,
                 respect_media_discovery_interval=False,
+                respect_source_cooldown=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
@@ -5405,6 +5707,7 @@ def process_leased_work_item(
                 metadata_candidate_ids=[video_id],
                 run_label=run_label,
                 respect_media_discovery_interval=False,
+                respect_source_cooldown=False,
                 urls_file_override=urls_temp_path,
                 strict_candidate_scope=True,
             )
@@ -7497,6 +7800,20 @@ def show_download_report(
                 f"retry_wait={int(queue_health_row[3] or 0)} "
                 f"dead={int(queue_health_row[4] or 0)}"
             )
+        cooldown_active, cooldown_remaining_hours, cooldown_until, cooldown_reason = (
+            get_source_network_cooldown_state(
+                connection=connection,
+                source_id=source.id,
+            )
+        )
+        if cooldown_active:
+            print(
+                "source network cooldown: "
+                f"until={cooldown_until or 'unknown'} "
+                f"remaining={cooldown_remaining_hours:.2f}h"
+            )
+            if cooldown_reason:
+                print(f"  reason: {cooldown_reason}")
 
         failure_rows = connection.execute(
             """
@@ -7647,6 +7964,20 @@ def show_queue_status_report(
         if only_unresolved and unresolved_total <= 0:
             continue
         print(f"\n=== queue-status: {source.id} ===")
+        cooldown_active, cooldown_remaining_hours, cooldown_until, cooldown_reason = (
+            get_source_network_cooldown_state(
+                connection=connection,
+                source_id=source.id,
+            )
+        )
+        if cooldown_active:
+            print(
+                "source network cooldown: "
+                f"until={cooldown_until or 'unknown'} "
+                f"remaining={cooldown_remaining_hours:.2f}h"
+            )
+            if cooldown_reason:
+                print(f"  reason: {cooldown_reason}")
         if summary_row is not None:
             print(
                 "queue unresolved total="
