@@ -27,6 +27,8 @@
 - `media` queue priority を source-fair に変更し、複数 source の新規動画が interleave されるようにした。
 - `queue-worker` は lease 時に source ごとの先頭候補を比較し、可能なら直前と異なる source を選ぶようにした。
 - block/forbidden 検知時に `source_access_state.blocked_until` を延長し、同 source の discovery と `media/subs/meta` lease を一時停止するようにした。
+- block 判定は TikTok 固有シグネチャ優先（`Your IP address is blocked from accessing this post` / `status 10204` / TikTok 文脈つき `403 Forbidden`）へ絞り、一般的な 403 で source 全体 cooldown に入りにくくした。
+- 成功した discovery / `media` / `subs` / `meta` は stale な source cooldown を解除し、`source.sleep_interval` ベースの `next_request_not_before` を更新して source 単位の短い request pacing を入れた。
 - legacy 側の `running` 回収ロジックを撤去し、queue lease 回収へ統一した。
 - `sync/backfill --execution-mode queue` に producer 共有ロックを追加し、launchd/手動の同時 producer 起動を抑止。
 - `run_daily_sync.sh` / `run_weekly_full_sync.sh` を queue 構成へ移行し、`sync/backfill` producer と `queue-worker` 複数起動を分離。
@@ -174,6 +176,7 @@ lease 失効時:
 - discovery を通過した source でも、queue への `media` 投入順は source 単位で固めず interleave する。
 - worker 側も ready item の source 偏りを緩和し、同一 source の連続処理をなるべく避ける。
 - block/forbidden 反応が出た source は `source_access_state` で一定時間 cooling し、その間は discovery/lease の両方で回避する。
+- cooling 解除後も、直近に network stage を走らせた source は `next_request_not_before` まで lease 対象から外し、同一 source への連打を少し減らす。
 
 ## 10. 既存コマンドとの対応
 

@@ -154,13 +154,15 @@ Operator note:
   - `download_state` is stage state history and can retain legacy/secondary errors after queue recovery.
   - `media` queue priority is source-fair: newly discovered IDs are interleaved across sources instead of enqueued as one source-local burst.
   - `queue-worker` lease selection also avoids repeating the same source when another source has a ready head item, reducing same-source streaks.
+  - `media/subs/meta` lease selection also respects `source_access_state.next_request_not_before`, so a source that just finished a network stage is briefly paced before the next network stage is leased.
 - `source_access_state` table:
-  - Per-source network cooldown state for block/forbidden signatures.
+  - Per-source network cooldown and pacing state for remote `media/subs/meta` traffic.
   - Active cooldown suppresses new discovery and prevents `media/subs/meta` lease selection for that source until `blocked_until`.
+  - Successful discovery / `media` / `subs` / `meta` runs clear stale cooldowns and refresh `next_request_not_before` from the source's configured `sleep_interval`.
 - Failed `media`, `subs`, and `meta` items are auto-retried in later `sync` runs with exponential backoff.
 - Retry delay is failure-aware:
   - Normal failures: exponential backoff from 5m up to 24h.
-  - Block/forbidden signatures (`Your IP address is blocked`, `HTTP 403`, `Forbidden`): conservative cool-off (6h -> 12h -> 24h -> 36h -> 48h).
+  - TikTok block/forbidden signatures (`Your IP address is blocked from accessing this post`, `status 10204`, or TikTok-scoped `403 Forbidden`): conservative cool-off (6h -> 12h -> 24h -> 36h -> 48h).
   - Missing artifact signatures (for example `subtitle file missing after download attempt`, `* did not write a terminal download_state row`): slower structural retry (30m -> 2h -> 6h -> 12h -> 24h).
 - Subtitle stage now runs on explicit per-video targets (new media IDs and due retries) instead of re-scanning the full profile feed.
 - Retries honor `next_retry_at` (backoff), so failed IDs are not re-hit on every run.

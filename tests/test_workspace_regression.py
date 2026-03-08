@@ -591,6 +591,21 @@ enabled = true
         self.assertGreaterEqual(normal_delay, 295)
         self.assertLessEqual(normal_delay, 305)
 
+    def test_is_blocked_or_forbidden_error_requires_tiktok_context(self):
+        self.assertFalse(
+            self.mod.is_blocked_or_forbidden_error("HTTP Error 403: Forbidden")
+        )
+        self.assertTrue(
+            self.mod.is_blocked_or_forbidden_error(
+                "ERROR: [TikTok] HTTP Error 403: Forbidden"
+            )
+        )
+        self.assertTrue(
+            self.mod.is_blocked_or_forbidden_error(
+                "ERROR: [TikTok] status 10204"
+            )
+        )
+
     def test_schedule_next_retry_iso_uses_structural_backoff_for_missing_artifact_error(self):
         before = dt.datetime.now(dt.timezone.utc)
         retry_at = dt.datetime.fromisoformat(
@@ -1204,6 +1219,82 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_record_source_network_access_success_clears_cooldown_and_sets_spacing(self):
+        source_root = self.workspace_root / "storiesofcz_source_access_state"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            now_iso = now_dt.isoformat()
+            blocked_until = (now_dt + dt.timedelta(hours=6)).isoformat()
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id=source.id,
+                blocked_until=blocked_until,
+                last_blocked_at=now_iso,
+                last_error="ERROR: [TikTok] Your IP address is blocked from accessing this post",
+                updated_at=now_iso,
+            )
+
+            next_request = self.mod.record_source_network_access(
+                connection=connection,
+                source=source,
+                request_at=now_iso,
+                succeeded=True,
+                clear_cooldown=True,
+                last_error=None,
+            )
+
+            row = connection.execute(
+                """
+                SELECT blocked_until, last_request_at, next_request_not_before, last_success_at, last_error
+                FROM source_access_state
+                WHERE source_id = ?
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIsNone(row[0])
+            self.assertEqual(str(row[1]), now_iso)
+            self.assertEqual(row[2], next_request)
+            self.assertEqual(str(row[3]), now_iso)
+            self.assertIsNone(row[4])
+
+            expected_delay = self.mod.compute_source_network_min_interval_seconds(source)
+            if expected_delay <= 0:
+                self.assertIsNone(next_request)
+            else:
+                self.assertIsNotNone(next_request)
+                next_request_dt = dt.datetime.fromisoformat(str(next_request))
+                delay_seconds = (next_request_dt - now_dt).total_seconds()
+                self.assertGreaterEqual(delay_seconds, expected_delay - 1)
+                self.assertLessEqual(delay_seconds, expected_delay + 1)
+        finally:
+            connection.close()
+
     def test_get_queue_producer_lock_path_uses_db_sibling_locks_dir(self):
         db_path = self.workspace_root / "data" / "custom.sqlite"
         lock_path = self.mod.get_queue_producer_lock_path(db_path)
@@ -1637,6 +1728,47 @@ data_dir = "{source_root}"
                 connection=connection,
                 worker_id="worker-media",
                 stages=["media"],
+                lease_seconds=600,
+            )
+            self.assertIsNotNone(leased)
+            self.assertEqual(str(leased["source_id"]), "source-b")
+        finally:
+            connection.close()
+
+    def test_lease_next_work_item_skips_network_stage_for_paced_source(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_dt = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            now_iso = now_dt.isoformat()
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-a",
+                stage="meta",
+                video_id="7615100000000000001",
+                now_iso=now_iso,
+                priority=0,
+            )
+            self.mod.enqueue_work_item(
+                connection=connection,
+                source_id="source-b",
+                stage="meta",
+                video_id="7625100000000000001",
+                now_iso=now_iso,
+                priority=10,
+            )
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id="source-a",
+                next_request_not_before=(now_dt + dt.timedelta(minutes=5)).isoformat(),
+                updated_at=now_iso,
+            )
+            connection.commit()
+
+            leased = self.mod.lease_next_work_item(
+                connection=connection,
+                worker_id="worker-meta",
+                stages=["meta"],
                 lease_seconds=600,
             )
             self.assertIsNotNone(leased)
@@ -2680,6 +2812,77 @@ data_dir = "{source_root}"
             self.assertIn("--playlist-end", media_command)
             playlist_end_index = media_command.index("--playlist-end")
             self.assertEqual(str(media_command[playlist_end_index + 1]), "5")
+        finally:
+            connection.close()
+
+    def test_sync_source_blocked_media_skips_following_metadata(self):
+        source_root = self.workspace_root / "storiesofcz_blocked_media_skip_meta"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+        source.media_archive.write_text(
+            "tiktok 7618888888888888888\n",
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            commands: list[list[str]] = []
+
+            def fake_run_command_with_output(command, dry_run):
+                commands.append(list(command))
+                return (
+                    1,
+                    "ERROR: [TikTok] Your IP address is blocked from accessing this post",
+                )
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                side_effect=fake_run_command_with_output,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=False,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                )
+
+            self.assertEqual(len(commands), 1)
+            row = connection.execute(
+                """
+                SELECT blocked_until, last_error
+                FROM source_access_state
+                WHERE source_id = ?
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertIsNotNone(row[0])
+            self.assertIn("blocked", str(row[1]).lower())
         finally:
             connection.close()
 

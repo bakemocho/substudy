@@ -102,10 +102,13 @@ DEFAULT_QUEUE_LEASE_SEC = 1800
 DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
+_SOURCE_ACCESS_UNSET = object()
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
-RE_RETRY_BLOCKED_OR_FORBIDDEN = re.compile(
-    r"(your ip address is blocked|ip blocked|http error 403|forbidden)",
+RE_RETRY_TIKTOK_BLOCKED = re.compile(
+    r"(your ip address is blocked from accessing this post|"
+    r"blocked from accessing this post|"
+    r"status(?:\s*code)?\s*[:=]?\s*10204)",
     re.IGNORECASE,
 )
 RE_RETRY_MISSING_ARTIFACT = re.compile(
@@ -1446,6 +1449,32 @@ def sync_source(
             if source_cooldown_reason:
                 print(f"[network-cooldown] {source.id}: reason={source_cooldown_reason}")
 
+    def activate_source_network_cooldown(
+        blocked_until: str | None,
+        reason: str | None,
+    ) -> None:
+        nonlocal source_cooldown_active
+        nonlocal source_cooldown_remaining_hours
+        nonlocal source_cooldown_until
+        nonlocal source_cooldown_reason
+        if not blocked_until:
+            return
+        blocked_until_dt = parse_iso_datetime_utc(blocked_until)
+        source_cooldown_active = True
+        source_cooldown_until = blocked_until
+        source_cooldown_reason = reason
+        if blocked_until_dt is None:
+            source_cooldown_remaining_hours = 0.0
+            return
+        remaining_seconds = max(
+            0.0,
+            (
+                blocked_until_dt
+                - dt.datetime.now(dt.timezone.utc)
+            ).total_seconds(),
+        )
+        source_cooldown_remaining_hours = remaining_seconds / 3600.0
+
     media_before_ids = set(read_archive_ids(source.media_archive))
     configured_playlist_end = playlist_end if playlist_end is not None else source.playlist_end
     metered_skip_media = False
@@ -1586,6 +1615,7 @@ def sync_source(
 
         media_exit_code = 0
         media_error: str | None = None
+        media_blocked_error: str | None = None
         if media_command is not None:
             try:
                 media_exit_code, media_output = run_command_with_output(
@@ -1603,7 +1633,7 @@ def sync_source(
                 print(f"[sync] {source.id} media command failed: {exc}", file=sys.stderr)
             if connection is not None and not dry_run:
                 if media_error:
-                    extend_source_network_cooldown(
+                    blocked_until = extend_source_network_cooldown(
                         connection=connection,
                         source_id=source.id,
                         error_message=media_error,
@@ -1613,6 +1643,12 @@ def sync_source(
                         ),
                         blocked_at=media_started_at,
                     )
+                    if blocked_until:
+                        media_blocked_error = media_error
+                        activate_source_network_cooldown(
+                            blocked_until=blocked_until,
+                            reason=media_error,
+                        )
                 set_app_state_value(
                     connection,
                     media_discovery_state_key,
@@ -2159,13 +2195,19 @@ def sync_source(
                     retry_count=next_retry_count,
                     next_retry_at=next_retry_at,
                 )
-                extend_source_network_cooldown(
+                blocked_until = extend_source_network_cooldown(
                     connection=connection,
                     source_id=source.id,
                     error_message=fallback_error,
                     blocked_until=next_retry_at,
                     blocked_at=media_started_at,
                 )
+                if blocked_until:
+                    media_blocked_error = fallback_error
+                    activate_source_network_cooldown(
+                        blocked_until=blocked_until,
+                        reason=fallback_error,
+                    )
 
             if repaired_media_ids:
                 repaired_at = now_utc_iso()
@@ -2201,6 +2243,25 @@ def sync_source(
                     )
                 )
             )
+            media_finished_at = now_utc_iso()
+            media_succeeded = media_exit_code == 0 and media_failed_count == 0
+            if media_command is not None or media_audio_target_ids:
+                record_source_network_access(
+                    connection=connection,
+                    source=source,
+                    request_at=media_finished_at,
+                    succeeded=media_succeeded,
+                    clear_cooldown=media_succeeded,
+                    last_error=(
+                        None
+                        if media_succeeded
+                        else (
+                            _SOURCE_ACCESS_UNSET
+                            if media_blocked_error
+                            else media_stage_error
+                        )
+                    ),
+                )
             finish_download_run(
                 connection=connection,
                 run_id=media_run_id if media_run_id is not None else -1,
@@ -2209,7 +2270,7 @@ def sync_source(
                     if media_exit_code == 0 and media_failed_count == 0
                     else "error"
                 ),
-                finished_at=now_utc_iso(),
+                finished_at=media_finished_at,
                 exit_code=media_exit_code,
                 success_count=media_success_count,
                 failure_count=media_failed_count,
@@ -2395,6 +2456,7 @@ def sync_source(
 
             subs_exit_code = 0
             subs_error: str | None = None
+            subs_blocked_error: str | None = None
             if subs_command is not None:
                 try:
                     subs_exit_code, subs_output = run_command_with_output(
@@ -2477,33 +2539,59 @@ def sync_source(
                             retry_count=next_retry_count,
                             next_retry_at=next_retry_at,
                         )
-                        extend_source_network_cooldown(
+                        blocked_until = extend_source_network_cooldown(
                             connection=connection,
                             source_id=source.id,
                             error_message=failure_reason,
                             blocked_until=next_retry_at,
                             blocked_at=subs_started_at,
                         )
+                        if blocked_until:
+                            subs_blocked_error = failure_reason
+                            activate_source_network_cooldown(
+                                blocked_until=blocked_until,
+                                reason=failure_reason,
+                            )
 
+                    subs_stage_error = None if not failed_sub_ids else (
+                        "cannot build URL for some subtitle targets"
+                        if unresolved_subtitle_target_ids and subs_error is None and subs_exit_code == 0
+                        else (
+                            subs_error or (
+                                f"command exit code {subs_exit_code}"
+                                if subs_exit_code != 0
+                                else "some subtitle items are still missing"
+                            )
+                        )
+                    )
+                    subs_finished_at = now_utc_iso()
+                    subs_succeeded = not failed_sub_ids
+                    if subs_command is not None:
+                        record_source_network_access(
+                            connection=connection,
+                            source=source,
+                            request_at=subs_finished_at,
+                            succeeded=subs_succeeded,
+                            clear_cooldown=subs_succeeded,
+                            last_error=(
+                                None
+                                if subs_succeeded
+                                else (
+                                    _SOURCE_ACCESS_UNSET
+                                    if subs_blocked_error
+                                    else subs_stage_error
+                                )
+                            ),
+                        )
                     finish_download_run(
                         connection=connection,
                         run_id=subs_run_id if subs_run_id is not None else -1,
-                        status="success" if not failed_sub_ids else "error",
-                        finished_at=now_utc_iso(),
+                        status="success" if subs_succeeded else "error",
+                        finished_at=subs_finished_at,
                         exit_code=subs_exit_code,
                         success_count=len(success_sub_ids),
                         failure_count=len(failed_sub_ids),
-                        error_message=None if not failed_sub_ids else (
-                            "cannot build URL for some subtitle targets"
-                            if unresolved_subtitle_target_ids and subs_error is None and subs_exit_code == 0
-                            else (
-                                subs_error or (
-                                    f"command exit code {subs_exit_code}"
-                                    if subs_exit_code != 0
-                                    else "some subtitle items are still missing"
-                                )
-                            )
-                        ),
+                        error_message=subs_stage_error,
                     )
                     connection.commit()
 
@@ -2648,6 +2736,7 @@ def sync_source(
 
     meta_exit_code = 0
     meta_error: str | None = None
+    meta_blocked_error: str | None = None
     if metadata_command is not None:
         try:
             meta_exit_code, meta_output = run_command_with_output(
@@ -2725,33 +2814,59 @@ def sync_source(
                 retry_count=next_retry_count,
                 next_retry_at=next_retry_at,
             )
-            extend_source_network_cooldown(
+            blocked_until = extend_source_network_cooldown(
                 connection=connection,
                 source_id=source.id,
                 error_message=failure_reason,
                 blocked_until=next_retry_at,
                 blocked_at=meta_started_at,
             )
+            if blocked_until:
+                meta_blocked_error = failure_reason
+                activate_source_network_cooldown(
+                    blocked_until=blocked_until,
+                    reason=failure_reason,
+                )
 
+        meta_stage_error = None if not failed_meta_ids else (
+            "cannot build URL for some metadata targets"
+            if unresolved_metadata_target_ids and meta_error is None and meta_exit_code == 0
+            else (
+                meta_error or (
+                    f"command exit code {meta_exit_code}"
+                    if meta_exit_code != 0
+                    else "some metadata items are still missing"
+                )
+            )
+        )
+        meta_finished_at = now_utc_iso()
+        meta_succeeded = not failed_meta_ids
+        if metadata_command is not None:
+            record_source_network_access(
+                connection=connection,
+                source=source,
+                request_at=meta_finished_at,
+                succeeded=meta_succeeded,
+                clear_cooldown=meta_succeeded,
+                last_error=(
+                    None
+                    if meta_succeeded
+                    else (
+                        _SOURCE_ACCESS_UNSET
+                        if meta_blocked_error
+                        else meta_stage_error
+                    )
+                ),
+            )
         finish_download_run(
             connection=connection,
             run_id=meta_run_id if meta_run_id is not None else -1,
-            status="success" if not failed_meta_ids else "error",
-            finished_at=now_utc_iso(),
+            status="success" if meta_succeeded else "error",
+            finished_at=meta_finished_at,
             exit_code=meta_exit_code,
             success_count=len(success_meta_ids),
             failure_count=len(failed_meta_ids),
-            error_message=None if not failed_meta_ids else (
-                "cannot build URL for some metadata targets"
-                if unresolved_metadata_target_ids and meta_error is None and meta_exit_code == 0
-                else (
-                    meta_error or (
-                        f"command exit code {meta_exit_code}"
-                        if meta_exit_code != 0
-                        else "some metadata items are still missing"
-                    )
-                )
-            ),
+            error_message=meta_stage_error,
         )
         connection.commit()
 
@@ -3201,12 +3316,18 @@ def create_schema(connection: sqlite3.Connection) -> None:
             blocked_until TEXT,
             last_blocked_at TEXT,
             last_error TEXT,
+            last_request_at TEXT,
+            next_request_not_before TEXT,
+            last_success_at TEXT,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (source_id) REFERENCES sources(source_id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_source_access_state_blocked_until
             ON source_access_state(blocked_until, updated_at);
+
+        CREATE INDEX IF NOT EXISTS idx_source_access_state_next_request
+            ON source_access_state(next_request_not_before, updated_at);
 
         CREATE TABLE IF NOT EXISTS worker_heartbeats (
             worker_id TEXT PRIMARY KEY,
@@ -3288,6 +3409,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
         """
     )
     ensure_videos_loudness_columns(connection)
+    ensure_source_access_state_columns(connection)
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
     ensure_translation_stage_runs_table(connection)
@@ -3309,6 +3431,24 @@ def ensure_videos_loudness_columns(connection: sqlite3.Connection) -> None:
             continue
         connection.execute(
             f"ALTER TABLE videos ADD COLUMN {column_name} {column_type}"
+        )
+
+
+def ensure_source_access_state_columns(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA table_info(source_access_state)").fetchall()
+    if not rows:
+        return
+    existing_columns = {str(row[1]) for row in rows}
+    required_columns = {
+        "last_request_at": "TEXT",
+        "next_request_not_before": "TEXT",
+        "last_success_at": "TEXT",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name in existing_columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE source_access_state ADD COLUMN {column_name} {column_type}"
         )
 
 
@@ -4377,7 +4517,14 @@ def is_blocked_or_forbidden_error(error_message: str | None) -> bool:
     text = str(error_message or "").strip()
     if not text:
         return False
-    return RE_RETRY_BLOCKED_OR_FORBIDDEN.search(text) is not None
+    if RE_RETRY_TIKTOK_BLOCKED.search(text) is not None:
+        return True
+    lowered = text.lower()
+    return (
+        "tiktok" in lowered
+        and "403" in lowered
+        and "forbidden" in lowered
+    )
 
 
 def is_missing_artifact_error(error_message: str | None) -> bool:
@@ -4730,14 +4877,93 @@ def get_source_network_cooldown_state(
     return True, remaining_hours, blocked_until_text, last_error
 
 
+def get_source_network_spacing_state(
+    connection: sqlite3.Connection,
+    source_id: str,
+    now_dt: dt.datetime | None = None,
+) -> tuple[bool, float, str | None]:
+    now_value = now_dt or dt.datetime.now(dt.timezone.utc)
+    row = connection.execute(
+        """
+        SELECT next_request_not_before
+        FROM source_access_state
+        WHERE source_id = ?
+        """,
+        (source_id,),
+    ).fetchone()
+    if row is None or row[0] in (None, ""):
+        return False, 0.0, None
+
+    next_request_text = str(row[0])
+    next_request_dt = parse_iso_datetime_utc(next_request_text)
+    if next_request_dt is None or now_value >= next_request_dt:
+        return False, 0.0, next_request_text
+
+    remaining_seconds = max(0.0, (next_request_dt - now_value).total_seconds())
+    return True, remaining_seconds, next_request_text
+
+
+def compute_source_network_min_interval_seconds(source: SourceConfig) -> int:
+    return max(0, int(source.sleep_interval))
+
+
+def compute_source_next_request_not_before_iso(
+    source: SourceConfig,
+    from_dt: dt.datetime | None = None,
+) -> str | None:
+    delay_seconds = compute_source_network_min_interval_seconds(source)
+    if delay_seconds <= 0:
+        return None
+    base_dt = from_dt or dt.datetime.now(dt.timezone.utc)
+    next_dt = base_dt + dt.timedelta(seconds=delay_seconds)
+    return next_dt.replace(microsecond=0).isoformat()
+
+
 def upsert_source_access_state(
     connection: sqlite3.Connection,
     source_id: str,
-    blocked_until: str | None,
-    last_blocked_at: str | None,
-    last_error: str | None,
-    updated_at: str,
+    blocked_until: Any = _SOURCE_ACCESS_UNSET,
+    last_blocked_at: Any = _SOURCE_ACCESS_UNSET,
+    last_error: Any = _SOURCE_ACCESS_UNSET,
+    last_request_at: Any = _SOURCE_ACCESS_UNSET,
+    next_request_not_before: Any = _SOURCE_ACCESS_UNSET,
+    last_success_at: Any = _SOURCE_ACCESS_UNSET,
+    updated_at: str | None = None,
 ) -> None:
+    updated_at_value = str(updated_at or now_utc_iso())
+    current = connection.execute(
+        """
+        SELECT
+            blocked_until,
+            last_blocked_at,
+            last_error,
+            last_request_at,
+            next_request_not_before,
+            last_success_at
+        FROM source_access_state
+        WHERE source_id = ?
+        """,
+        (source_id,),
+    ).fetchone()
+    current_values = (
+        current if current is not None else (None, None, None, None, None, None)
+    )
+    blocked_until_value = current_values[0] if blocked_until is _SOURCE_ACCESS_UNSET else blocked_until
+    last_blocked_at_value = (
+        current_values[1] if last_blocked_at is _SOURCE_ACCESS_UNSET else last_blocked_at
+    )
+    last_error_value = current_values[2] if last_error is _SOURCE_ACCESS_UNSET else last_error
+    last_request_at_value = (
+        current_values[3] if last_request_at is _SOURCE_ACCESS_UNSET else last_request_at
+    )
+    next_request_not_before_value = (
+        current_values[4]
+        if next_request_not_before is _SOURCE_ACCESS_UNSET
+        else next_request_not_before
+    )
+    last_success_at_value = (
+        current_values[5] if last_success_at is _SOURCE_ACCESS_UNSET else last_success_at
+    )
     connection.execute(
         """
         INSERT INTO source_access_state (
@@ -4745,20 +4971,29 @@ def upsert_source_access_state(
             blocked_until,
             last_blocked_at,
             last_error,
+            last_request_at,
+            next_request_not_before,
+            last_success_at,
             updated_at
-        ) VALUES (?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_id) DO UPDATE SET
             blocked_until = excluded.blocked_until,
             last_blocked_at = excluded.last_blocked_at,
             last_error = excluded.last_error,
+            last_request_at = excluded.last_request_at,
+            next_request_not_before = excluded.next_request_not_before,
+            last_success_at = excluded.last_success_at,
             updated_at = excluded.updated_at
         """,
         (
             source_id,
-            blocked_until,
-            last_blocked_at,
-            last_error,
-            updated_at,
+            blocked_until_value,
+            last_blocked_at_value,
+            last_error_value,
+            last_request_at_value,
+            next_request_not_before_value,
+            last_success_at_value,
+            updated_at_value,
         ),
     )
 
@@ -4803,6 +5038,42 @@ def extend_source_network_cooldown(
         updated_at=blocked_at_value,
     )
     return next_blocked_until
+
+
+def record_source_network_access(
+    connection: sqlite3.Connection,
+    source: SourceConfig,
+    request_at: str | None = None,
+    succeeded: bool = False,
+    clear_cooldown: bool = False,
+    last_error: str | None | object = _SOURCE_ACCESS_UNSET,
+) -> str | None:
+    request_at_value = str(request_at or now_utc_iso())
+    request_dt = parse_iso_datetime_utc(request_at_value)
+    if request_dt is None:
+        request_dt = dt.datetime.now(dt.timezone.utc)
+        request_at_value = request_dt.replace(microsecond=0).isoformat()
+    next_request_not_before = compute_source_next_request_not_before_iso(
+        source,
+        from_dt=request_dt,
+    )
+    blocked_until: Any = _SOURCE_ACCESS_UNSET
+    if clear_cooldown:
+        blocked_until = None
+    success_value: Any = _SOURCE_ACCESS_UNSET
+    if succeeded:
+        success_value = request_at_value
+    upsert_source_access_state(
+        connection=connection,
+        source_id=source.id,
+        blocked_until=blocked_until,
+        last_error=last_error,
+        last_request_at=request_at_value,
+        next_request_not_before=next_request_not_before,
+        last_success_at=success_value,
+        updated_at=request_at_value,
+    )
+    return next_request_not_before
 
 
 def should_poll_source_discovery(
@@ -5099,6 +5370,17 @@ def enqueue_source_media_discovery(
             )
             if blocked_until and blocked_until > next_poll_iso:
                 next_poll_iso = blocked_until
+            record_source_network_access(
+                connection=connection,
+                source=source,
+                request_at=now_utc_iso(),
+                succeeded=False,
+                last_error=(
+                    _SOURCE_ACCESS_UNSET
+                    if blocked_until
+                    else str(exc)
+                ),
+            )
             upsert_source_poll_state(
                 connection=connection,
                 source_id=source.id,
@@ -5140,6 +5422,14 @@ def enqueue_source_media_discovery(
         last_poll_at=now_iso,
         next_poll_at=next_poll_iso,
         updated_at=now_iso,
+    )
+    record_source_network_access(
+        connection=connection,
+        source=source,
+        request_at=now_utc_iso(),
+        succeeded=True,
+        clear_cooldown=True,
+        last_error=None,
     )
     connection.commit()
 
@@ -5330,7 +5620,7 @@ def lease_next_work_item(
         lease_token = uuid.uuid4().hex
 
         connection.execute("BEGIN IMMEDIATE")
-        candidate_params: list[Any] = [*normalized_stages, now_iso, now_iso]
+        candidate_params: list[Any] = [*normalized_stages, now_iso, now_iso, now_iso]
         order_by = "priority ASC, updated_at ASC, id ASC"
         if avoid_source_id:
             order_by = (
@@ -5361,8 +5651,16 @@ def lease_next_work_item(
                           SELECT 1
                           FROM source_access_state AS access
                           WHERE access.source_id = work_items.source_id
-                            AND access.blocked_until IS NOT NULL
-                            AND access.blocked_until > ?
+                            AND (
+                                (
+                                    access.blocked_until IS NOT NULL
+                                    AND access.blocked_until > ?
+                                )
+                                OR (
+                                    access.next_request_not_before IS NOT NULL
+                                    AND access.next_request_not_before > ?
+                                )
+                            )
                       )
                   )
             ),
