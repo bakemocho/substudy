@@ -1052,29 +1052,68 @@ def run_command(command: list[str], dry_run: bool, raise_on_error: bool = True) 
     return completed.returncode
 
 
+def _stream_text_pipe(
+    pipe: Any,
+    target: Any,
+    chunks: list[str],
+) -> None:
+    if pipe is None:
+        return
+    try:
+        while True:
+            chunk = pipe.readline()
+            if chunk == "":
+                break
+            chunks.append(chunk)
+            target.write(chunk)
+            target.flush()
+    finally:
+        pipe.close()
+
+
 def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str]:
     print("$", shlex.join(command))
     if dry_run:
         return (0, "")
 
-    completed = subprocess.run(
+    completed = subprocess.Popen(
         command,
-        check=False,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
     )
-    stdout_text = completed.stdout or ""
-    stderr_text = completed.stderr or ""
-    if stdout_text:
-        sys.stdout.write(stdout_text)
-    if stderr_text:
-        sys.stderr.write(stderr_text)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_thread = threading.Thread(
+        target=_stream_text_pipe,
+        kwargs={
+            "pipe": completed.stdout,
+            "target": sys.stdout,
+            "chunks": stdout_chunks,
+        },
+    )
+    stderr_thread = threading.Thread(
+        target=_stream_text_pipe,
+        kwargs={
+            "pipe": completed.stderr,
+            "target": sys.stderr,
+            "chunks": stderr_chunks,
+        },
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    return_code = completed.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout_text = "".join(stdout_chunks)
+    stderr_text = "".join(stderr_chunks)
     combined_output = "\n".join(
         part.strip()
         for part in (stderr_text, stdout_text)
         if str(part or "").strip()
     )
-    return (completed.returncode, combined_output)
+    return (return_code, combined_output)
 
 
 def summarize_command_failure(output_text: str | None, exit_code: int) -> str:

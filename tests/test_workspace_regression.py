@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 import datetime as dt
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 import urllib.request
 from pathlib import Path
@@ -95,6 +95,36 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertEqual(by_name["translation_qa.jsonl"]["kind"], "translation_qa")
         self.assertTrue(str(by_name["review_hints.jsonl"]["open_url"]).startswith("/artifact/"))
         self.assertIn("?download=1", str(by_name["review_hints.jsonl"]["download_url"]))
+
+    def test_run_command_with_output_streams_and_returns_combined_text(self):
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            exit_code, output_text = self.mod.run_command_with_output(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys, time; "
+                        "print('out-1', flush=True); "
+                        "print('err-1', file=sys.stderr, flush=True); "
+                        "time.sleep(0.05); "
+                        "print('out-2', flush=True); "
+                        "print('err-2', file=sys.stderr, flush=True)"
+                    ),
+                ],
+                dry_run=False,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("out-1", stdout_capture.getvalue())
+        self.assertIn("out-2", stdout_capture.getvalue())
+        self.assertIn("err-1", stderr_capture.getvalue())
+        self.assertIn("err-2", stderr_capture.getvalue())
+        self.assertIn("out-1", output_text)
+        self.assertIn("out-2", output_text)
+        self.assertIn("err-1", output_text)
+        self.assertIn("err-2", output_text)
 
     def test_import_monitor_records_latest_summary(self):
         input_path = self.workspace_root / "exports" / "llm" / "enriched_missing.jsonl"
