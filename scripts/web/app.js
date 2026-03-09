@@ -6340,11 +6340,13 @@ function scrollSubtitlePanelRowIntoCenter(index, smooth = true, force = false) {
   const cardEl = elements.subtitlePanelReel.closest(".subtitle-reel-card");
   const cardRect = cardEl ? cardEl.getBoundingClientRect() : null;
   const rowCenterY = rowRect.top + (rowRect.height / 2);
+  const topSafeInset = 12;
+  const bottomSafeInset = 34;
   let desiredCenterY = reelRect.top + (reelRect.height / 2);
   if (cardRect) {
     const cardCenterY = cardRect.top + (cardRect.height / 2);
-    const minCenterY = reelRect.top + Math.max(18, rowRect.height / 2);
-    const maxCenterY = reelRect.bottom - Math.max(18, rowRect.height / 2);
+    const minCenterY = reelRect.top + Math.max(18 + topSafeInset, rowRect.height / 2 + topSafeInset);
+    const maxCenterY = reelRect.bottom - Math.max(18 + bottomSafeInset, rowRect.height / 2 + bottomSafeInset);
     desiredCenterY = Math.max(minCenterY, Math.min(maxCenterY, cardCenterY));
   }
   const deltaY = rowCenterY - desiredCenterY;

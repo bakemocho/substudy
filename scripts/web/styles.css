@@ -838,7 +838,8 @@ textarea {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 2px 4px 0 0;
+  padding: 2px 4px 28px 0;
+  scroll-padding-block: 12px 34px;
 }
 
 .subtitle-panel-empty {
