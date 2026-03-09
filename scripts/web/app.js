@@ -62,6 +62,8 @@ const PLAYBACK_TRACK_PREF_VALUES = new Set([
 ]);
 const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source";
 const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
+const SOURCE_TARGET_FILTER_STORAGE_KEY = "substudy.source_target_filter";
+const SOURCE_TARGET_TAG_STORAGE_KEY = "substudy.source_target_tag";
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -98,6 +100,25 @@ const DICT_IRREGULAR_BASE_FORMS = new Map([
   ["saw", "see"],
   ["seen", "see"],
 ]);
+
+function loadSelectedSourceTargetTags() {
+  const raw = localStorage.getItem(SOURCE_TARGET_TAG_STORAGE_KEY);
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
+    }
+  } catch (_error) {
+    // Fall back to legacy single-tag storage.
+  }
+  const single = String(raw || "").trim();
+  return single ? [single] : [];
+}
 
 const state = {
   videos: [],
@@ -271,6 +292,8 @@ const state = {
   workspaceArtifacts: [],
   sourceTargets: [],
   sourceTargetsManagedPath: "",
+  sourceTargetsFilter: String(localStorage.getItem(SOURCE_TARGET_FILTER_STORAGE_KEY) || ""),
+  sourceTargetsSelectedTags: loadSelectedSourceTargetTags(),
   workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
 };
@@ -338,12 +361,15 @@ const elements = {
   workspaceArtifacts: document.getElementById("workspaceArtifacts"),
   sourceTargetsRefreshBtn: document.getElementById("sourceTargetsRefreshBtn"),
   sourceTargetsSummary: document.getElementById("sourceTargetsSummary"),
+  sourceTargetsFilterInput: document.getElementById("sourceTargetsFilterInput"),
+  sourceTargetsTagFilters: document.getElementById("sourceTargetsTagFilters"),
   sourceTargetsList: document.getElementById("sourceTargetsList"),
   sourceTargetIdInput: document.getElementById("sourceTargetIdInput"),
   sourceTargetWatchKindSelect: document.getElementById("sourceTargetWatchKindSelect"),
   sourceTargetHandleInput: document.getElementById("sourceTargetHandleInput"),
   sourceTargetUrlInput: document.getElementById("sourceTargetUrlInput"),
   sourceTargetDataDirInput: document.getElementById("sourceTargetDataDirInput"),
+  sourceTargetTagsInput: document.getElementById("sourceTargetTagsInput"),
   sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
   sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
   sourceTargetFormHint: document.getElementById("sourceTargetFormHint"),
@@ -7010,6 +7036,55 @@ function normalizeSourceTargetHandleInput(rawValue) {
   return rawText.replace(/^@+/, "").split("/", 1)[0].trim();
 }
 
+function normalizeSourceTags(rawValue) {
+  const candidates = [];
+  if (Array.isArray(rawValue)) {
+    for (const item of rawValue) {
+      if (item === null || item === undefined) {
+        continue;
+      }
+      candidates.push(...String(item).split(/[,;\n]/));
+    }
+  } else if (rawValue !== null && rawValue !== undefined) {
+    candidates.push(...String(rawValue).split(/[,;\n]/));
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const tag = String(candidate || "").trim().replace(/\s+/g, " ");
+    if (!tag) {
+      continue;
+    }
+    const dedupeKey = tag.toLocaleLowerCase();
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    normalized.push(tag);
+  }
+  return normalized;
+}
+
+function formatSourceTags(rawValue) {
+  return normalizeSourceTags(rawValue).join(", ");
+}
+
+function createSourceTagList(rawValue, className = "source-tag-list") {
+  const tags = normalizeSourceTags(rawValue);
+  if (!tags.length) {
+    return null;
+  }
+  const list = document.createElement("div");
+  list.className = className;
+  for (const tag of tags) {
+    const chip = document.createElement("span");
+    chip.className = "source-tag-chip";
+    chip.textContent = tag;
+    list.appendChild(chip);
+  }
+  return list;
+}
+
 function sourceTargetWatchKindLabel(watchKind) {
   return String(watchKind || "").trim().toLowerCase() === "likes" ? "いいね欄" : "投稿";
 }
@@ -7039,19 +7114,401 @@ function findSourceTargetById(sourceId) {
   return null;
 }
 
+function normalizeSourceTargetFilterValue(rawValue) {
+  return String(rawValue || "").trim().toLocaleLowerCase();
+}
+
+function normalizeSourceTargetTagValue(rawValue) {
+  return String(rawValue || "").trim();
+}
+
+function normalizeSourceTargetTagSelection(rawValue) {
+  if (!Array.isArray(rawValue)) {
+    return [];
+  }
+  const selected = [];
+  const seen = new Set();
+  for (const value of rawValue) {
+    const normalized = normalizeSourceTargetTagValue(value);
+    if (!normalized) {
+      continue;
+    }
+    const dedupeKey = normalized.toLocaleLowerCase();
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+    seen.add(dedupeKey);
+    selected.push(normalized);
+  }
+  return selected;
+}
+
+function persistSourceTargetTagSelection() {
+  localStorage.setItem(
+    SOURCE_TARGET_TAG_STORAGE_KEY,
+    JSON.stringify(normalizeSourceTargetTagSelection(state.sourceTargetsSelectedTags))
+  );
+}
+
+function buildSourceTargetProcessingMap() {
+  const rows = Array.isArray(state.workspaceSourceProcessing?.sources)
+    ? state.workspaceSourceProcessing.sources
+    : [];
+  const map = new Map();
+  for (const row of rows) {
+    const sourceId = String(row?.source_id || "").trim();
+    if (!sourceId) {
+      continue;
+    }
+    map.set(sourceId, row);
+  }
+  return map;
+}
+
+function decorateSourceTargetItem(item, processingBySource) {
+  const tags = normalizeSourceTags(item?.tags);
+  const summary = processingBySource.get(String(item?.id || "").trim()) || null;
+  const videoCount = Math.max(
+    Number(item?.video_count || 0),
+    Number(summary?.total_videos || 0)
+  );
+  const pendingTotal = Number(summary?.pending_total || 0);
+  const englishSubtitlesMissing = Number(summary?.english_subtitles_missing || 0);
+  const loudnessPending = Number(summary?.loudness_pending || 0);
+  const metaMissing = Number(summary?.meta_missing || 0);
+  const mediaMissing = Number(summary?.media_missing || 0);
+  return {
+    ...item,
+    tags,
+    video_count: videoCount,
+    pending_total: pendingTotal,
+    english_subtitles_missing: englishSubtitlesMissing,
+    loudness_pending: loudnessPending,
+    meta_missing: metaMissing,
+    media_missing: mediaMissing,
+    needs_attention: pendingTotal > 0 || englishSubtitlesMissing > 0 || loudnessPending > 0 || metaMissing > 0 || mediaMissing > 0,
+  };
+}
+
+function sourceTargetMatchesFilter(item, normalizedFilter) {
+  if (!normalizedFilter) {
+    return true;
+  }
+  const tokens = normalizedFilter.split(/\s+/).filter(Boolean);
+  if (!tokens.length) {
+    return true;
+  }
+  const haystacks = [
+    String(item?.id || ""),
+    String(item?.target_handle || ""),
+    String(item?.handle || ""),
+    String(item?.url || ""),
+    String(item?.data_dir || ""),
+    ...normalizeSourceTags(item?.tags),
+  ].map((value) => value.toLocaleLowerCase());
+  return tokens.every((token) => haystacks.some((value) => value.includes(token)));
+}
+
+function sourceTargetMatchesSelectedTags(item, selectedTags) {
+  const normalizedSelectedTags = normalizeSourceTargetTagSelection(selectedTags)
+    .map((tag) => tag.toLocaleLowerCase());
+  if (!normalizedSelectedTags.length) {
+    return true;
+  }
+  const tags = normalizeSourceTags(item?.tags);
+  return normalizedSelectedTags.every((selectedTag) => {
+    if (selectedTag === "untagged") {
+      return tags.length === 0;
+    }
+    return tags.some((tag) => tag.toLocaleLowerCase() === selectedTag);
+  });
+}
+
+function buildSourceTargetTagStats(items) {
+  const statsByTag = new Map();
+  let untaggedCount = 0;
+  for (const item of items) {
+    const tags = normalizeSourceTags(item?.tags);
+    if (!tags.length) {
+      untaggedCount += 1;
+      continue;
+    }
+    for (const tag of tags) {
+      const key = tag.toLocaleLowerCase();
+      if (!statsByTag.has(key)) {
+        statsByTag.set(key, { label: tag, count: 0 });
+      }
+      statsByTag.get(key).count += 1;
+    }
+  }
+  const tags = Array.from(statsByTag.values()).sort((left, right) => (
+    Number(right?.count || 0) - Number(left?.count || 0)
+    || String(left?.label || "").localeCompare(String(right?.label || ""))
+  ));
+  return {
+    tags,
+    untaggedCount,
+  };
+}
+
+function renderSourceTargetTagFilters(allItems, matchedItems, searchFilteredItems) {
+  if (!elements.sourceTargetsTagFilters) {
+    return;
+  }
+  elements.sourceTargetsTagFilters.textContent = "";
+  const selectedTags = normalizeSourceTargetTagSelection(state.sourceTargetsSelectedTags);
+  const activeTagSet = new Set(
+    selectedTags.map((selectedTag) => selectedTag.toLocaleLowerCase())
+  );
+  const candidateItems = selectedTags.length > 0 ? matchedItems : searchFilteredItems;
+  const { tags, untaggedCount } = buildSourceTargetTagStats(candidateItems);
+  const totalCount = searchFilteredItems.length;
+  const buttonSpecs = [
+    { label: "All", value: "", count: totalCount },
+  ];
+  if (untaggedCount > 0) {
+    buttonSpecs.push({ label: "Untagged", value: "Untagged", count: untaggedCount });
+  }
+  for (const tag of tags) {
+    buttonSpecs.push({
+      label: String(tag?.label || ""),
+      value: String(tag?.label || ""),
+      count: Number(tag?.count || 0),
+    });
+  }
+
+  for (const selectedTag of selectedTags) {
+    const normalizedSelectedTag = selectedTag.toLocaleLowerCase();
+    if (buttonSpecs.some(
+      (spec) => normalizeSourceTargetTagValue(spec.value).toLocaleLowerCase() === normalizedSelectedTag
+    )) {
+      continue;
+    }
+    const selectedCount = matchedItems.filter((item) => (
+      sourceTargetMatchesSelectedTags(item, [selectedTag])
+    )).length;
+    buttonSpecs.push({
+      label: selectedTag,
+      value: selectedTag,
+      count: selectedTags.length > 0 ? matchedItems.length : selectedCount,
+    });
+  }
+
+  for (const spec of buttonSpecs) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "source-target-tag-filter-btn";
+    const normalizedSpecValue = normalizeSourceTargetTagValue(spec.value).toLocaleLowerCase();
+    if (normalizedSpecValue && activeTagSet.has(normalizedSpecValue)) {
+      button.classList.add("active");
+    }
+    if (!spec.value && activeTagSet.size === 0) {
+      button.classList.add("active");
+    }
+    button.textContent = `${spec.label} (${spec.count})`;
+    button.addEventListener("click", () => {
+      if (!spec.value) {
+        state.sourceTargetsSelectedTags = [];
+      } else if (activeTagSet.has(normalizedSpecValue)) {
+        state.sourceTargetsSelectedTags = selectedTags.filter(
+          (selectedTag) => selectedTag.toLocaleLowerCase() !== normalizedSpecValue
+        );
+      } else {
+        state.sourceTargetsSelectedTags = [...selectedTags, String(spec.value)];
+      }
+      persistSourceTargetTagSelection();
+      renderSourceTargetsPanel();
+    });
+    elements.sourceTargetsTagFilters.appendChild(button);
+  }
+}
+
+function buildGroupedSourceTargets(items, selectedTags = []) {
+  const groupsByLabel = new Map();
+  const normalizedSelectedTags = normalizeSourceTargetTagSelection(selectedTags)
+    .map((tag) => tag.toLocaleLowerCase());
+  for (const item of items) {
+    const tags = normalizeSourceTags(item?.tags);
+    let labels = tags.length ? tags : ["Untagged"];
+    if (normalizedSelectedTags.length) {
+      labels = labels.filter((label) => normalizedSelectedTags.includes(label.toLocaleLowerCase()));
+      if (!tags.length && normalizedSelectedTags.includes("untagged")) {
+        labels = ["Untagged"];
+      }
+    }
+    for (const label of labels) {
+      if (!groupsByLabel.has(label)) {
+        groupsByLabel.set(label, {
+          label,
+          itemCount: 0,
+          enabledCount: 0,
+          pendingTotal: 0,
+          englishSubtitlesMissing: 0,
+          loudnessPending: 0,
+          metaMissing: 0,
+          mediaMissing: 0,
+          items: [],
+        });
+      }
+      const group = groupsByLabel.get(label);
+      group.itemCount += 1;
+      group.enabledCount += item?.enabled ? 1 : 0;
+      group.pendingTotal += Number(item?.pending_total || 0);
+      group.englishSubtitlesMissing += Number(item?.english_subtitles_missing || 0);
+      group.loudnessPending += Number(item?.loudness_pending || 0);
+      group.metaMissing += Number(item?.meta_missing || 0);
+      group.mediaMissing += Number(item?.media_missing || 0);
+      group.items.push(item);
+    }
+  }
+
+  const groups = Array.from(groupsByLabel.values());
+  for (const group of groups) {
+    group.items.sort((left, right) => (
+      Number(right?.pending_total || 0) - Number(left?.pending_total || 0)
+      || Number(right?.video_count || 0) - Number(left?.video_count || 0)
+      || String(left?.id || "").localeCompare(String(right?.id || ""))
+    ));
+  }
+  groups.sort((left, right) => (
+    Number(String(left?.label || "") === "Untagged") - Number(String(right?.label || "") === "Untagged")
+    || Number(right?.pendingTotal || 0) - Number(left?.pendingTotal || 0)
+    || Number(right?.englishSubtitlesMissing || 0) - Number(left?.englishSubtitlesMissing || 0)
+    || Number(right?.loudnessPending || 0) - Number(left?.loudnessPending || 0)
+    || Number(right?.itemCount || 0) - Number(left?.itemCount || 0)
+    || String(left?.label || "").localeCompare(String(right?.label || ""))
+  ));
+  return groups;
+}
+
+function buildSourceTargetGroupSummary(group) {
+  return [
+    `sources:${Number(group?.itemCount || 0)}`,
+    `enabled:${Number(group?.enabledCount || 0)}`,
+    `pending:${Number(group?.pendingTotal || 0)}`,
+    `英字幕未DL:${Number(group?.englishSubtitlesMissing || 0)}`,
+    `loudness未処理:${Number(group?.loudnessPending || 0)}`,
+  ].join(" • ");
+}
+
+function renderSourceTargetItemRow(item) {
+  const row = document.createElement("article");
+  row.className = "workspace-item compact source-target-item";
+  if (item?.needs_attention) {
+    row.classList.add("attention");
+  }
+
+  const head = document.createElement("div");
+  head.className = "workspace-item-head";
+
+  const title = document.createElement("p");
+  title.className = "workspace-item-title";
+  title.textContent = `${String(item?.id || "")} • ${sourceTargetWatchKindLabel(item?.watch_kind)}`;
+
+  const badges = document.createElement("div");
+  badges.className = "source-target-badges";
+
+  const enabledBadge = document.createElement("span");
+  enabledBadge.className = "workspace-badge";
+  enabledBadge.textContent = Boolean(item?.enabled) ? "enabled" : "disabled";
+  if (!item?.enabled) {
+    enabledBadge.classList.add("missing");
+  }
+  badges.appendChild(enabledBadge);
+
+  if (Number(item?.pending_total || 0) > 0) {
+    const pendingBadge = document.createElement("span");
+    pendingBadge.className = "workspace-badge missing";
+    pendingBadge.textContent = `pending ${Number(item?.pending_total || 0)}`;
+    badges.appendChild(pendingBadge);
+  }
+
+  head.appendChild(title);
+  head.appendChild(badges);
+
+  const meta = document.createElement("p");
+  meta.className = "workspace-item-meta";
+  meta.textContent = `@${String(item?.target_handle || item?.handle || "-")} • origin:${sourceTargetOriginLabel(item?.origin)} • videos:${Number(item?.video_count || 0)} • 英字幕未DL:${Number(item?.english_subtitles_missing || 0)} • loudness未処理:${Number(item?.loudness_pending || 0)}`;
+
+  const url = document.createElement("p");
+  url.className = "workspace-item-meta";
+  url.textContent = String(item?.url || "");
+
+  const tagList = createSourceTagList(item?.tags);
+
+  const actions = document.createElement("div");
+  actions.className = "workspace-artifact-actions";
+
+  const editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.className = "workspace-jump-btn workspace-artifact-btn";
+  editBtn.textContent = "編集";
+  editBtn.addEventListener("click", () => {
+    const sourceId = String(item?.id || "").trim();
+    setSourceTargetFormFromItem(item);
+    setStatus(`フォームに読み込みました: ${sourceId}`, "ok");
+  });
+  actions.appendChild(editBtn);
+
+  const toggleBtn = document.createElement("button");
+  toggleBtn.type = "button";
+  toggleBtn.className = "workspace-jump-btn workspace-artifact-btn";
+  const enableNext = !Boolean(item?.enabled);
+  toggleBtn.textContent = enableNext ? "有効化" : "無効化";
+  toggleBtn.addEventListener("click", () => {
+    const payload = buildSourceTargetPayloadFromItem(item, { enabled: enableNext });
+    upsertSourceTarget(
+      payload,
+      `${String(item?.id || "")} を${enableNext ? "有効化" : "無効化"}しました。`
+    ).catch((error) => setStatus(error.message, "error"));
+  });
+  actions.appendChild(toggleBtn);
+
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "workspace-jump-btn workspace-artifact-btn";
+  const origin = String(item?.origin || "").trim().toLowerCase();
+  if (origin === "managed_override") {
+    removeBtn.textContent = "override解除";
+  } else {
+    removeBtn.textContent = "削除";
+  }
+  if (origin === "config") {
+    removeBtn.disabled = true;
+    removeBtn.title = "config 側の定義はここからは削除できません。";
+  } else {
+    removeBtn.addEventListener("click", () => {
+      removeSourceTargetOverride(item).catch((error) => setStatus(error.message, "error"));
+    });
+  }
+  actions.appendChild(removeBtn);
+
+  row.appendChild(head);
+  row.appendChild(meta);
+  if (tagList) {
+    row.appendChild(tagList);
+  }
+  if (url.textContent) {
+    row.appendChild(url);
+  }
+  row.appendChild(actions);
+  return row;
+}
+
 function refreshSourceTargetFormState() {
   const sourceId = String(elements.sourceTargetIdInput?.value || "").trim();
   const existingItem = findSourceTargetById(sourceId);
+  const groupingHint = " タグを複数付けると、一覧では各タグの section に重複表示されます。";
   if (elements.sourceTargetSaveBtn) {
     elements.sourceTargetSaveBtn.textContent = existingItem ? "更新" : "追加";
   }
   if (elements.sourceTargetFormHint) {
     if (!sourceId) {
-      elements.sourceTargetFormHint.textContent = "source id が既存なら更新、未登録なら追加します。";
+      elements.sourceTargetFormHint.textContent = `source id が既存なら更新、未登録なら追加します。${groupingHint}`;
     } else if (existingItem) {
-      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は既存です。保存で更新します。`;
+      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は既存です。保存で更新します。${groupingHint}`;
     } else {
-      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は未登録です。保存で追加します。`;
+      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は未登録です。保存で追加します。${groupingHint}`;
     }
   }
 }
@@ -7075,6 +7532,9 @@ function setSourceTargetFormFromItem(item = null) {
   if (elements.sourceTargetDataDirInput) {
     elements.sourceTargetDataDirInput.value = target ? String(target.data_dir || "") : "";
   }
+  if (elements.sourceTargetTagsInput) {
+    elements.sourceTargetTagsInput.value = target ? formatSourceTags(target.tags) : "";
+  }
   if (elements.sourceTargetEnabledInput) {
     elements.sourceTargetEnabledInput.checked = target ? Boolean(target.enabled) : true;
   }
@@ -7088,6 +7548,7 @@ function buildSourceTargetPayloadFromItem(item, overrides = {}) {
     target_handle: String(item?.target_handle || item?.handle || ""),
     url: String(item?.url || ""),
     data_dir: String(item?.data_dir || ""),
+    tags: normalizeSourceTags(item?.tags),
     enabled: Boolean(item?.enabled),
     ...overrides,
   };
@@ -7097,6 +7558,7 @@ function buildSourceTargetPayloadFromItem(item, overrides = {}) {
     target_handle: normalizeSourceTargetHandleInput(merged.target_handle),
     url: String(merged.url || "").trim(),
     data_dir: String(merged.data_dir || "").trim(),
+    tags: normalizeSourceTags(merged.tags),
     enabled: Boolean(merged.enabled),
   };
   return payload;
@@ -7110,6 +7572,7 @@ function buildSourceTargetPayloadFromForm() {
   const targetHandle = normalizeSourceTargetHandleInput(elements.sourceTargetHandleInput?.value || "");
   const url = String(elements.sourceTargetUrlInput?.value || "").trim();
   const dataDir = String(elements.sourceTargetDataDirInput?.value || "").trim();
+  const tags = normalizeSourceTags(elements.sourceTargetTagsInput?.value || "");
   const enabled = Boolean(elements.sourceTargetEnabledInput?.checked);
   if (!id) {
     throw new Error("source id を入力してください。");
@@ -7123,6 +7586,7 @@ function buildSourceTargetPayloadFromForm() {
     target_handle: targetHandle,
     url,
     data_dir: dataDir,
+    tags,
     enabled,
   };
 }
@@ -7162,108 +7626,93 @@ async function removeSourceTargetOverride(item) {
 }
 
 function renderSourceTargetsPanel() {
-  const targets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
+  const rawTargets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
+  const processingBySource = buildSourceTargetProcessingMap();
+  const normalizedFilter = normalizeSourceTargetFilterValue(
+    elements.sourceTargetsFilterInput?.value || state.sourceTargetsFilter
+  );
+  const selectedTags = normalizeSourceTargetTagSelection(state.sourceTargetsSelectedTags);
+  const decoratedTargets = rawTargets.map((item) => decorateSourceTargetItem(item, processingBySource));
+  const searchFilteredTargets = decoratedTargets.filter((item) => (
+    sourceTargetMatchesFilter(item, normalizedFilter)
+  ));
+  const targets = searchFilteredTargets.filter((item) => (
+    sourceTargetMatchesFilter(item, normalizedFilter)
+    && sourceTargetMatchesSelectedTags(item, selectedTags)
+  ));
+  renderSourceTargetTagFilters(decoratedTargets, targets, searchFilteredTargets);
   const enabledCount = targets.filter((item) => Boolean(item?.enabled)).length;
   const likesCount = targets.filter(
     (item) => String(item?.watch_kind || "").trim().toLowerCase() === "likes"
   ).length;
+  const attentionCount = targets.filter((item) => Boolean(item?.needs_attention)).length;
+  const uniqueTags = new Set();
+  for (const item of targets) {
+    for (const tag of normalizeSourceTags(item?.tags)) {
+      uniqueTags.add(tag.toLocaleLowerCase());
+    }
+  }
+  const groups = buildGroupedSourceTargets(targets, selectedTags);
   if (elements.sourceTargetsSummary) {
     const managedPath = String(state.sourceTargetsManagedPath || "").trim();
-    const summary = `targets:${targets.length} • enabled:${enabledCount} • likes:${likesCount}`;
+    const totalLabel = rawTargets.length === targets.length
+      ? `targets:${targets.length}`
+      : `targets:${targets.length}/${rawTargets.length}`;
+    const tagLabel = selectedTags.length ? ` • selected:${selectedTags.join(",")}` : "";
+    const summary = `${totalLabel} • groups:${groups.length} • enabled:${enabledCount} • likes:${likesCount} • attention:${attentionCount} • tags:${uniqueTags.size}${tagLabel}`;
     elements.sourceTargetsSummary.textContent = managedPath
       ? `${summary} • managed:${managedPath}`
       : summary;
   }
+  if (!elements.sourceTargetsList) {
+    return;
+  }
+  elements.sourceTargetsList.textContent = "";
+  if (!groups.length) {
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = rawTargets.length > 0
+      ? "条件に一致するターゲットはありません。"
+      : "監視ターゲットは未設定です。";
+    elements.sourceTargetsList.appendChild(empty);
+    return;
+  }
 
-  renderWorkspaceList(
-    elements.sourceTargetsList,
-    targets,
-    (item) => {
-      const row = document.createElement("article");
-      row.className = "workspace-item compact source-target-item";
+  groups.forEach((group, index) => {
+    const details = document.createElement("details");
+    details.className = "source-target-group";
+    if (normalizedFilter || Number(group?.pendingTotal || 0) > 0 || index < 2) {
+      details.open = true;
+    }
 
-      const head = document.createElement("div");
-      head.className = "workspace-item-head";
+    const summary = document.createElement("summary");
+    summary.className = "source-target-group-summary";
 
-      const title = document.createElement("p");
-      title.className = "workspace-item-title";
-      title.textContent = `${String(item?.id || "")} • ${sourceTargetWatchKindLabel(item?.watch_kind)}`;
+    const head = document.createElement("div");
+    head.className = "source-target-group-head";
 
-      const badge = document.createElement("span");
-      badge.className = "workspace-badge";
-      badge.textContent = Boolean(item?.enabled) ? "enabled" : "disabled";
-      if (!item?.enabled) {
-        badge.classList.add("missing");
-      }
+    const title = document.createElement("span");
+    title.className = "source-target-group-title";
+    title.textContent = String(group?.label || "Untagged");
 
-      head.appendChild(title);
-      head.appendChild(badge);
+    const meta = document.createElement("span");
+    meta.className = "source-target-group-meta";
+    meta.textContent = buildSourceTargetGroupSummary(group);
 
-      const meta = document.createElement("p");
-      meta.className = "workspace-item-meta";
-      meta.textContent = `@${String(item?.target_handle || item?.handle || "-")} • origin:${sourceTargetOriginLabel(item?.origin)} • videos:${Number(item?.video_count || 0)}`;
+    head.appendChild(title);
+    head.appendChild(meta);
+    summary.appendChild(head);
 
-      const url = document.createElement("p");
-      url.className = "workspace-item-meta";
-      url.textContent = String(item?.url || "");
+    const list = document.createElement("div");
+    list.className = "source-target-group-list";
+    for (const item of group.items) {
+      list.appendChild(renderSourceTargetItemRow(item));
+    }
 
-      const actions = document.createElement("div");
-      actions.className = "workspace-artifact-actions";
-
-      const editBtn = document.createElement("button");
-      editBtn.type = "button";
-      editBtn.className = "workspace-jump-btn workspace-artifact-btn";
-      editBtn.textContent = "編集";
-      editBtn.addEventListener("click", () => {
-        const sourceId = String(item?.id || "").trim();
-        setSourceTargetFormFromItem(item);
-        setStatus(`フォームに読み込みました: ${sourceId}`, "ok");
-      });
-      actions.appendChild(editBtn);
-
-      const toggleBtn = document.createElement("button");
-      toggleBtn.type = "button";
-      toggleBtn.className = "workspace-jump-btn workspace-artifact-btn";
-      const enableNext = !Boolean(item?.enabled);
-      toggleBtn.textContent = enableNext ? "有効化" : "無効化";
-      toggleBtn.addEventListener("click", () => {
-        const payload = buildSourceTargetPayloadFromItem(item, { enabled: enableNext });
-        upsertSourceTarget(
-          payload,
-          `${String(item?.id || "")} を${enableNext ? "有効化" : "無効化"}しました。`
-        ).catch((error) => setStatus(error.message, "error"));
-      });
-      actions.appendChild(toggleBtn);
-
-      const removeBtn = document.createElement("button");
-      removeBtn.type = "button";
-      removeBtn.className = "workspace-jump-btn workspace-artifact-btn";
-      const origin = String(item?.origin || "").trim().toLowerCase();
-      if (origin === "managed_override") {
-        removeBtn.textContent = "override解除";
-      } else {
-        removeBtn.textContent = "削除";
-      }
-      if (origin === "config") {
-        removeBtn.disabled = true;
-        removeBtn.title = "config 側の定義はここからは削除できません。";
-      } else {
-        removeBtn.addEventListener("click", () => {
-          removeSourceTargetOverride(item).catch((error) => setStatus(error.message, "error"));
-        });
-      }
-      actions.appendChild(removeBtn);
-
-      row.appendChild(head);
-      row.appendChild(meta);
-      if (url.textContent) {
-        row.appendChild(url);
-      }
-      row.appendChild(actions);
-      return row;
-    },
-    "監視ターゲットは未設定です。"
-  );
+    details.appendChild(summary);
+    details.appendChild(list);
+    elements.sourceTargetsList.appendChild(details);
+  });
 }
 
 async function loadSourceTargets(options = {}) {
@@ -7362,6 +7811,8 @@ function buildWorkspaceSourceSummaryCard(summary) {
   head.appendChild(title);
   head.appendChild(badge);
 
+  const tagList = createSourceTagList(summary?.tags, "source-tag-list workspace-source-tag-list");
+
   const body = document.createElement("div");
   body.className = "workspace-source-status-body";
 
@@ -7453,6 +7904,9 @@ function buildWorkspaceSourceSummaryCard(summary) {
   body.appendChild(detail);
 
   card.appendChild(head);
+  if (tagList) {
+    card.appendChild(tagList);
+  }
   card.appendChild(body);
   return card;
 }
@@ -7930,6 +8384,7 @@ function renderWorkspacePanels() {
   renderWorkspacePendingFailures();
   renderWorkspaceImportRuns();
   renderWorkspaceArtifacts();
+  renderSourceTargetsPanel();
 }
 
 async function loadWorkspaceData(options = {}) {
@@ -8987,6 +9442,13 @@ function bindEvents() {
       resetControlsToggleFade();
     });
   }
+  if (elements.sourceTargetsFilterInput) {
+    elements.sourceTargetsFilterInput.addEventListener("input", () => {
+      state.sourceTargetsFilter = String(elements.sourceTargetsFilterInput.value || "");
+      localStorage.setItem(SOURCE_TARGET_FILTER_STORAGE_KEY, state.sourceTargetsFilter);
+      renderSourceTargetsPanel();
+    });
+  }
   if (elements.sourceTargetSaveBtn) {
     elements.sourceTargetSaveBtn.addEventListener("click", () => {
       let payload = null;
@@ -9265,6 +9727,9 @@ async function initialize() {
   resetWorkspaceState();
   renderWorkspacePanels();
   setSourceTargetFormFromItem(null);
+  if (elements.sourceTargetsFilterInput) {
+    elements.sourceTargetsFilterInput.value = state.sourceTargetsFilter;
+  }
   renderSourceTargetsPanel();
   bindEvents();
 

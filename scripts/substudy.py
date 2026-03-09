@@ -144,6 +144,7 @@ class SourceConfig:
     id: str
     platform: str
     url: str
+    tags: list[str]
     watch_kind: str
     target_handle: str | None
     enabled: bool
@@ -549,6 +550,34 @@ def normalize_source_watch_kind(raw_value: Any) -> str:
     return SOURCE_WATCH_KIND_POSTS
 
 
+def normalize_source_tags(raw_value: Any) -> list[str]:
+    if raw_value in (None, ""):
+        return []
+    candidates: list[str] = []
+    if isinstance(raw_value, str):
+        candidates.extend(re.split(r"[,;\n]", raw_value))
+    elif isinstance(raw_value, list):
+        for item in raw_value:
+            if item in (None, ""):
+                continue
+            candidates.extend(re.split(r"[,;\n]", str(item)))
+    else:
+        candidates.append(str(raw_value))
+
+    normalized_tags: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        tag = " ".join(str(candidate or "").strip().split())
+        if not tag:
+            continue
+        dedupe_key = tag.casefold()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        normalized_tags.append(tag)
+    return normalized_tags
+
+
 def normalize_tiktok_handle(raw_value: Any) -> str | None:
     text = str(raw_value or "").strip()
     if not text:
@@ -618,6 +647,8 @@ def load_managed_source_overrides(config_path: Path) -> list[dict[str, Any]]:
             "watch_kind": watch_kind,
             "enabled": parse_bool_like(raw_item.get("enabled"), default=True),
         }
+        if "tags" in raw_item:
+            normalized["tags"] = normalize_source_tags(raw_item.get("tags"))
         if target_handle:
             normalized["target_handle"] = target_handle
             if watch_kind == SOURCE_WATCH_KIND_POSTS:
@@ -820,6 +851,7 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             id=source_id,
             platform=platform,
             url=url,
+            tags=normalize_source_tags(source_raw.get("tags")),
             watch_kind=watch_kind,
             target_handle=target_handle,
             enabled=parse_bool_like(source_raw.get("enabled"), default=True),
@@ -12428,6 +12460,7 @@ def serialize_source_target(source: SourceConfig, video_count: int = 0) -> dict[
         "id": source.id,
         "platform": source.platform,
         "enabled": bool(source.enabled),
+        "tags": list(source.tags),
         "watch_kind": source.watch_kind,
         "target_handle": source.target_handle or "",
         "handle": source.handle or "",
@@ -12660,6 +12693,16 @@ def build_web_handler(
                 return enabled_source_ids & set(allowed_source_ids)
             return enabled_source_ids
 
+        def _load_config_source_map(self) -> dict[str, SourceConfig]:
+            try:
+                configured_sources = self._load_all_config_sources()
+            except (FileNotFoundError, ValueError, KeyError):
+                return {}
+            return {
+                source.id: source
+                for source in configured_sources
+            }
+
         def _is_source_allowed(self, source_id: str) -> bool:
             scope = self._resolve_effective_source_scope()
             if scope is None:
@@ -12751,6 +12794,9 @@ def build_web_handler(
                 "enabled": parse_bool_like(payload.get("enabled"), default=True),
                 "url": url,
             }
+            tags = normalize_source_tags(payload.get("tags"))
+            if tags:
+                managed_entry["tags"] = tags
             if target_handle:
                 managed_entry["target_handle"] = target_handle
                 if watch_kind == SOURCE_WATCH_KIND_POSTS:
@@ -13407,6 +13453,10 @@ def build_web_handler(
                     source_ids=source_scope,
                     run_limit=import_run_limit,
                 )
+            source_config_by_id = self._load_config_source_map()
+            for item in cast(list[dict[str, Any]], source_processing.get("sources") or []):
+                source_config = source_config_by_id.get(str(item.get("source_id") or "").strip())
+                item["tags"] = list(source_config.tags) if source_config is not None else []
             review_hints_by_card_id = load_workspace_review_hints(workspace_root)
             review_cards = apply_workspace_review_hints(review_cards, review_hints_by_card_id)
             translation_qa_by_card_id = load_workspace_translation_qa(workspace_root)

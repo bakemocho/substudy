@@ -315,12 +315,14 @@ enabled = true
                             "target_handle": "storiesofcz",
                             "enabled": False,
                             "url": "https://www.tiktok.com/@storiesofcz",
+                            "tags": ["English", "Funny"],
                         },
                         {
                             "id": "storiesofcz_likes",
                             "watch_kind": "likes",
                             "target_handle": "storiesofcz",
                             "enabled": True,
+                            "tags": "Cooking, Science",
                         },
                     ],
                 }
@@ -336,6 +338,7 @@ enabled = true
         override_source = by_id["storiesofcz"]
         self.assertFalse(override_source.enabled)
         self.assertEqual(override_source.origin, "managed_override")
+        self.assertEqual(override_source.tags, ["English", "Funny"])
 
         likes_source = by_id["storiesofcz_likes"]
         self.assertTrue(likes_source.enabled)
@@ -343,6 +346,7 @@ enabled = true
         self.assertEqual(likes_source.target_handle, "storiesofcz")
         self.assertEqual(likes_source.url, "https://www.tiktok.com/@storiesofcz/liked")
         self.assertEqual(likes_source.origin, "managed")
+        self.assertEqual(likes_source.tags, ["Cooking", "Science"])
 
     def test_load_config_resolves_ytdlp_bin_to_absolute_path(self):
         config_dir = self.workspace_root / "config"
@@ -418,6 +422,7 @@ enabled = true
             "watch_kind": "likes",
             "target_handle": "storiesofcz",
             "enabled": True,
+            "tags": ["Funny", "English"],
         }
         request = urllib.request.Request(
             upsert_url,
@@ -437,6 +442,7 @@ enabled = true
         self.assertIn("storiesofcz_likes", by_id)
         self.assertEqual(by_id["storiesofcz_likes"]["watch_kind"], "likes")
         self.assertEqual(by_id["storiesofcz_likes"]["url"], "https://www.tiktok.com/@storiesofcz/liked")
+        self.assertEqual(by_id["storiesofcz_likes"]["tags"], ["Funny", "English"])
 
         remove_request = urllib.request.Request(
             remove_url,
@@ -612,6 +618,7 @@ enabled = true
             id="storiesofcz",
             platform="tiktok",
             url="https://www.tiktok.com/@storiesofcz",
+            tags=[],
             watch_kind="posts",
             target_handle=None,
             enabled=True,
@@ -665,6 +672,81 @@ enabled = true
 
         self.assertEqual(effective, 5.0)
         self.assertEqual(self.mod.format_ytdlp_sleep_seconds(effective), "5.0")
+
+    def test_workspace_api_source_processing_includes_source_tags(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+tags = ["English", "Funny"]
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        now_iso = dt.datetime(2026, 3, 9, 1, 2, tzinfo=dt.timezone.utc).isoformat()
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    meta_path,
+                    has_media,
+                    audio_loudness_analyzed_at,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("alpha", "7611111111111111111", "/tmp/alpha.info.json", 1, now_iso, now_iso),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("alpha", "7611111111111111111", "en", "/tmp/alpha.en.vtt", "vtt"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        workspace_url = f"http://{host}:{port}/api/workspace"
+        with urllib.request.urlopen(workspace_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        sources = payload.get("source_processing", {}).get("sources", [])
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["source_id"], "alpha")
+        self.assertEqual(sources[0]["tags"], ["English", "Funny"])
 
     def test_resolve_impersonate_flags_auto_prefers_chrome(self):
         config_dir = self.workspace_root / "config"

@@ -57,6 +57,9 @@ platform = "tiktok"
 # target_handle = "example_creator"
 url = "https://www.tiktok.com/@example_creator"
 enabled = true
+# Optional source classification tags. The first tag is used as the primary
+# group in the Web UI target manager.
+tags = ["English", "Funny"]
 
 # Paths can be absolute or relative. Relative paths are resolved from data_dir.
 data_dir = "example_creator"

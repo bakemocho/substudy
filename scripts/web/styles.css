@@ -1221,6 +1221,26 @@ textarea {
   align-items: start;
 }
 
+.source-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.source-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(143, 164, 235, 0.28);
+  background: rgba(26, 42, 78, 0.5);
+  color: #dbe6ff;
+  font-size: 0.68rem;
+  line-height: 1;
+  letter-spacing: 0.02em;
+}
+
 .workspace-source-chart-wrap {
   display: grid;
   gap: 8px;
@@ -1270,6 +1290,10 @@ textarea {
   display: grid;
   gap: 10px;
   min-width: 0;
+}
+
+.workspace-source-tag-list {
+  margin-top: -2px;
 }
 
 .workspace-source-legend {
@@ -1335,10 +1359,60 @@ textarea {
   max-height: 28vh;
 }
 
+.source-target-toolbar {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.source-target-tag-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.source-target-tag-filter-btn {
+  width: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(143, 164, 235, 0.28);
+  background: rgba(18, 30, 56, 0.52);
+  color: #c7d8ff;
+  border-radius: 999px;
+  padding: 4px 12px;
+  min-height: 22px;
+  font-size: 0.66rem;
+  font-family: "Noto Sans JP", sans-serif;
+  letter-spacing: 0;
+  line-height: 1.05;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease, color 140ms ease;
+}
+
+.source-target-tag-filter-btn:hover {
+  border-color: rgba(166, 190, 255, 0.48);
+  background: rgba(28, 45, 79, 0.74);
+}
+
+.source-target-tag-filter-btn.active {
+  border-color: rgba(255, 181, 95, 0.56);
+  background: rgba(98, 63, 18, 0.78);
+  color: #fff0cc;
+  transform: translateY(-1px);
+}
+
 .source-target-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+}
+
+.source-target-tags-field {
+  grid-column: 1 / -1;
 }
 
 .source-target-enabled-field input[type="checkbox"] {
@@ -1350,6 +1424,63 @@ textarea {
 
 .source-target-item .workspace-artifact-actions {
   margin-top: 2px;
+}
+
+.source-target-item.attention {
+  border-color: rgba(255, 181, 95, 0.38);
+}
+
+.source-target-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.source-target-group {
+  border: 1px solid rgba(143, 164, 235, 0.22);
+  border-radius: 14px;
+  background: rgba(8, 14, 30, 0.48);
+  overflow: hidden;
+}
+
+.source-target-group + .source-target-group {
+  margin-top: 10px;
+}
+
+.source-target-group-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 10px 12px;
+  background:
+    linear-gradient(180deg, rgba(123, 158, 255, 0.1), rgba(8, 14, 30, 0)),
+    rgba(13, 22, 43, 0.72);
+}
+
+.source-target-group-summary::-webkit-details-marker {
+  display: none;
+}
+
+.source-target-group-head {
+  display: grid;
+  gap: 4px;
+}
+
+.source-target-group-title {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 0.96rem;
+  color: #f2f6ff;
+}
+
+.source-target-group-meta {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.source-target-group-list {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
 }
 
 .shortcuts ul {

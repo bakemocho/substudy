@@ -171,6 +171,13 @@
               <button id="sourceTargetsRefreshBtn" class="workspace-refresh-btn" type="button">更新</button>
             </div>
             <p id="sourceTargetsSummary" class="hint">監視ターゲットを読み込み中...</p>
+            <div class="source-target-toolbar">
+              <label class="field">
+                <span>tag / source filter</span>
+                <input id="sourceTargetsFilterInput" type="text" placeholder="例: cooking, funny, tinny" />
+              </label>
+              <div id="sourceTargetsTagFilters" class="source-target-tag-filters"></div>
+            </div>
             <div id="sourceTargetsList" class="workspace-list compact"></div>
 
             <details class="bookmark-inline-tools source-target-editor">
@@ -198,6 +205,10 @@
                 <label class="field">
                   <span>保存先 data_dir（任意）</span>
                   <input id="sourceTargetDataDirInput" type="text" placeholder="未入力なら source id" />
+                </label>
+                <label class="field source-target-tags-field">
+                  <span>タグ（カンマ区切り）</span>
+                  <input id="sourceTargetTagsInput" type="text" placeholder="例: English, Funny, Cooking" />
                 </label>
                 <label class="field source-target-enabled-field">
                   <span>有効化</span>
