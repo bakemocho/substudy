@@ -365,6 +365,7 @@ const elements = {
   sourceTargetsFilterInput: document.getElementById("sourceTargetsFilterInput"),
   sourceTargetsTagFilters: document.getElementById("sourceTargetsTagFilters"),
   sourceTargetsList: document.getElementById("sourceTargetsList"),
+  sourceTargetEditor: document.getElementById("sourceTargetEditor"),
   sourceTargetIdInput: document.getElementById("sourceTargetIdInput"),
   sourceTargetWatchKindSelect: document.getElementById("sourceTargetWatchKindSelect"),
   sourceTargetHandleInput: document.getElementById("sourceTargetHandleInput"),
@@ -374,6 +375,7 @@ const elements = {
   sourceTargetTagSuggestions: document.getElementById("sourceTargetTagSuggestions"),
   sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
   sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
+  sourceTargetRemoveBtn: document.getElementById("sourceTargetRemoveBtn"),
   sourceTargetFormHint: document.getElementById("sourceTargetFormHint"),
   videoNote: document.getElementById("videoNote"),
   saveNoteBtn: document.getElementById("saveNoteBtn"),
@@ -7203,7 +7205,7 @@ function sourceTargetRemoveActionLabel(item) {
   if (normalized === "config") {
     return "config固定";
   }
-  return "監視解除";
+  return "アーカイブ";
 }
 
 function sourceTargetRemoveActionTitle(item) {
@@ -7214,7 +7216,7 @@ function sourceTargetRemoveActionTitle(item) {
   if (normalized === "config") {
     return "config 側の定義はここからは解除できません。";
   }
-  return "この source を監視ターゲット一覧から外します。ローカルの動画・字幕・meta は削除しません。";
+  return "この source を監視ターゲット一覧からアーカイブします。ローカルの動画・字幕・meta は削除しません。";
 }
 
 function findSourceTargetById(sourceId) {
@@ -7501,7 +7503,7 @@ function buildGroupedSourceTargets(items, selectedTags = []) {
 function buildSourceTargetGroupSummary(group) {
   return [
     `sources:${Number(group?.itemCount || 0)}`,
-    `enabled:${Number(group?.enabledCount || 0)}`,
+    `監視中:${Number(group?.enabledCount || 0)}`,
     `未完了(tracked):${Number(group?.pendingTotal || 0)}`,
     `英字幕未DL:${Number(group?.englishSubtitlesMissing || 0)}`,
     `loudness未処理:${Number(group?.loudnessPending || 0)}`,
@@ -7527,7 +7529,7 @@ function renderSourceTargetItemRow(item) {
 
   const enabledBadge = document.createElement("span");
   enabledBadge.className = "workspace-badge";
-  enabledBadge.textContent = Boolean(item?.enabled) ? "enabled" : "disabled";
+  enabledBadge.textContent = Boolean(item?.enabled) ? "監視中" : "監視停止";
   if (!item?.enabled) {
     enabledBadge.classList.add("missing");
   }
@@ -7563,23 +7565,12 @@ function renderSourceTargetItemRow(item) {
   editBtn.addEventListener("click", () => {
     const sourceId = String(item?.id || "").trim();
     setSourceTargetFormFromItem(item);
+    if (elements.sourceTargetEditor) {
+      elements.sourceTargetEditor.open = true;
+    }
     setStatus(`フォームに読み込みました: ${sourceId}`, "ok");
   });
   actions.appendChild(editBtn);
-
-  const toggleBtn = document.createElement("button");
-  toggleBtn.type = "button";
-  toggleBtn.className = "workspace-jump-btn workspace-artifact-btn";
-  const enableNext = !Boolean(item?.enabled);
-  toggleBtn.textContent = enableNext ? "有効化" : "無効化";
-  toggleBtn.addEventListener("click", () => {
-    const payload = buildSourceTargetPayloadFromItem(item, { enabled: enableNext });
-    upsertSourceTarget(
-      payload,
-      `${String(item?.id || "")} を${enableNext ? "有効化" : "無効化"}しました。`
-    ).catch((error) => setStatus(error.message, "error"));
-  });
-  actions.appendChild(toggleBtn);
 
   const randomPlayBtn = document.createElement("button");
   randomPlayBtn.type = "button";
@@ -7593,21 +7584,6 @@ function renderSourceTargetItemRow(item) {
     });
   });
   actions.appendChild(randomPlayBtn);
-
-  const removeBtn = document.createElement("button");
-  removeBtn.type = "button";
-  removeBtn.className = "workspace-jump-btn workspace-artifact-btn";
-  const origin = String(item?.origin || "").trim().toLowerCase();
-  removeBtn.textContent = sourceTargetRemoveActionLabel(item);
-  removeBtn.title = sourceTargetRemoveActionTitle(item);
-  if (origin === "config") {
-    removeBtn.disabled = true;
-  } else {
-    removeBtn.addEventListener("click", () => {
-      removeSourceTargetOverride(item).catch((error) => setStatus(error.message, "error"));
-    });
-  }
-  actions.appendChild(removeBtn);
 
   row.appendChild(head);
   row.appendChild(meta);
@@ -7631,11 +7607,27 @@ function refreshSourceTargetFormState() {
   if (elements.sourceTargetSaveBtn) {
     elements.sourceTargetSaveBtn.textContent = existingItem ? "更新" : "追加";
   }
+  if (elements.sourceTargetRemoveBtn) {
+    if (!existingItem) {
+      elements.sourceTargetRemoveBtn.hidden = true;
+      elements.sourceTargetRemoveBtn.disabled = true;
+      elements.sourceTargetRemoveBtn.textContent = "アーカイブ";
+      elements.sourceTargetRemoveBtn.title = "";
+    } else {
+      const removeLabel = sourceTargetRemoveActionLabel(existingItem);
+      const removeTitle = sourceTargetRemoveActionTitle(existingItem);
+      const origin = String(existingItem?.origin || "").trim().toLowerCase();
+      elements.sourceTargetRemoveBtn.hidden = false;
+      elements.sourceTargetRemoveBtn.disabled = origin === "config";
+      elements.sourceTargetRemoveBtn.textContent = removeLabel;
+      elements.sourceTargetRemoveBtn.title = removeTitle;
+    }
+  }
   if (elements.sourceTargetFormHint) {
     if (!sourceId) {
       elements.sourceTargetFormHint.textContent = `source id が既存なら更新、未登録なら追加します。${groupingHint}`;
     } else if (existingItem) {
-      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は既存です。保存で更新します。${groupingHint}`;
+      elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は既存です。保存で更新します。監視停止やアーカイブなどの重要操作もこの編集欄から行ってください。${groupingHint}`;
     } else {
       elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は未登録です。保存で追加します。${groupingHint}`;
     }
@@ -7745,6 +7737,17 @@ async function removeSourceTargetOverride(item) {
     return;
   }
   const actionLabel = sourceTargetRemoveActionLabel(item);
+  const confirmed = window.confirm(
+    [
+      `${actionLabel}: ${sourceId}`,
+      sourceTargetRemoveActionTitle(item),
+      "続ける場合のみ OK を押してください。",
+    ].join("\n")
+  );
+  if (!confirmed) {
+    setStatus(`${actionLabel}をキャンセルしました: ${sourceId}`, "info");
+    return;
+  }
   const confirmation = window.prompt(
     [
       `${actionLabel}の確認: ${sourceId}`,
@@ -7806,7 +7809,7 @@ function renderSourceTargetsPanel() {
       ? `targets:${targets.length}`
       : `targets:${targets.length}/${rawTargets.length}`;
     const tagLabel = selectedTags.length ? ` • selected:${selectedTags.join(",")}` : "";
-    const summary = `${totalLabel} • groups:${groups.length} • enabled:${enabledCount} • likes:${likesCount} • attention:${attentionCount} • tags:${uniqueTags.size}${tagLabel}`;
+    const summary = `${totalLabel} • groups:${groups.length} • 監視中:${enabledCount} • likes:${likesCount} • attention:${attentionCount} • tags:${uniqueTags.size}${tagLabel}`;
     elements.sourceTargetsSummary.textContent = managedPath
       ? `${summary} • managed:${managedPath}`
       : summary;
@@ -9647,6 +9650,18 @@ function bindEvents() {
         .catch((error) => {
           setStatus(error.message, "error");
         });
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.sourceTargetRemoveBtn) {
+    elements.sourceTargetRemoveBtn.addEventListener("click", () => {
+      const sourceId = String(elements.sourceTargetIdInput?.value || "").trim();
+      const existingItem = findSourceTargetById(sourceId);
+      if (!existingItem) {
+        setStatus("既存の監視ターゲットをフォームに読み込んでから実行してください。", "error");
+        return;
+      }
+      removeSourceTargetOverride(existingItem).catch((error) => setStatus(error.message, "error"));
       resetControlsToggleFade();
     });
   }

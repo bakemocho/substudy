@@ -1472,6 +1472,31 @@ textarea {
   margin: 0;
 }
 
+.source-target-archive-btn {
+  width: auto;
+  margin-left: auto;
+  align-self: center;
+  padding: 4px 8px;
+  min-height: 0;
+  border-radius: 999px;
+  border-color: rgba(198, 120, 120, 0.24);
+  background: rgba(46, 16, 20, 0.24);
+  color: rgba(242, 192, 192, 0.8);
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+}
+
+.source-target-archive-btn:hover {
+  border-color: rgba(212, 132, 132, 0.38);
+  background: rgba(60, 21, 26, 0.42);
+  color: rgba(255, 214, 214, 0.92);
+}
+
+.source-target-archive-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .source-target-item .workspace-artifact-actions {
   margin-top: 2px;
 }

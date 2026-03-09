@@ -180,8 +180,8 @@
             </div>
             <div id="sourceTargetsList" class="workspace-list compact"></div>
 
-            <details class="bookmark-inline-tools source-target-editor">
-              <summary>ターゲット追加 / 更新</summary>
+            <details id="sourceTargetEditor" class="bookmark-inline-tools source-target-editor">
+              <summary>ターゲット追加 / 編集</summary>
               <div class="source-target-form-grid">
                 <label class="field">
                   <span>source id</span>
@@ -215,12 +215,13 @@
                   </div>
                 </div>
                 <label class="field source-target-enabled-field">
-                  <span>有効化</span>
+                  <span>監視対象に含める</span>
                   <input id="sourceTargetEnabledInput" type="checkbox" checked />
                 </label>
               </div>
               <div class="inline-actions">
                 <button id="sourceTargetSaveBtn" type="button">追加</button>
+                <button id="sourceTargetRemoveBtn" class="source-target-archive-btn" type="button" hidden>アーカイブ</button>
               </div>
               <p id="sourceTargetFormHint" class="hint">source id が既存なら更新、未登録なら追加します。</p>
             </details>
