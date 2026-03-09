@@ -116,6 +116,13 @@ RE_RETRY_TIKTOK_BLOCKED = re.compile(
     r"status(?:\s*code)?\s*[:=]?\s*10204)",
     re.IGNORECASE,
 )
+RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT = re.compile(
+    r"(unable to extract universal data for rehydration|"
+    r"unable to extract webpage video data|"
+    r"unable to extract challenge data|"
+    r"unexpected response from webpage request)",
+    re.IGNORECASE,
+)
 RE_RETRY_MISSING_ARTIFACT = re.compile(
     r"(subtitle file missing after download attempt|did not write a terminal download_state row)",
     re.IGNORECASE,
@@ -1507,6 +1514,19 @@ class ChunkedYtdlpStagePlan:
     blocked_error: str | None = None
 
 
+def attempted_chunk_target_ids(plan: ChunkedYtdlpStagePlan) -> list[str]:
+    attempted_ids: list[str] = []
+    seen_ids: set[str] = set()
+    attempted_chunk_count = max(0, min(plan.chunk_index, len(plan.url_chunks)))
+    for chunk_pairs in plan.url_chunks[:attempted_chunk_count]:
+        for video_id, _url in chunk_pairs:
+            if video_id in seen_ids:
+                continue
+            seen_ids.add(video_id)
+            attempted_ids.append(video_id)
+    return attempted_ids
+
+
 def run_interleaved_chunked_ytdlp_stage_plans(
     plans: list[ChunkedYtdlpStagePlan],
     dry_run: bool,
@@ -1792,16 +1812,23 @@ def finalize_subtitle_download_plan(
         return
 
     source = plan.source
+    attempted_resolved_target_ids = attempted_chunk_target_ids(plan)
+    attempted_resolved_target_id_set = set(attempted_resolved_target_ids)
+    unattempted_resolved_target_ids = [
+        video_id
+        for video_id in plan.resolved_target_ids
+        if video_id not in attempted_resolved_target_id_set
+    ]
     subs_after_ids = set(read_archive_ids(source.subs_archive))
     local_sub_after_ids = set(scan_subtitles(source).keys())
     success_sub_ids = [
         video_id
-        for video_id in plan.resolved_target_ids
+        for video_id in attempted_resolved_target_ids
         if video_id in subs_after_ids or video_id in local_sub_after_ids
     ]
     failed_sub_ids = [
         video_id
-        for video_id in plan.resolved_target_ids
+        for video_id in attempted_resolved_target_ids
         if video_id not in subs_after_ids and video_id not in local_sub_after_ids
     ]
     failed_sub_ids.extend(plan.unresolved_target_ids)
@@ -1936,6 +1963,8 @@ def finalize_subtitle_download_plan(
         f"subtitle targets={len(plan.target_ids)} "
         f"success={len(success_sub_ids)} failed={len(failed_sub_ids)} "
         f"(resolved={len(plan.resolved_target_ids)}, unresolved={len(plan.unresolved_target_ids)}, "
+        f"attempted={len(attempted_resolved_target_ids)}, "
+        f"not_attempted={len(unattempted_resolved_target_ids)}, "
         f"new={int(plan.payload.get('new_count', 0))}, retry={int(plan.payload.get('retry_count', 0))}, "
         f"bootstrap={int(plan.payload.get('bootstrap_count', 0))}, "
         f"deferred={int(plan.payload.get('deferred_count', 0))}, "
@@ -2117,12 +2146,19 @@ def finalize_metadata_download_plan(
         return
 
     source = plan.source
+    attempted_resolved_target_ids = attempted_chunk_target_ids(plan)
+    attempted_resolved_target_id_set = set(attempted_resolved_target_ids)
+    unattempted_resolved_target_ids = [
+        video_id
+        for video_id in plan.resolved_target_ids
+        if video_id not in attempted_resolved_target_id_set
+    ]
     post_meta_ids = list_meta_ids(source.meta_dir)
     success_meta_ids = [
-        video_id for video_id in plan.resolved_target_ids if video_id in post_meta_ids
+        video_id for video_id in attempted_resolved_target_ids if video_id in post_meta_ids
     ]
     failed_meta_ids = [
-        video_id for video_id in plan.resolved_target_ids if video_id not in post_meta_ids
+        video_id for video_id in attempted_resolved_target_ids if video_id not in post_meta_ids
     ]
     failed_meta_ids.extend(plan.unresolved_target_ids)
 
@@ -2238,6 +2274,8 @@ def finalize_metadata_download_plan(
         f"metadata targets={len(plan.target_ids)} "
         f"success={len(success_meta_ids)} failed={len(failed_meta_ids)} "
         f"(resolved={len(plan.resolved_target_ids)}, unresolved={len(plan.unresolved_target_ids)}, "
+        f"attempted={len(attempted_resolved_target_ids)}, "
+        f"not_attempted={len(unattempted_resolved_target_ids)}, "
         f"new={int(plan.payload.get('new_count', 0))}, retry={int(plan.payload.get('retry_count', 0))}, "
         f"deferred={int(plan.payload.get('deferred_count', 0))})"
     )
@@ -4999,11 +5037,29 @@ def is_blocked_or_forbidden_error(error_message: str | None) -> bool:
     )
 
 
+def is_tiktok_transient_webpage_error(error_message: str | None) -> bool:
+    text = str(error_message or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        "tiktok" in lowered
+        and RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(text) is not None
+    )
+
+
 def is_missing_artifact_error(error_message: str | None) -> bool:
     text = str(error_message or "").strip()
     if not text:
         return False
     return RE_RETRY_MISSING_ARTIFACT.search(text) is not None
+
+
+def is_source_network_cooldown_error(error_message: str | None) -> bool:
+    return (
+        is_blocked_or_forbidden_error(error_message)
+        or is_tiktok_transient_webpage_error(error_message)
+    )
 
 
 def schedule_next_retry_iso(
@@ -5015,6 +5071,11 @@ def schedule_next_retry_iso(
         blocked_backoff_seconds = (21600, 43200, 86400, 129600, 172800)
         index = min(max(0, retry_count - 1), len(blocked_backoff_seconds) - 1)
         delay_seconds = blocked_backoff_seconds[index]
+    elif is_tiktok_transient_webpage_error(error_message):
+        # TikTok webpage extractor misses often recover after a shorter source-level cool-off.
+        transient_backoff_seconds = (1800, 3600, 7200, 14400, 21600)
+        index = min(max(0, retry_count - 1), len(transient_backoff_seconds) - 1)
+        delay_seconds = transient_backoff_seconds[index]
     elif is_missing_artifact_error(error_message):
         # Structural misses (missing subtitle/meta artifacts) should not spin quickly.
         missing_artifact_backoff_seconds = (1800, 7200, 21600, 43200, 86400)
@@ -5477,7 +5538,7 @@ def extend_source_network_cooldown(
     blocked_until: str | None = None,
     blocked_at: str | None = None,
 ) -> str | None:
-    if not is_blocked_or_forbidden_error(error_message):
+    if not is_source_network_cooldown_error(error_message):
         return None
 
     blocked_at_value = str(blocked_at or now_utc_iso())
