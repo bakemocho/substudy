@@ -64,6 +64,7 @@ const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source"
 const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
 const SOURCE_TARGET_FILTER_STORAGE_KEY = "substudy.source_target_filter";
 const SOURCE_TARGET_TAG_STORAGE_KEY = "substudy.source_target_tag";
+const SOURCE_TAG_SCOPE_OPTION_PREFIX = "__tag_scope__:";
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -124,6 +125,8 @@ const state = {
   videos: [],
   sources: [],
   feedSourceId: "",
+  feedSourceTags: [],
+  feedTagRestoreSourceId: "",
   index: 0,
   shuffleMode: true,
   shuffleQueue: [],
@@ -304,6 +307,7 @@ const elements = {
   sourceSelect: document.getElementById("sourceSelect"),
   translationFilterSelect: document.getElementById("translationFilterSelect"),
   translationVariantSelect: document.getElementById("translationVariantSelect"),
+  subtitleReelSourceTags: document.getElementById("subtitleReelSourceTags"),
   jumpOpenBtn: document.getElementById("jumpOpenBtn"),
   autoplayToggle: document.getElementById("autoplayToggle"),
   shuffleToggle: document.getElementById("shuffleToggle"),
@@ -905,7 +909,7 @@ function normalizePlaybackTrackPreference(value, fallback = "en-subtitle") {
 }
 
 function getSourceIdForTranslationVariantPreference(preferredSourceId = "") {
-  const safePreferredSourceId = String(preferredSourceId || "").trim();
+  const safePreferredSourceId = parseSourceScopeValue(preferredSourceId).sourceId;
   if (safePreferredSourceId) {
     return safePreferredSourceId;
   }
@@ -913,7 +917,51 @@ function getSourceIdForTranslationVariantPreference(preferredSourceId = "") {
   if (currentSource) {
     return currentSource;
   }
-  return String(elements.sourceSelect?.value || "").trim();
+  return parseSourceScopeValue(elements.sourceSelect?.value || "").sourceId;
+}
+
+function normalizeFeedSourceTags(rawValue) {
+  return normalizeSourceTags(rawValue);
+}
+
+function buildSourceTagScopeOptionValue(rawTags = []) {
+  const tags = normalizeFeedSourceTags(rawTags);
+  if (!tags.length) {
+    return "";
+  }
+  return `${SOURCE_TAG_SCOPE_OPTION_PREFIX}${tags.map((tag) => encodeURIComponent(tag)).join(",")}`;
+}
+
+function parseSourceScopeValue(rawValue = "") {
+  const value = String(rawValue || "").trim();
+  if (!value.startsWith(SOURCE_TAG_SCOPE_OPTION_PREFIX)) {
+    return {
+      sourceId: value,
+      sourceTags: [],
+    };
+  }
+  const encodedTags = value.slice(SOURCE_TAG_SCOPE_OPTION_PREFIX.length);
+  const sourceTags = encodedTags
+    .split(",")
+    .map((tag) => {
+      try {
+        return decodeURIComponent(tag);
+      } catch (_error) {
+        return String(tag || "");
+      }
+    });
+  return {
+    sourceId: "",
+    sourceTags: normalizeFeedSourceTags(sourceTags),
+  };
+}
+
+function formatSourceScopeLabel(sourceId = "", sourceTags = []) {
+  const tags = normalizeFeedSourceTags(sourceTags);
+  if (tags.length) {
+    return tags.map((tag) => `#${tag}`).join(" + ");
+  }
+  return String(sourceId || "").trim() || "All Sources";
 }
 
 function getTranslationVariantPreferenceForSource(sourceId = "") {
@@ -1098,6 +1146,8 @@ function parseInitialVideoSelectionFromUrl() {
   try {
     const params = new URLSearchParams(window.location.search);
     const sourceId = String(params.get("source_id") || "").trim();
+    const sourceTags = normalizeFeedSourceTags(params.get("source_tags") || "");
+    const restoreSourceId = String(params.get("restore_source_id") || "").trim();
     const videoId = String(params.get("video_id") || "").trim();
     const rawPlaybackTimeSec = Number(params.get("t"));
     const playbackTimeSec = (
@@ -1117,6 +1167,8 @@ function parseInitialVideoSelectionFromUrl() {
     );
     return {
       sourceId,
+      sourceTags,
+      restoreSourceId,
       videoId,
       playbackTimeSec,
       translationFilter,
@@ -1127,6 +1179,8 @@ function parseInitialVideoSelectionFromUrl() {
   } catch (_error) {
     return {
       sourceId: "",
+      sourceTags: [],
+      restoreSourceId: "",
       videoId: "",
       playbackTimeSec: null,
       translationFilter: state.translationFilter,
@@ -1142,14 +1196,29 @@ function updateUrlVideoSelection(
   videoId = "",
   translationFilter = state.translationFilter,
   playbackTimeSec = null,
-  translationVariant = state.translationVariant
+  translationVariant = state.translationVariant,
+  sourceTags = state.feedSourceTags,
+  restoreSourceId = state.feedTagRestoreSourceId
 ) {
   try {
     const url = new URL(window.location.href);
-    if (sourceId) {
-      url.searchParams.set("source_id", sourceId);
-    } else {
+    const normalizedSourceTags = normalizeFeedSourceTags(sourceTags);
+    if (normalizedSourceTags.length) {
       url.searchParams.delete("source_id");
+      url.searchParams.set("source_tags", normalizedSourceTags.join(","));
+      if (restoreSourceId) {
+        url.searchParams.set("restore_source_id", String(restoreSourceId || "").trim());
+      } else {
+        url.searchParams.delete("restore_source_id");
+      }
+    } else {
+      url.searchParams.delete("source_tags");
+      url.searchParams.delete("restore_source_id");
+      if (sourceId) {
+        url.searchParams.set("source_id", sourceId);
+      } else {
+        url.searchParams.delete("source_id");
+      }
     }
     if (videoId) {
       url.searchParams.set("video_id", videoId);
@@ -1201,7 +1270,9 @@ function syncUrlPlaybackPosition(force = false) {
     video.video_id,
     state.translationFilter,
     second,
-    state.translationVariant
+    state.translationVariant,
+    state.feedSourceTags,
+    state.feedTagRestoreSourceId
   );
 }
 
@@ -1535,12 +1606,22 @@ function closeJumpModal() {
   elements.jumpModal.setAttribute("aria-hidden", "true");
 }
 
-function renderSourceOptions(preferredSource) {
-  const selectedBefore = preferredSource === undefined
-    ? String(elements.sourceSelect.value || "").trim()
-    : String(preferredSource || "").trim();
+function renderSourceOptions(preferredSource, preferredSourceTags = []) {
+  const normalizedSourceTags = normalizeFeedSourceTags(preferredSourceTags);
+  const selectedBefore = normalizedSourceTags.length
+    ? buildSourceTagScopeOptionValue(normalizedSourceTags)
+    : preferredSource === undefined
+      ? String(elements.sourceSelect.value || "").trim()
+      : String(preferredSource || "").trim();
   const options = ["", ...state.sources];
   elements.sourceSelect.textContent = "";
+
+  if (normalizedSourceTags.length) {
+    const tagOption = document.createElement("option");
+    tagOption.value = buildSourceTagScopeOptionValue(normalizedSourceTags);
+    tagOption.textContent = formatSourceScopeLabel("", normalizedSourceTags);
+    elements.sourceSelect.appendChild(tagOption);
+  }
 
   for (const sourceId of options) {
     const option = document.createElement("option");
@@ -1549,7 +1630,8 @@ function renderSourceOptions(preferredSource) {
     elements.sourceSelect.appendChild(option);
   }
 
-  const available = options.includes(selectedBefore) ? selectedBefore : "";
+  const optionValues = Array.from(elements.sourceSelect.options).map((option) => String(option.value || ""));
+  const available = optionValues.includes(selectedBefore) ? selectedBefore : "";
   elements.sourceSelect.value = available;
 }
 
@@ -7108,6 +7190,138 @@ function createSourceTagList(rawValue, className = "source-tag-list") {
   return list;
 }
 
+function resolveSourceTagsForSourceId(sourceId = "") {
+  const normalizedSourceId = String(sourceId || "").trim();
+  if (!normalizedSourceId) {
+    return [];
+  }
+  const sourceTarget = findSourceTargetById(normalizedSourceId);
+  if (sourceTarget) {
+    return normalizeSourceTags(sourceTarget?.tags);
+  }
+  const summaries = Array.isArray(state.workspaceSourceProcessing?.sources)
+    ? state.workspaceSourceProcessing.sources
+    : [];
+  const summary = summaries.find((item) => String(item?.source_id || "").trim() === normalizedSourceId) || null;
+  return normalizeSourceTags(summary?.tags);
+}
+
+function sourceMatchesAnyFeedTag(sourceId = "", selectedTags = []) {
+  const normalizedSelectedTags = normalizeFeedSourceTags(selectedTags)
+    .map((tag) => tag.toLocaleLowerCase());
+  if (!normalizedSelectedTags.length) {
+    return true;
+  }
+  const sourceTags = resolveSourceTagsForSourceId(sourceId)
+    .map((tag) => tag.toLocaleLowerCase());
+  return normalizedSelectedTags.some((selectedTag) => sourceTags.includes(selectedTag));
+}
+
+async function toggleSubtitleReelSourceTag(tag) {
+  const normalizedTag = normalizeFeedSourceTags([tag])[0] || "";
+  if (!normalizedTag) {
+    return;
+  }
+  const currentTags = normalizeFeedSourceTags(state.feedSourceTags);
+  const normalizedTagKey = normalizedTag.toLocaleLowerCase();
+  const reloadSelection = getCurrentVideoReloadSelection();
+  let nextTags = currentTags;
+  if (currentTags.some((item) => item.toLocaleLowerCase() === normalizedTagKey)) {
+    nextTags = currentTags.filter((item) => item.toLocaleLowerCase() !== normalizedTagKey);
+  } else {
+    nextTags = [...currentTags, normalizedTag];
+  }
+
+  if (!currentTags.length && nextTags.length) {
+    state.feedTagRestoreSourceId = state.feedSourceId;
+  }
+
+  if (!nextTags.length) {
+    const restoreSourceId = String(state.feedTagRestoreSourceId || "").trim();
+    state.feedTagRestoreSourceId = "";
+    await loadFeed(
+      restoreSourceId,
+      false,
+      reloadSelection.videoId,
+      state.translationFilter,
+      reloadSelection.playbackTimeSec,
+      [],
+      "",
+      true
+    );
+    return;
+  }
+
+  const canApplyLocally = (
+    !state.feedSourceId
+    && (
+      !currentTags.length
+      || nextTags.every((nextTag) => currentTags.some((currentTag) => (
+        currentTag.toLocaleLowerCase() === nextTag.toLocaleLowerCase()
+      )))
+    )
+  );
+
+  if (canApplyLocally) {
+    const nextVideos = Array.isArray(state.videos)
+      ? state.videos.filter((video) => sourceMatchesAnyFeedTag(video?.source_id, nextTags))
+      : [];
+    await applyLoadedFeedState({
+      videos: nextVideos,
+      sources: state.sources,
+      sourceId: "",
+      sourceTags: nextTags,
+      restoreSourceId: state.feedTagRestoreSourceId,
+      preferredVideoId: reloadSelection.videoId,
+      preferredPlaybackTimeSec: reloadSelection.playbackTimeSec,
+      allowNoVideoReload: true,
+      serverFilterMismatch: false,
+    });
+    return;
+  }
+
+  await loadFeed(
+    "",
+    false,
+    reloadSelection.videoId,
+    state.translationFilter,
+    reloadSelection.playbackTimeSec,
+    nextTags,
+    state.feedTagRestoreSourceId,
+    true
+  );
+}
+
+function renderSubtitleReelSourceTags(video = currentVideo()) {
+  if (!elements.subtitleReelSourceTags) {
+    return;
+  }
+  elements.subtitleReelSourceTags.textContent = "";
+  const sourceId = String(video?.source_id || "").trim();
+  const currentSourceTags = resolveSourceTagsForSourceId(sourceId);
+  const tags = normalizeFeedSourceTags([...currentSourceTags, ...state.feedSourceTags]);
+  if (!tags.length) {
+    return;
+  }
+  const activeTagSet = new Set(
+    normalizeFeedSourceTags(state.feedSourceTags).map((tag) => tag.toLocaleLowerCase())
+  );
+  for (const tag of tags) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "source-hashtag-chip";
+    if (activeTagSet.has(String(tag || "").toLocaleLowerCase())) {
+      chip.classList.add("active");
+    }
+    chip.textContent = `#${tag}`;
+    chip.addEventListener("click", () => {
+      toggleSubtitleReelSourceTag(tag).catch((error) => setStatus(error.message, "error"));
+      resetControlsToggleFade();
+    });
+    elements.subtitleReelSourceTags.appendChild(chip);
+  }
+}
+
 function buildSourceTargetFormTagSuggestions() {
   const selectedTags = normalizeSourceTags(elements.sourceTargetTagsInput?.value || "");
   const selectedTagSet = new Set(selectedTags.map((tag) => tag.toLocaleLowerCase()));
@@ -7579,7 +7793,7 @@ function renderSourceTargetItemRow(item) {
   randomPlayBtn.title = "この source の再生可能動画からランダムに1本選んで開きます。";
   randomPlayBtn.addEventListener("click", () => {
     const sourceId = String(item?.id || "").trim();
-    loadFeed(sourceId, true, "", state.translationFilter).catch((error) => {
+    loadFeed(sourceId, true, "", state.translationFilter, null, [], "").catch((error) => {
       setStatus(error.message, "error");
     });
   });
@@ -7878,6 +8092,7 @@ async function loadSourceTargets(options = {}) {
   state.sourceTargetsManagedPath = String(payload.managed_path || "");
   renderSourceTargetsPanel();
   refreshSourceTargetFormState();
+  renderSubtitleReelSourceTags();
 }
 
 function renderWorkspaceList(container, items, renderItem, emptyMessage) {
@@ -8168,7 +8383,7 @@ async function jumpToWorkspaceCue(item) {
     });
   };
 
-  const currentSourceFilter = String(elements.sourceSelect?.value || "").trim();
+  const currentSourceFilter = parseSourceScopeValue(elements.sourceSelect?.value || "").sourceId;
   pushAttempt(currentSourceFilter, state.translationFilter, "");
   pushAttempt(sourceId, state.translationFilter, "");
   pushAttempt("", state.translationFilter, "");
@@ -8183,7 +8398,9 @@ async function jumpToWorkspaceCue(item) {
       false,
       videoId,
       attempt.translationFilter,
-      cueStartSec
+      cueStartSec,
+      [],
+      ""
     );
     targetIndex = findTargetIndex();
     if (targetIndex >= 0) {
@@ -8581,7 +8798,7 @@ async function loadWorkspaceData(options = {}) {
     artifact_limit: String(WORKSPACE_ARTIFACT_LIMIT),
     since_hours: String(WORKSPACE_SINCE_HOURS),
   });
-  const sourceId = String(elements.sourceSelect?.value || "").trim();
+  const sourceId = state.feedSourceId;
   if (sourceId) {
     params.set("source_id", sourceId);
   }
@@ -8598,6 +8815,7 @@ async function loadWorkspaceData(options = {}) {
   state.workspaceImportMonitor = payload.import_monitor || null;
   state.workspaceArtifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
   renderWorkspacePanels();
+  renderSubtitleReelSourceTags();
 }
 
 async function openVideo(index, autoplay = true, historyMode = "push", startTimeSec = null) {
@@ -8625,12 +8843,15 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   updateFavoriteButton();
   elements.videoNote.value = video.note || "";
   renderTrackOptions(video);
+  renderSubtitleReelSourceTags(video);
   updateUrlVideoSelection(
     state.feedSourceId,
     video.video_id,
     state.translationFilter,
     null,
-    state.translationVariant
+    state.translationVariant,
+    state.feedSourceTags,
+    state.feedTagRestoreSourceId
   );
 
   await loadTrackCues();
@@ -8658,28 +8879,181 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   schedulePhoneShellSnapCheck();
 }
 
+function applyFeedSelectionWithoutVideoReload(index, playbackTimeSec = null) {
+  if (!state.videos.length) {
+    return;
+  }
+  state.index = Math.max(0, Math.min(index, state.videos.length - 1));
+  resetPlaybackTracking(state.index);
+  const video = currentVideo();
+  if (!video) {
+    return;
+  }
+  const videoSourceId = String(video?.source_id || "").trim();
+  state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
+  updateTranslationVariantSelect(videoSourceId, video);
+  const resolvedPlaybackTimeSec = Number.isFinite(Number(playbackTimeSec)) && Number(playbackTimeSec) >= 0
+    ? Math.max(0, Math.round(Number(playbackTimeSec)))
+    : state.urlPlaybackTimeSecond >= 0
+      ? state.urlPlaybackTimeSecond
+      : Number.isFinite(Number(elements.videoPlayer?.currentTime))
+        ? Math.max(0, Math.round(Number(elements.videoPlayer.currentTime)))
+        : null;
+  if (resolvedPlaybackTimeSec !== null) {
+    state.urlPlaybackTimeSecond = resolvedPlaybackTimeSec;
+  }
+  renderVideoMeta(video);
+  updateFavoriteButton();
+  elements.videoNote.value = video.note || "";
+  renderSubtitleReelSourceTags(video);
+  updateUrlVideoSelection(
+    state.feedSourceId,
+    video.video_id,
+    state.translationFilter,
+    resolvedPlaybackTimeSec,
+    state.translationVariant,
+    state.feedSourceTags,
+    state.feedTagRestoreSourceId
+  );
+}
+
+async function applyLoadedFeedState(options = {}) {
+  const {
+    videos = [],
+    sources = [],
+    sourceId = "",
+    sourceTags = [],
+    restoreSourceId = "",
+    startRandom = false,
+    preferredVideoId = "",
+    preferredPlaybackTimeSec = null,
+    allowNoVideoReload = false,
+    serverFilterMismatch = false,
+  } = options;
+  const normalizedSourceTags = normalizeFeedSourceTags(sourceTags);
+  state.feedSourceId = normalizedSourceTags.length ? "" : String(sourceId || "").trim();
+  state.feedSourceTags = normalizedSourceTags;
+  state.feedTagRestoreSourceId = normalizedSourceTags.length ? String(restoreSourceId || "").trim() : "";
+  state.videos = Array.isArray(videos) ? videos : [];
+  state.sources = Array.isArray(sources) ? sources : [];
+  state.index = 0;
+  state.rangeStartMs = null;
+  state.metaExpanded = false;
+  updateMetaDrawerState();
+  elements.rangeStatus.textContent = "範囲ブックマークは未開始です。";
+  renderSourceOptions(state.feedSourceId, state.feedSourceTags);
+
+  if (!state.videos.length) {
+    elements.videoPlayer.removeAttribute("src");
+    elements.videoPlayer.load();
+    updateVideoProgressTimer();
+    releasePlayerCardSnapLock(false);
+    updateUrlVideoSelection(
+      state.feedSourceId,
+      "",
+      state.translationFilter,
+      null,
+      getTranslationVariantPreferenceForSource(state.feedSourceId),
+      state.feedSourceTags,
+      state.feedTagRestoreSourceId
+    );
+    state.playbackHistory = [];
+    state.historyPointer = -1;
+    state.shuffleQueue = [];
+    state.lyricReelIndex = -1;
+    clearSubtitleOverlay("動画がありません");
+    setVideoMetaFallback("動画が見つかりません", "0 / 0");
+    state.bookmarks = [];
+    state.dictBookmarks = new Map();
+    rebuildDictionaryBookmarkedTermNorms();
+    refreshSubtitleReelDictionaryBookmarkHighlights();
+    state.subtitlePanelRows = [];
+    state.subtitlePanelPrimaryCues = [];
+    state.subtitlePanelJaCues = [];
+    state.subtitlePanelPrimaryTrackId = null;
+    state.subtitlePanelJaTrackId = null;
+    state.subtitlePanelActiveIndex = -1;
+    renderSubtitlePanelLoading("動画がありません。");
+    renderSubtitleReelSourceTags(null);
+    renderBookmarkList();
+    resetWorkspaceState();
+    renderWorkspacePanels();
+    setStatus("条件に一致する動画がありません。", "error");
+    return;
+  }
+
+  const preferredVideoIdText = String(preferredVideoId || "").trim();
+  const shouldRandomizeInitialIndex = (
+    Boolean(startRandom)
+    || (
+      state.shuffleMode
+      && !state.feedSourceId
+      && !state.feedSourceTags.length
+      && !preferredVideoIdText
+    )
+  );
+
+  let initialIndex = -1;
+  let usedPreferredVideo = false;
+  if (preferredVideoIdText) {
+    initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoIdText);
+    usedPreferredVideo = initialIndex >= 0;
+  }
+  if (initialIndex < 0) {
+    initialIndex = shouldRandomizeInitialIndex
+      ? Math.floor(Math.random() * state.videos.length)
+      : 0;
+  }
+
+  const initialPlaybackTimeSec = usedPreferredVideo ? preferredPlaybackTimeSec : null;
+  if (allowNoVideoReload && usedPreferredVideo) {
+    applyFeedSelectionWithoutVideoReload(initialIndex, initialPlaybackTimeSec);
+  } else {
+    resetPlaybackTracking(initialIndex);
+    await openVideo(initialIndex, true, "keep", initialPlaybackTimeSec);
+  }
+
+  loadWorkspaceData({ silent: true }).catch((error) => {
+    if (elements.workspaceSummary) {
+      elements.workspaceSummary.textContent = `復習データ読み込み失敗: ${error.message}`;
+    }
+  });
+  if (serverFilterMismatch) {
+    setStatus(
+      `${state.videos.length}件の動画を読み込みました。和訳フィルタはローカル適用です（Webサーバー再起動推奨）。`,
+      "ok"
+    );
+  } else {
+    setStatus(`${state.videos.length}件の動画を読み込みました。`, "ok");
+  }
+}
+
 async function loadFeed(
   sourceId = "",
   startRandom = false,
   preferredVideoId = "",
   translationFilter = state.translationFilter,
-  preferredPlaybackTimeSec = null
+  preferredPlaybackTimeSec = null,
+  sourceTags = [],
+  restoreSourceId = "",
+  allowNoVideoReload = false
 ) {
   closeJumpModal();
   closeLyricReel();
-  state.feedSourceId = String(sourceId || "").trim();
+  const normalizedSourceTags = normalizeFeedSourceTags(sourceTags);
   state.translationFilter = normalizeTranslationFilter(translationFilter, state.translationFilter);
   localStorage.setItem("substudy.translation_filter", state.translationFilter);
   updateTranslationFilterSelect();
-  const variantSourceId = state.feedSourceId;
+  const nextFeedSourceId = normalizedSourceTags.length ? "" : String(sourceId || "").trim();
+  const variantSourceId = nextFeedSourceId;
   state.translationVariant = getTranslationVariantPreferenceForSource(variantSourceId);
   updateTranslationVariantSelect(variantSourceId);
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
   const params = new URLSearchParams({ limit: "900", offset: "0" });
-  if (state.feedSourceId) {
-    params.set("source_id", state.feedSourceId);
+  if (nextFeedSourceId) {
+    params.set("source_id", nextFeedSourceId);
   }
   params.set("translation_filter", state.translationFilter);
 
@@ -8700,89 +9074,21 @@ async function loadFeed(
         : !hasJaSubtitleTrack(video)
     ));
   }
-
-  state.videos = loadedVideos;
-  state.sources = loadedSources;
-  state.index = 0;
-  state.rangeStartMs = null;
-  state.metaExpanded = false;
-  updateMetaDrawerState();
-  elements.rangeStatus.textContent = "範囲ブックマークは未開始です。";
-  renderSourceOptions(state.feedSourceId);
-
-  if (!state.videos.length) {
-    elements.videoPlayer.removeAttribute("src");
-    elements.videoPlayer.load();
-    updateVideoProgressTimer();
-    releasePlayerCardSnapLock(false);
-    updateUrlVideoSelection(
-      state.feedSourceId,
-      "",
-      state.translationFilter,
-      null,
-      getTranslationVariantPreferenceForSource(state.feedSourceId)
-    );
-    state.playbackHistory = [];
-    state.historyPointer = -1;
-    state.shuffleQueue = [];
-    state.lyricReelIndex = -1;
-    clearSubtitleOverlay("動画がありません");
-    setVideoMetaFallback("動画が見つかりません", "0 / 0");
-    state.bookmarks = [];
-    state.dictBookmarks = new Map();
-    rebuildDictionaryBookmarkedTermNorms();
-    refreshSubtitleReelDictionaryBookmarkHighlights();
-    state.subtitlePanelRows = [];
-    state.subtitlePanelPrimaryCues = [];
-    state.subtitlePanelJaCues = [];
-    state.subtitlePanelPrimaryTrackId = null;
-    state.subtitlePanelJaTrackId = null;
-    state.subtitlePanelActiveIndex = -1;
-    renderSubtitlePanelLoading("動画がありません。");
-    renderBookmarkList();
-    resetWorkspaceState();
-    renderWorkspacePanels();
-    setStatus("条件に一致する動画がありません。", "error");
-    return;
+  if (normalizedSourceTags.length) {
+    loadedVideos = loadedVideos.filter((video) => sourceMatchesAnyFeedTag(video?.source_id, normalizedSourceTags));
   }
-
-  const preferredVideoIdText = String(preferredVideoId || "").trim();
-  const shouldRandomizeInitialIndex = (
-    Boolean(startRandom)
-    || (
-      state.shuffleMode
-      && !variantSourceId
-      && !preferredVideoIdText
-    )
-  );
-
-  let initialIndex = -1;
-  let usedPreferredVideo = false;
-  if (preferredVideoIdText) {
-    initialIndex = state.videos.findIndex((video) => video.video_id === preferredVideoIdText);
-    usedPreferredVideo = initialIndex >= 0;
-  }
-  if (initialIndex < 0) {
-    initialIndex = shouldRandomizeInitialIndex
-      ? Math.floor(Math.random() * state.videos.length)
-      : 0;
-  }
-  resetPlaybackTracking(initialIndex);
-  const initialPlaybackTimeSec = usedPreferredVideo ? preferredPlaybackTimeSec : null;
-  await openVideo(initialIndex, true, "keep", initialPlaybackTimeSec);
-  loadWorkspaceData({ silent: true }).catch((error) => {
-    if (elements.workspaceSummary) {
-      elements.workspaceSummary.textContent = `復習データ読み込み失敗: ${error.message}`;
-    }
+  await applyLoadedFeedState({
+    videos: loadedVideos,
+    sources: loadedSources,
+    sourceId: nextFeedSourceId,
+    sourceTags: normalizedSourceTags,
+    restoreSourceId,
+    startRandom,
+    preferredVideoId,
+    preferredPlaybackTimeSec,
+    allowNoVideoReload,
+    serverFilterMismatch,
   });
-  if (serverFilterMismatch) {
-    setStatus(
-      `${state.videos.length}件の動画を読み込みました。和訳フィルタはローカル適用です（Webサーバー再起動推奨）。`,
-      "ok"
-    );
-  } else {
-    setStatus(`${state.videos.length}件の動画を読み込みました。`, "ok");
-  }
 }
 
 async function nextVideo() {
@@ -9538,12 +9844,15 @@ function bindEvents() {
 
   elements.sourceSelect.addEventListener("change", () => {
     const reloadSelection = getCurrentVideoReloadSelection();
+    const nextScope = parseSourceScopeValue(elements.sourceSelect.value);
     loadFeed(
-      elements.sourceSelect.value,
+      nextScope.sourceId,
       false,
       reloadSelection.videoId,
       state.translationFilter,
-      reloadSelection.playbackTimeSec
+      reloadSelection.playbackTimeSec,
+      nextScope.sourceTags,
+      nextScope.sourceTags.length ? state.feedTagRestoreSourceId : ""
     ).catch((error) => {
       setStatus(error.message, "error");
     });
@@ -9556,12 +9865,15 @@ function bindEvents() {
       localStorage.setItem("substudy.translation_filter", state.translationFilter);
       updateTranslationFilterSelect();
       const reloadSelection = getCurrentVideoReloadSelection();
+      const nextScope = parseSourceScopeValue(elements.sourceSelect.value);
       loadFeed(
-        elements.sourceSelect.value,
+        nextScope.sourceId,
         false,
         reloadSelection.videoId,
         state.translationFilter,
-        reloadSelection.playbackTimeSec
+        reloadSelection.playbackTimeSec,
+        nextScope.sourceTags,
+        nextScope.sourceTags.length ? state.feedTagRestoreSourceId : ""
       ).catch((error) => {
         setStatus(error.message, "error");
       });
@@ -9944,6 +10256,11 @@ async function initialize() {
 
   try {
     const initialSelection = parseInitialVideoSelectionFromUrl();
+    try {
+      await loadSourceTargets({ silent: true });
+    } catch (error) {
+      setStatus(`監視ターゲット読み込み失敗: ${error.message}`, "error");
+    }
     if (initialSelection.hasTranslationFilter) {
       state.translationFilter = normalizeTranslationFilter(initialSelection.translationFilter, "all");
       localStorage.setItem("substudy.translation_filter", state.translationFilter);
@@ -9963,13 +10280,10 @@ async function initialize() {
       false,
       initialSelection.videoId,
       state.translationFilter,
-      initialSelection.playbackTimeSec
+      initialSelection.playbackTimeSec,
+      initialSelection.sourceTags,
+      initialSelection.restoreSourceId
     );
-    try {
-      await loadSourceTargets({ silent: true });
-    } catch (error) {
-      setStatus(`監視ターゲット読み込み失敗: ${error.message}`, "error");
-    }
     schedulePhoneShellSnapCheck();
     setStatus("準備完了。字幕の英単語ホバーで辞書表示、Gでジャンプできます。", "ok");
   } catch (error) {

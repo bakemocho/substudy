@@ -86,20 +86,28 @@
 
         <section class="study-column" aria-label="Learning Tools">
           <article class="card subtitle-reel-card">
-            <h3>字幕リール</h3>
-            <label class="field">
-              <span>和訳バリアント</span>
-              <select id="translationVariantSelect">
-                <option value="auto">自動</option>
-                <option value="ja" selected>ja（高品質claude和訳）</option>
-                <option value="ja-local">ja-local（ローカル和訳）</option>
-                <option value="ja-asr-local">ja-asr-local（ASRローカル和訳）</option>
-              </select>
-            </label>
-            <label class="field">
-              <span>再生字幕トラック</span>
-              <select id="trackSelect"></select>
-            </label>
+            <div class="subtitle-reel-head">
+              <h3>字幕リール</h3>
+              <div id="subtitleReelSourceTags" class="subtitle-reel-source-tags" aria-live="polite"></div>
+            </div>
+            <details class="bookmark-inline-tools subtitle-reel-settings">
+              <summary>表示設定</summary>
+              <div class="subtitle-reel-settings-grid">
+                <label class="field">
+                  <span>和訳バリアント</span>
+                  <select id="translationVariantSelect">
+                    <option value="auto">自動</option>
+                    <option value="ja" selected>ja（高品質claude和訳）</option>
+                    <option value="ja-local">ja-local（ローカル和訳）</option>
+                    <option value="ja-asr-local">ja-asr-local（ASRローカル和訳）</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>再生字幕トラック</span>
+                  <select id="trackSelect"></select>
+                </label>
+              </div>
+            </details>
             <div class="subtitle-panel-mode-toggle" role="group" aria-label="字幕表示モード">
               <button id="subtitlePanelModeEnOnlyBtn" type="button">EN only</button>
               <button id="subtitlePanelModeEnJaBtn" type="button">EN + JA</button>
