@@ -123,6 +123,7 @@ function loadSelectedSourceTargetTags() {
 const state = {
   videos: [],
   sources: [],
+  feedSourceId: "",
   index: 0,
   shuffleMode: true,
   shuffleQueue: [],
@@ -1193,14 +1194,27 @@ function syncUrlPlaybackPosition(force = false) {
     return;
   }
   state.urlPlaybackTimeSecond = second;
-  const sourceId = String(video?.source_id || "").trim();
   updateUrlVideoSelection(
-    sourceId,
+    state.feedSourceId,
     video.video_id,
     state.translationFilter,
     second,
-    getTranslationVariantPreferenceForSource(sourceId)
+    state.translationVariant
   );
+}
+
+function getCurrentVideoReloadSelection() {
+  const current = currentVideo();
+  const videoId = String(current?.video_id || "").trim();
+  const playbackTimeSec = state.urlPlaybackTimeSecond >= 0
+    ? state.urlPlaybackTimeSecond
+    : Number.isFinite(Number(elements.videoPlayer?.currentTime))
+      ? Math.max(0, Math.round(Number(elements.videoPlayer.currentTime)))
+      : null;
+  return {
+    videoId,
+    playbackTimeSec,
+  };
 }
 
 function applyInitialPlaybackTime(playbackTimeSec) {
@@ -1519,8 +1533,10 @@ function closeJumpModal() {
   elements.jumpModal.setAttribute("aria-hidden", "true");
 }
 
-function renderSourceOptions(preferredSource = "") {
-  const selectedBefore = preferredSource || elements.sourceSelect.value || "";
+function renderSourceOptions(preferredSource) {
+  const selectedBefore = preferredSource === undefined
+    ? String(elements.sourceSelect.value || "").trim()
+    : String(preferredSource || "").trim();
   const options = ["", ...state.sources];
   elements.sourceSelect.textContent = "";
 
@@ -8607,7 +8623,7 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   elements.videoNote.value = video.note || "";
   renderTrackOptions(video);
   updateUrlVideoSelection(
-    video.source_id,
+    state.feedSourceId,
     video.video_id,
     state.translationFilter,
     null,
@@ -8648,18 +8664,19 @@ async function loadFeed(
 ) {
   closeJumpModal();
   closeLyricReel();
+  state.feedSourceId = String(sourceId || "").trim();
   state.translationFilter = normalizeTranslationFilter(translationFilter, state.translationFilter);
   localStorage.setItem("substudy.translation_filter", state.translationFilter);
   updateTranslationFilterSelect();
-  const variantSourceId = String(sourceId || "").trim();
+  const variantSourceId = state.feedSourceId;
   state.translationVariant = getTranslationVariantPreferenceForSource(variantSourceId);
   updateTranslationVariantSelect(variantSourceId);
   state.dictPrefetchToken += 1;
   state.dictPrefetchedVideoKeys.clear();
   state.dictPrefetchPendingVideoKeys.clear();
   const params = new URLSearchParams({ limit: "900", offset: "0" });
-  if (sourceId) {
-    params.set("source_id", sourceId);
+  if (state.feedSourceId) {
+    params.set("source_id", state.feedSourceId);
   }
   params.set("translation_filter", state.translationFilter);
 
@@ -8688,7 +8705,7 @@ async function loadFeed(
   state.metaExpanded = false;
   updateMetaDrawerState();
   elements.rangeStatus.textContent = "範囲ブックマークは未開始です。";
-  renderSourceOptions(sourceId);
+  renderSourceOptions(state.feedSourceId);
 
   if (!state.videos.length) {
     elements.videoPlayer.removeAttribute("src");
@@ -8696,11 +8713,11 @@ async function loadFeed(
     updateVideoProgressTimer();
     releasePlayerCardSnapLock(false);
     updateUrlVideoSelection(
-      sourceId,
+      state.feedSourceId,
       "",
       state.translationFilter,
       null,
-      getTranslationVariantPreferenceForSource(sourceId)
+      getTranslationVariantPreferenceForSource(state.feedSourceId)
     );
     state.playbackHistory = [];
     state.historyPointer = -1;
@@ -9517,7 +9534,14 @@ function bindEvents() {
   });
 
   elements.sourceSelect.addEventListener("change", () => {
-    loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
+    const reloadSelection = getCurrentVideoReloadSelection();
+    loadFeed(
+      elements.sourceSelect.value,
+      false,
+      reloadSelection.videoId,
+      state.translationFilter,
+      reloadSelection.playbackTimeSec
+    ).catch((error) => {
       setStatus(error.message, "error");
     });
     elements.sourceSelect.blur();
@@ -9528,7 +9552,14 @@ function bindEvents() {
       state.translationFilter = normalizeTranslationFilter(elements.translationFilterSelect.value, "all");
       localStorage.setItem("substudy.translation_filter", state.translationFilter);
       updateTranslationFilterSelect();
-      loadFeed(elements.sourceSelect.value, false, "", state.translationFilter).catch((error) => {
+      const reloadSelection = getCurrentVideoReloadSelection();
+      loadFeed(
+        elements.sourceSelect.value,
+        false,
+        reloadSelection.videoId,
+        state.translationFilter,
+        reloadSelection.playbackTimeSec
+      ).catch((error) => {
         setStatus(error.message, "error");
       });
       elements.translationFilterSelect.blur();
@@ -9562,7 +9593,7 @@ function bindEvents() {
       const current = currentVideo();
       const playbackTimeSec = state.urlPlaybackTimeSecond >= 0 ? state.urlPlaybackTimeSecond : null;
       updateUrlVideoSelection(
-        current?.source_id || sourceId,
+        state.feedSourceId,
         current?.video_id || "",
         state.translationFilter,
         playbackTimeSec,
@@ -9753,7 +9784,7 @@ function bindEvents() {
         });
         const playbackTimeSec = state.urlPlaybackTimeSecond >= 0 ? state.urlPlaybackTimeSecond : null;
         updateUrlVideoSelection(
-          video.source_id,
+          state.feedSourceId,
           video.video_id,
           state.translationFilter,
           playbackTimeSec,
