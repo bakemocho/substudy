@@ -630,12 +630,36 @@ body {
 
 .main-controls {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
 .main-controls.collapsed {
   display: none;
+}
+
+.main-controls button {
+  min-width: 0;
+}
+
+.preference-btn.active {
+  color: #f6f8ff;
+}
+
+.preference-btn-positive.active,
+.preference-btn-positive.active:hover,
+.preference-btn-positive.active:focus-visible {
+  border-color: rgba(255, 212, 109, 0.88);
+  background: rgba(70, 50, 10, 0.94);
+  color: #fff2ca;
+}
+
+.preference-btn-negative.active,
+.preference-btn-negative.active:hover,
+.preference-btn-negative.active:focus-visible {
+  border-color: rgba(255, 113, 140, 0.84);
+  background: rgba(61, 18, 31, 0.94);
+  color: #ffd6df;
 }
 
 .volume-wrap {

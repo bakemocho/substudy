@@ -4025,6 +4025,14 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS video_dislikes (
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, video_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
         CREATE TABLE IF NOT EXISTS subtitle_bookmarks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id TEXT NOT NULL,
@@ -4074,6 +4082,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_video_favorites_created_at
             ON video_favorites(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_video_dislikes_created_at
+            ON video_dislikes(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
             ON subtitle_bookmarks(source_id, video_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
@@ -4962,7 +4972,7 @@ def prune_source_videos_full_rebuild(
         )
 
     # Keep side tables consistent when full rebuild drops videos that no longer exist.
-    for table_name in ("video_favorites", "subtitle_bookmarks", "video_notes"):
+    for table_name in ("video_favorites", "video_dislikes", "subtitle_bookmarks", "video_notes"):
         connection.execute(
             f"""
             DELETE FROM {table_name}
@@ -13293,10 +13303,15 @@ def build_web_handler(
                         v.webpage_url,
                         v.media_path,
                         COALESCE(vf.created_at, '') AS favorite_created_at,
+                        COALESCE(vd.created_at, '') AS disliked_created_at,
                         CASE
                             WHEN vf.video_id IS NULL THEN 0
                             ELSE 1
                         END AS is_favorite,
+                        CASE
+                            WHEN vd.video_id IS NULL THEN 0
+                            ELSE 1
+                        END AS is_disliked,
                         COALESCE(vn.note, '') AS video_note,
                         v.audio_lufs,
                         v.audio_gain_db
@@ -13304,6 +13319,9 @@ def build_web_handler(
                     LEFT JOIN video_favorites vf
                       ON vf.source_id = v.source_id
                      AND vf.video_id = v.video_id
+                    LEFT JOIN video_dislikes vd
+                      ON vd.source_id = v.source_id
+                     AND vd.video_id = v.video_id
                     LEFT JOIN video_notes vn
                       ON vn.source_id = v.source_id
                      AND vn.video_id = v.video_id
@@ -13421,6 +13439,12 @@ def build_web_handler(
                                 ""
                                 if row["favorite_created_at"] in (None, "")
                                 else str(row["favorite_created_at"])
+                            ),
+                            "is_disliked": bool(row["is_disliked"]),
+                            "disliked_created_at": (
+                                ""
+                                if row["disliked_created_at"] in (None, "")
+                                else str(row["disliked_created_at"])
                             ),
                             "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
                             "audio_lufs": safe_float(row["audio_lufs"]),
@@ -14009,6 +14033,107 @@ def build_web_handler(
             ).fetchone()
             return row is not None
 
+        def _fetch_video_preference_state(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+        ) -> dict[str, Any]:
+            favorite_row = connection.execute(
+                """
+                SELECT created_at
+                FROM video_favorites
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            dislike_row = connection.execute(
+                """
+                SELECT created_at
+                FROM video_dislikes
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            return {
+                "is_favorite": favorite_row is not None,
+                "favorite_created_at": (
+                    ""
+                    if favorite_row is None or favorite_row["created_at"] in (None, "")
+                    else str(favorite_row["created_at"])
+                ),
+                "is_disliked": dislike_row is not None,
+                "disliked_created_at": (
+                    ""
+                    if dislike_row is None or dislike_row["created_at"] in (None, "")
+                    else str(dislike_row["created_at"])
+                ),
+            }
+
+        def _toggle_video_preference_mark(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+            selected_table: str,
+            cleared_table: str | None = None,
+        ) -> tuple[bool, bool]:
+            existing = connection.execute(
+                f"""
+                SELECT 1
+                FROM {selected_table}
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    f"""
+                    INSERT INTO {selected_table}(source_id, video_id, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (source_id, video_id, now_utc_iso()),
+                )
+                cleared_other = False
+                if cleared_table:
+                    other_existing = connection.execute(
+                        f"""
+                        SELECT 1
+                        FROM {cleared_table}
+                        WHERE source_id = ?
+                          AND video_id = ?
+                        LIMIT 1
+                        """,
+                        (source_id, video_id),
+                    ).fetchone()
+                    cleared_other = other_existing is not None
+                    if other_existing is not None:
+                        connection.execute(
+                            f"""
+                            DELETE FROM {cleared_table}
+                            WHERE source_id = ?
+                              AND video_id = ?
+                            """,
+                            (source_id, video_id),
+                        )
+                return True, cleared_other
+
+            connection.execute(
+                f"""
+                DELETE FROM {selected_table}
+                WHERE source_id = ?
+                  AND video_id = ?
+                """,
+                (source_id, video_id),
+            )
+            return False, False
+
         def _handle_api_toggle_favorite(self) -> None:
             try:
                 payload = self._read_json_body()
@@ -14029,37 +14154,14 @@ def build_web_handler(
                     self._send_error_json(404, "Video not found.")
                     return
 
-                existing = connection.execute(
-                    """
-                    SELECT 1
-                    FROM video_favorites
-                    WHERE source_id = ?
-                      AND video_id = ?
-                    LIMIT 1
-                    """,
-                    (source_id, video_id),
-                ).fetchone()
-                if existing is None:
-                    created_at = now_utc_iso()
-                    connection.execute(
-                        """
-                        INSERT INTO video_favorites(source_id, video_id, created_at)
-                        VALUES (?, ?, ?)
-                        """,
-                        (source_id, video_id, created_at),
-                    )
-                    favorited = True
-                else:
-                    connection.execute(
-                        """
-                        DELETE FROM video_favorites
-                        WHERE source_id = ?
-                          AND video_id = ?
-                        """,
-                        (source_id, video_id),
-                    )
-                    favorited = False
-                    created_at = ""
+                favorited, cleared_dislike = self._toggle_video_preference_mark(
+                    connection=connection,
+                    source_id=source_id,
+                    video_id=video_id,
+                    selected_table="video_favorites",
+                    cleared_table="video_dislikes",
+                )
+                state_payload = self._fetch_video_preference_state(connection, source_id, video_id)
                 connection.commit()
 
             self._send_json(
@@ -14067,7 +14169,52 @@ def build_web_handler(
                     "source_id": source_id,
                     "video_id": video_id,
                     "is_favorite": favorited,
-                    "created_at": created_at,
+                    "favorite_created_at": str(state_payload["favorite_created_at"] or ""),
+                    "is_disliked": bool(state_payload["is_disliked"]),
+                    "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
+                    "cleared_dislike": cleared_dislike,
+                }
+            )
+
+        def _handle_api_toggle_dislike(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+
+                disliked, cleared_favorite = self._toggle_video_preference_mark(
+                    connection=connection,
+                    source_id=source_id,
+                    video_id=video_id,
+                    selected_table="video_dislikes",
+                    cleared_table="video_favorites",
+                )
+                state_payload = self._fetch_video_preference_state(connection, source_id, video_id)
+                connection.commit()
+
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "is_favorite": bool(state_payload["is_favorite"]),
+                    "favorite_created_at": str(state_payload["favorite_created_at"] or ""),
+                    "is_disliked": disliked,
+                    "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
+                    "cleared_favorite": cleared_favorite,
                 }
             )
 
@@ -14340,6 +14487,9 @@ def build_web_handler(
             try:
                 if path == "/api/favorites/toggle":
                     self._handle_api_toggle_favorite()
+                    return
+                if path == "/api/dislikes/toggle":
+                    self._handle_api_toggle_dislike()
                     return
                 if path == "/api/video-note":
                     self._handle_api_upsert_video_note()

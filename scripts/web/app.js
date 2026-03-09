@@ -339,6 +339,7 @@ const elements = {
   seekForwardBtn: document.getElementById("seekForwardBtn"),
   nextBtn: document.getElementById("nextBtn"),
   favoriteBtn: document.getElementById("favoriteBtn"),
+  dislikeBtn: document.getElementById("dislikeBtn"),
   muteBtn: document.getElementById("muteBtn"),
   volumeSlider: document.getElementById("volumeSlider"),
   playerActions: document.querySelector(".player-actions"),
@@ -732,13 +733,25 @@ function handleWindowWheelForPlayerSnap(event) {
   releasePlayerCardSnapLock(true);
 }
 
-function updateFavoriteButton() {
+function updateVideoPreferenceButtons() {
   const video = currentVideo();
   if (!video) {
     elements.favoriteBtn.textContent = "☆ ファボ";
+    elements.favoriteBtn.classList.remove("active");
+    elements.favoriteBtn.setAttribute("aria-pressed", "false");
+    elements.dislikeBtn.textContent = "✕ パス";
+    elements.dislikeBtn.classList.remove("active");
+    elements.dislikeBtn.setAttribute("aria-pressed", "false");
     return;
   }
-  elements.favoriteBtn.textContent = video.is_favorite ? "★ ファボ済み" : "☆ ファボ";
+  const favoriteActive = Boolean(video.is_favorite);
+  const dislikeActive = Boolean(video.is_disliked);
+  elements.favoriteBtn.textContent = favoriteActive ? "★ ファボ済" : "☆ ファボ";
+  elements.favoriteBtn.classList.toggle("active", favoriteActive);
+  elements.favoriteBtn.setAttribute("aria-pressed", favoriteActive ? "true" : "false");
+  elements.dislikeBtn.textContent = dislikeActive ? "✕ パス済" : "✕ パス";
+  elements.dislikeBtn.classList.toggle("active", dislikeActive);
+  elements.dislikeBtn.setAttribute("aria-pressed", dislikeActive ? "true" : "false");
 }
 
 function updateMetaDrawerState() {
@@ -8842,7 +8855,7 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   state.urlPlaybackTimeSecond = -1;
 
   renderVideoMeta(video);
-  updateFavoriteButton();
+  updateVideoPreferenceButtons();
   elements.videoNote.value = video.note || "";
   renderTrackOptions(video);
   renderSubtitleReelSourceTags(video);
@@ -8905,7 +8918,7 @@ function applyFeedSelectionWithoutVideoReload(index, playbackTimeSec = null) {
     state.urlPlaybackTimeSecond = resolvedPlaybackTimeSec;
   }
   renderVideoMeta(video);
-  updateFavoriteButton();
+  updateVideoPreferenceButtons();
   elements.videoNote.value = video.note || "";
   renderSubtitleReelSourceTags(video);
   updateUrlVideoSelection(
@@ -9147,6 +9160,7 @@ async function toggleFavorite() {
   if (!video) {
     return;
   }
+  const wasDisliked = Boolean(video.is_disliked);
 
   const payload = await apiRequest("/api/favorites/toggle", {
     method: "POST",
@@ -9157,8 +9171,44 @@ async function toggleFavorite() {
   });
 
   video.is_favorite = Boolean(payload.is_favorite);
-  updateFavoriteButton();
-  setStatus(video.is_favorite ? "動画をファボしました。" : "ファボを解除しました。", "ok");
+  video.favorite_created_at = String(payload.favorite_created_at || "");
+  video.is_disliked = Boolean(payload.is_disliked);
+  video.disliked_created_at = String(payload.disliked_created_at || "");
+  updateVideoPreferenceButtons();
+  setStatus(
+    video.is_favorite
+      ? (wasDisliked ? "動画をファボしました。パスを解除しました。" : "動画をファボしました。")
+      : "ファボを解除しました。",
+    "ok",
+  );
+}
+
+async function toggleDislike() {
+  const video = currentVideo();
+  if (!video) {
+    return;
+  }
+  const wasFavorite = Boolean(video.is_favorite);
+
+  const payload = await apiRequest("/api/dislikes/toggle", {
+    method: "POST",
+    body: JSON.stringify({
+      source_id: video.source_id,
+      video_id: video.video_id,
+    }),
+  });
+
+  video.is_favorite = Boolean(payload.is_favorite);
+  video.favorite_created_at = String(payload.favorite_created_at || "");
+  video.is_disliked = Boolean(payload.is_disliked);
+  video.disliked_created_at = String(payload.disliked_created_at || "");
+  updateVideoPreferenceButtons();
+  setStatus(
+    video.is_disliked
+      ? (wasFavorite ? "動画をパス扱いにしました。ファボを解除しました。" : "動画をパス扱いにしました。")
+      : "パス扱いを解除しました。",
+    "ok",
+  );
 }
 
 async function saveVideoNote() {
@@ -10070,6 +10120,10 @@ function bindEvents() {
   });
   elements.favoriteBtn.addEventListener("click", () => {
     toggleFavorite().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
+  });
+  elements.dislikeBtn.addEventListener("click", () => {
+    toggleDislike().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
   });
   elements.metaTabBtn.addEventListener("click", () => toggleMetaDrawer());

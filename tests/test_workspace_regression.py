@@ -3861,6 +3861,92 @@ enabled = true
         self.assertIn("storiesofcz", source_ids)
         self.assertIn("ortbake", source_ids)
 
+    def test_feed_and_toggle_dislike_state(self):
+        media_path = self.workspace_root / "storiesofcz.mp4"
+        media_path.write_bytes(b"")
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "7611111111111111111", "sample", str(media_path), 1, now_iso),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
+        favorite_url = f"http://{host}:{port}/api/favorites/toggle"
+        dislike_url = f"http://{host}:{port}/api/dislikes/toggle"
+        toggle_body = json.dumps(
+            {
+                "source_id": "storiesofcz",
+                "video_id": "7611111111111111111",
+            }
+        ).encode("utf-8")
+
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload.get("count"), 1)
+        self.assertFalse(payload["videos"][0]["is_favorite"])
+        self.assertFalse(payload["videos"][0]["is_disliked"])
+
+        dislike_request = urllib.request.Request(
+            dislike_url,
+            data=toggle_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(dislike_request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            dislike_payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(dislike_payload["is_disliked"])
+        self.assertFalse(dislike_payload["is_favorite"])
+
+        favorite_request = urllib.request.Request(
+            favorite_url,
+            data=toggle_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(favorite_request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            favorite_payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(favorite_payload["is_favorite"])
+        self.assertFalse(favorite_payload["is_disliked"])
+
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            updated_payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(updated_payload["videos"][0]["is_favorite"])
+        self.assertFalse(updated_payload["videos"][0]["is_disliked"])
+
 
 if __name__ == "__main__":
     unittest.main()
