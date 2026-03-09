@@ -1415,6 +1415,56 @@ textarea {
   grid-column: 1 / -1;
 }
 
+.source-target-tag-suggestions-wrap {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.source-target-tag-suggestions-label {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.source-target-tag-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.source-target-form-tag-btn {
+  width: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(143, 164, 235, 0.24);
+  background: rgba(18, 30, 56, 0.44);
+  color: #c7d8ff;
+  border-radius: 999px;
+  padding: 4px 10px;
+  min-height: 22px;
+  font-size: 0.66rem;
+  font-family: "Noto Sans JP", sans-serif;
+  line-height: 1.05;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease, color 140ms ease;
+}
+
+.source-target-form-tag-btn:hover {
+  border-color: rgba(166, 190, 255, 0.44);
+  background: rgba(28, 45, 79, 0.68);
+}
+
+.source-target-form-tag-btn.active {
+  border-color: rgba(105, 216, 167, 0.46);
+  background: rgba(18, 72, 54, 0.66);
+  color: #dcfff1;
+  transform: translateY(-1px);
+}
+
 .source-target-enabled-field input[type="checkbox"] {
   width: 18px;
   height: 18px;

@@ -370,6 +370,7 @@ const elements = {
   sourceTargetUrlInput: document.getElementById("sourceTargetUrlInput"),
   sourceTargetDataDirInput: document.getElementById("sourceTargetDataDirInput"),
   sourceTargetTagsInput: document.getElementById("sourceTargetTagsInput"),
+  sourceTargetTagSuggestions: document.getElementById("sourceTargetTagSuggestions"),
   sourceTargetEnabledInput: document.getElementById("sourceTargetEnabledInput"),
   sourceTargetSaveBtn: document.getElementById("sourceTargetSaveBtn"),
   sourceTargetFormHint: document.getElementById("sourceTargetFormHint"),
@@ -7085,6 +7086,80 @@ function createSourceTagList(rawValue, className = "source-tag-list") {
   return list;
 }
 
+function buildSourceTargetFormTagSuggestions() {
+  const selectedTags = normalizeSourceTags(elements.sourceTargetTagsInput?.value || "");
+  const selectedTagSet = new Set(selectedTags.map((tag) => tag.toLocaleLowerCase()));
+  const statsByTag = new Map();
+  const targets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
+  for (const item of targets) {
+    for (const tag of normalizeSourceTags(item?.tags)) {
+      const key = tag.toLocaleLowerCase();
+      if (!statsByTag.has(key)) {
+        statsByTag.set(key, { label: tag, count: 0, active: false });
+      }
+      statsByTag.get(key).count += 1;
+    }
+  }
+  for (const tag of selectedTags) {
+    const key = tag.toLocaleLowerCase();
+    if (!statsByTag.has(key)) {
+      statsByTag.set(key, { label: tag, count: 0, active: true });
+      continue;
+    }
+    statsByTag.get(key).active = true;
+  }
+  return Array.from(statsByTag.values()).sort((left, right) => (
+    Number(Boolean(right?.active || selectedTagSet.has(String(right?.label || "").toLocaleLowerCase())))
+    - Number(Boolean(left?.active || selectedTagSet.has(String(left?.label || "").toLocaleLowerCase())))
+    || Number(right?.count || 0) - Number(left?.count || 0)
+    || String(left?.label || "").localeCompare(String(right?.label || ""))
+  ));
+}
+
+function renderSourceTargetTagSuggestions() {
+  if (!elements.sourceTargetTagSuggestions) {
+    return;
+  }
+  elements.sourceTargetTagSuggestions.textContent = "";
+  const selectedTags = normalizeSourceTags(elements.sourceTargetTagsInput?.value || "");
+  const activeTagSet = new Set(selectedTags.map((tag) => tag.toLocaleLowerCase()));
+  const suggestions = buildSourceTargetFormTagSuggestions();
+  if (!suggestions.length) {
+    return;
+  }
+  for (const suggestion of suggestions) {
+    const label = String(suggestion?.label || "").trim();
+    if (!label) {
+      continue;
+    }
+    const normalizedLabel = label.toLocaleLowerCase();
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "source-target-form-tag-btn";
+    if (activeTagSet.has(normalizedLabel)) {
+      button.classList.add("active");
+    }
+    button.textContent = label;
+    const count = Number(suggestion?.count || 0);
+    button.title = count > 0
+      ? `${count} source で使用中`
+      : "未保存のタグです";
+    button.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+    });
+    button.addEventListener("click", () => {
+      const nextTags = activeTagSet.has(normalizedLabel)
+        ? selectedTags.filter((tag) => tag.toLocaleLowerCase() !== normalizedLabel)
+        : [...selectedTags, label];
+      if (elements.sourceTargetTagsInput) {
+        elements.sourceTargetTagsInput.value = formatSourceTags(nextTags);
+      }
+      renderSourceTargetTagSuggestions();
+    });
+    elements.sourceTargetTagSuggestions.appendChild(button);
+  }
+}
+
 function sourceTargetWatchKindLabel(watchKind) {
   return String(watchKind || "").trim().toLowerCase() === "likes" ? "いいね欄" : "投稿";
 }
@@ -7511,6 +7586,7 @@ function refreshSourceTargetFormState() {
       elements.sourceTargetFormHint.textContent = `source id「${sourceId}」は未登録です。保存で追加します。${groupingHint}`;
     }
   }
+  renderSourceTargetTagSuggestions();
 }
 
 function setSourceTargetFormFromItem(item = null) {
@@ -9474,6 +9550,15 @@ function bindEvents() {
     elements.sourceTargetHandleInput.addEventListener("blur", () => {
       const normalized = normalizeSourceTargetHandleInput(elements.sourceTargetHandleInput.value);
       elements.sourceTargetHandleInput.value = normalized;
+    });
+  }
+  if (elements.sourceTargetTagsInput) {
+    elements.sourceTargetTagsInput.addEventListener("input", () => {
+      renderSourceTargetTagSuggestions();
+    });
+    elements.sourceTargetTagsInput.addEventListener("blur", () => {
+      elements.sourceTargetTagsInput.value = formatSourceTags(elements.sourceTargetTagsInput.value);
+      renderSourceTargetTagSuggestions();
     });
   }
 

@@ -206,10 +206,14 @@
                   <span>保存先 data_dir（任意）</span>
                   <input id="sourceTargetDataDirInput" type="text" placeholder="未入力なら source id" />
                 </label>
-                <label class="field source-target-tags-field">
+                <div class="field source-target-tags-field">
                   <span>タグ（カンマ区切り）</span>
                   <input id="sourceTargetTagsInput" type="text" placeholder="例: English, Funny, Cooking" />
-                </label>
+                  <div class="source-target-tag-suggestions-wrap">
+                    <span class="source-target-tag-suggestions-label">既存タグをクリックして追加/解除</span>
+                    <div id="sourceTargetTagSuggestions" class="source-target-tag-suggestions"></div>
+                  </div>
+                </div>
                 <label class="field source-target-enabled-field">
                   <span>有効化</span>
                   <input id="sourceTargetEnabledInput" type="checkbox" checked />
