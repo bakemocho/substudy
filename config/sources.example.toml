@@ -50,6 +50,12 @@ asr_prefer_exts = ["srt", "vtt"]
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
 
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.50
+min_total_videos = 10
+
 [[sources]]
 id = "example_creator"
 platform = "tiktok"
@@ -57,8 +63,8 @@ platform = "tiktok"
 # target_handle = "example_creator"
 url = "https://www.tiktok.com/@example_creator"
 enabled = true
-# Optional source classification tags. The first tag is used as the primary
-# group in the Web UI target manager.
+# Optional manual classification tags. In the Web UI a source appears under
+# every tag it has. Automatic tags from [[auto_tags]] are merged in at runtime.
 tags = ["English", "Funny"]
 
 # Paths can be absolute or relative. Relative paths are resolved from data_dir.

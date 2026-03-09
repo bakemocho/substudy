@@ -210,6 +210,83 @@ python3 scripts/substudy.py ledger --config config/sources.toml --incremental
 python3 scripts/substudy.py web --config config/sources.toml
 ```
 
+## 5.1. Claude翻訳比率をクリアした source の確認
+
+`substudy` では、Claude 翻訳の進捗を **視聴可能な動画総数** ベースで判定できる。
+この比率を source 単位で見たい場合は、`config/sources.toml` に自動タグルールを入れておく。
+
+```toml
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.50
+min_total_videos = 10
+```
+
+- `claude_subtitles_ready_playable_ratio` は `media_path` がある動画だけを分母に使う。
+- 分子は、そのうち `ja` 字幕（Claude 翻訳）がある動画数。
+- `min_total_videos = 10` は、母数が小さすぎる source を除外するための下限。
+
+確認手順:
+
+1. 先に ledger を更新する。
+
+```bash
+python3 scripts/substudy.py ledger --config config/sources.toml --incremental
+```
+
+2. Web UI を開いて更新する。
+
+```bash
+python3 scripts/substudy.py web --config config/sources.toml
+```
+
+3. `監視ターゲット管理` または source 処理サマリで `Claude字幕50%+` タグが付いている source を見る。
+
+補足:
+
+- タグが付くのは、設定した閾値を超えた source だけ。
+- 例: `storiesofcz` が `313 / 669 = 46.8%` の場合、`gte = 0.50` ではまだタグは付かない。
+
+Web UI を開かずに確認したい場合は、以下の SQL で同じ基準の source 一覧を出せる。
+
+```bash
+sqlite3 data/master_ledger.sqlite "
+WITH playable AS (
+  SELECT
+    v.source_id,
+    v.video_id,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM subtitles s
+        WHERE s.source_id = v.source_id
+          AND s.video_id = v.video_id
+          AND (
+            LOWER(COALESCE(s.language, '')) = 'ja'
+            OR LOWER(COALESCE(s.language, '')) LIKE 'ja-%'
+            OR LOWER(COALESCE(s.subtitle_path, '')) LIKE '%.ja.%'
+          )
+      ) THEN 1
+      ELSE 0
+    END AS has_claude_ja
+  FROM videos v
+  WHERE v.has_media = 1
+    AND COALESCE(v.media_path, '') <> ''
+)
+SELECT
+  source_id,
+  COUNT(*) AS playable_total,
+  SUM(has_claude_ja) AS claude_ready,
+  ROUND(1.0 * SUM(has_claude_ja) / COUNT(*), 4) AS claude_ready_ratio
+FROM playable
+GROUP BY source_id
+HAVING COUNT(*) >= 10
+   AND 1.0 * SUM(has_claude_ja) / COUNT(*) >= 0.50
+ORDER BY claude_ready_ratio DESC, playable_total DESC, source_id;
+"
+```
+
 ## 5.5. 中断復旧
 
 ### ケースA: 正常な再開

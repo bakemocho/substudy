@@ -229,6 +229,8 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertEqual(alpha["total_videos"], 5)
         self.assertEqual(alpha["english_subtitles_missing"], 2)
         self.assertEqual(alpha["ja_subtitles_ready"], 2)
+        self.assertEqual(alpha["ja_subtitles_ready_playable"], 2)
+        self.assertEqual(alpha["ja_subtitles_missing_playable"], 2)
         self.assertEqual(alpha["loudness_pending"], 3)
         self.assertEqual(alpha["meta_missing"], 1)
         self.assertEqual(alpha["media_missing"], 1)
@@ -245,6 +247,8 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertEqual(beta["source_text_ready"], 1)
         self.assertEqual(beta["asr_ready"], 1)
         self.assertEqual(beta["ja_subtitles_ready"], 0)
+        self.assertEqual(beta["ja_subtitles_ready_playable"], 0)
+        self.assertEqual(beta["ja_subtitles_missing_playable"], 1)
         self.assertEqual(beta["pipeline_buckets"]["ja_pending"], 1)
 
     def test_artifact_open_and_download_headers(self):
@@ -293,6 +297,11 @@ class WorkspaceRegressionTests(unittest.TestCase):
 [global]
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
+
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.5
 
 [[sources]]
 id = "storiesofcz"
@@ -388,6 +397,11 @@ enabled = true
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
 
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.5
+
 [[sources]]
 id = "storiesofcz"
 platform = "tiktok"
@@ -435,6 +449,34 @@ enabled = true
             payload = json.loads(response.read().decode("utf-8"))
         self.assertIn(payload.get("status"), {"created", "updated"})
 
+        now_iso = dt.datetime(2026, 3, 9, 1, 2, tzinfo=dt.timezone.utc).isoformat()
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    meta_path,
+                    has_media,
+                    audio_loudness_analyzed_at,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz_likes", "7611111111111111111", "/tmp/likes.info.json", 1, now_iso, now_iso),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz_likes", "7611111111111111111", "ja", "/tmp/likes.ja.vtt", "vtt"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
         with urllib.request.urlopen(list_url, timeout=5) as response:
             self.assertEqual(response.status, 200)
             list_payload = json.loads(response.read().decode("utf-8"))
@@ -442,7 +484,9 @@ enabled = true
         self.assertIn("storiesofcz_likes", by_id)
         self.assertEqual(by_id["storiesofcz_likes"]["watch_kind"], "likes")
         self.assertEqual(by_id["storiesofcz_likes"]["url"], "https://www.tiktok.com/@storiesofcz/liked")
-        self.assertEqual(by_id["storiesofcz_likes"]["tags"], ["Funny", "English"])
+        self.assertEqual(by_id["storiesofcz_likes"]["manual_tags"], ["Funny", "English"])
+        self.assertEqual(by_id["storiesofcz_likes"]["auto_tags"], ["Claude字幕50%+"])
+        self.assertEqual(by_id["storiesofcz_likes"]["tags"], ["Funny", "English", "Claude字幕50%+"])
 
         remove_request = urllib.request.Request(
             remove_url,
@@ -508,6 +552,43 @@ media_discovery_interval_hours = 3
             3.0,
             places=3,
         )
+
+    def test_load_config_parses_auto_tag_rules(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.5
+min_total_videos = 10
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        global_config, sources = self.mod.load_config(config_path)
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(len(global_config.auto_tag_rules), 1)
+        rule = global_config.auto_tag_rules[0]
+        self.assertEqual(rule.tag, "Claude字幕50%+")
+        self.assertEqual(rule.metric, "claude_subtitles_ready_playable_ratio")
+        self.assertEqual(rule.comparator, "gte")
+        self.assertEqual(rule.threshold, 0.5)
+        self.assertEqual(rule.min_total_videos, 10)
 
     def test_order_sources_for_run_random_keeps_same_members(self):
         config_dir = self.workspace_root / "config"
@@ -683,6 +764,11 @@ enabled = true
 ledger_db = "data/master_ledger.sqlite"
 ledger_csv = "data/master_ledger.csv"
 
+[[auto_tags]]
+tag = "Claude字幕50%+"
+metric = "claude_subtitles_ready_playable_ratio"
+gte = 0.5
+
 [[sources]]
 id = "alpha"
 platform = "tiktok"
@@ -719,6 +805,13 @@ tags = ["English", "Funny"]
                 """,
                 ("alpha", "7611111111111111111", "en", "/tmp/alpha.en.vtt", "vtt"),
             )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("alpha", "7611111111111111111", "ja", "/tmp/alpha.ja.vtt", "vtt"),
+            )
             connection.commit()
         finally:
             connection.close()
@@ -746,7 +839,9 @@ tags = ["English", "Funny"]
         sources = payload.get("source_processing", {}).get("sources", [])
         self.assertEqual(len(sources), 1)
         self.assertEqual(sources[0]["source_id"], "alpha")
-        self.assertEqual(sources[0]["tags"], ["English", "Funny"])
+        self.assertEqual(sources[0]["manual_tags"], ["English", "Funny"])
+        self.assertEqual(sources[0]["auto_tags"], ["Claude字幕50%+"])
+        self.assertEqual(sources[0]["tags"], ["English", "Funny", "Claude字幕50%+"])
 
     def test_resolve_impersonate_flags_auto_prefers_chrome(self):
         config_dir = self.workspace_root / "config"

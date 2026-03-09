@@ -107,6 +107,56 @@ DEFAULT_SLEEP_REQUESTS_JITTER_RATIO = 0.35
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_CHANCE = 0.18
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MIN_SEC = 1.0
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MAX_SEC = 2.5
+AUTO_TAG_COMPARATORS = ("gte", "gt", "lte", "lt", "eq")
+AUTO_TAG_METRIC_KEYS = frozenset(
+    {
+        "total_videos",
+        "complete_count",
+        "pending_total",
+        "english_subtitles_ready",
+        "english_subtitles_missing",
+        "source_text_ready",
+        "source_text_missing",
+        "ja_subtitles_ready",
+        "ja_subtitles_missing",
+        "ja_subtitles_ready_playable",
+        "ja_subtitles_missing_playable",
+        "claude_subtitles_ready",
+        "claude_subtitles_missing",
+        "claude_subtitles_ready_playable",
+        "claude_subtitles_missing_playable",
+        "meta_ready",
+        "meta_missing",
+        "media_ready",
+        "media_missing",
+        "asr_ready",
+        "asr_pending",
+        "loudness_ready",
+        "loudness_pending",
+        "complete_ratio",
+        "pending_ratio",
+        "english_subtitles_ready_ratio",
+        "english_subtitles_missing_ratio",
+        "source_text_ready_ratio",
+        "source_text_missing_ratio",
+        "ja_subtitles_ready_ratio",
+        "ja_subtitles_missing_ratio",
+        "ja_subtitles_ready_playable_ratio",
+        "ja_subtitles_missing_playable_ratio",
+        "claude_subtitles_ready_ratio",
+        "claude_subtitles_missing_ratio",
+        "claude_subtitles_ready_playable_ratio",
+        "claude_subtitles_missing_playable_ratio",
+        "meta_ready_ratio",
+        "meta_missing_ratio",
+        "media_ready_ratio",
+        "media_missing_ratio",
+        "asr_ready_ratio",
+        "asr_pending_ratio",
+        "loudness_ready_ratio",
+        "loudness_pending_ratio",
+    }
+)
 _SOURCE_ACCESS_UNSET = object()
 RE_TRANSLATION_ASCII = re.compile(r"[A-Za-z]")
 RE_TRANSLATION_JA = re.compile(r"[ぁ-んァ-ヶ一-龯々ー]")
@@ -137,6 +187,16 @@ class GlobalConfig:
     ledger_db: Path
     ledger_csv: Path
     source_order: str
+    auto_tag_rules: list[AutoTagRule]
+
+
+@dataclass(frozen=True)
+class AutoTagRule:
+    tag: str
+    metric: str
+    comparator: str
+    threshold: float
+    min_total_videos: int = 1
 
 
 @dataclass
@@ -501,6 +561,16 @@ def parse_non_negative_float(raw_value: Any, fallback: float) -> float:
     return parsed
 
 
+def parse_config_finite_float(raw_value: Any, field_name: str) -> float:
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number.") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be a finite number.")
+    return parsed
+
+
 def normalize_source_order_mode(raw_value: Any, fallback: str = "random") -> str:
     text = str(raw_value or "").strip().lower()
     if text in {"config", "random"}:
@@ -576,6 +646,60 @@ def normalize_source_tags(raw_value: Any) -> list[str]:
         seen.add(dedupe_key)
         normalized_tags.append(tag)
     return normalized_tags
+
+
+def normalize_auto_tag_metric(raw_value: Any) -> str:
+    return str(raw_value or "").strip().lower()
+
+
+def parse_auto_tag_rules(raw_value: Any) -> list[AutoTagRule]:
+    if raw_value in (None, ""):
+        return []
+    if isinstance(raw_value, dict):
+        candidates = [raw_value]
+    elif isinstance(raw_value, list):
+        candidates = raw_value
+    else:
+        raise ValueError("`auto_tags` must be a list of tables.")
+
+    rules: list[AutoTagRule] = []
+    for index, item in enumerate(candidates, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"`auto_tags[{index}]` must be a table.")
+        if not parse_bool_like(item.get("enabled"), default=True):
+            continue
+        tag = " ".join(str(item.get("tag", "")).strip().split())
+        if not tag:
+            raise ValueError(f"`auto_tags[{index}].tag` is required.")
+        metric = normalize_auto_tag_metric(item.get("metric"))
+        if metric not in AUTO_TAG_METRIC_KEYS:
+            supported_metrics = ", ".join(sorted(AUTO_TAG_METRIC_KEYS))
+            raise ValueError(
+                f"`auto_tags[{index}].metric` must be one of: {supported_metrics}"
+            )
+        comparisons = [
+            (name, item.get(name))
+            for name in AUTO_TAG_COMPARATORS
+            if item.get(name) not in (None, "")
+        ]
+        if len(comparisons) != 1:
+            raise ValueError(
+                f"`auto_tags[{index}]` requires exactly one of "
+                f"{', '.join(AUTO_TAG_COMPARATORS)}."
+            )
+        comparator, raw_threshold = comparisons[0]
+        threshold = parse_config_finite_float(raw_threshold, f"`auto_tags[{index}].{comparator}`")
+        min_total_videos = parse_optional_positive_int(item.get("min_total_videos"), 1) or 1
+        rules.append(
+            AutoTagRule(
+                tag=tag,
+                metric=metric,
+                comparator=comparator,
+                threshold=threshold,
+                min_total_videos=max(1, int(min_total_videos)),
+            )
+        )
+    return rules
 
 
 def normalize_tiktok_handle(raw_value: Any) -> str | None:
@@ -720,6 +844,19 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
         global_raw.get("source_order", "random"),
         fallback="random",
     )
+    raw_auto_tag_rules: list[Any] = []
+    if "auto_tags" in global_raw:
+        global_auto_tags = global_raw.get("auto_tags")
+        if isinstance(global_auto_tags, list):
+            raw_auto_tag_rules.extend(global_auto_tags)
+        elif global_auto_tags not in (None, ""):
+            raise ValueError("`global.auto_tags` must be a list of tables.")
+    root_auto_tags = raw.get("auto_tags")
+    if isinstance(root_auto_tags, list):
+        raw_auto_tag_rules.extend(root_auto_tags)
+    elif root_auto_tags not in (None, ""):
+        raise ValueError("`auto_tags` must be a list of tables.")
+    auto_tag_rules = parse_auto_tag_rules(raw_auto_tag_rules)
     global_media_discovery_interval_hours = parse_non_negative_float(
         global_raw.get("media_discovery_interval_hours", 24.0),
         24.0,
@@ -729,6 +866,7 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
         ledger_db=resolve_path(cwd, global_raw.get("ledger_db"), str(DEFAULT_LEDGER_DB)),
         ledger_csv=resolve_path(cwd, global_raw.get("ledger_csv"), str(DEFAULT_LEDGER_CSV)),
         source_order=global_source_order,
+        auto_tag_rules=auto_tag_rules,
     )
     global_playlist_end = parse_optional_positive_int(
         global_raw.get("playlist_end"),
@@ -11963,6 +12101,8 @@ def build_workspace_source_processing_summary(source_id: str = "") -> dict[str, 
         "source_text_missing": 0,
         "ja_subtitles_ready": 0,
         "ja_subtitles_missing": 0,
+        "ja_subtitles_ready_playable": 0,
+        "ja_subtitles_missing_playable": 0,
         "meta_ready": 0,
         "meta_missing": 0,
         "media_ready": 0,
@@ -11981,6 +12121,118 @@ def build_workspace_source_processing_summary(source_id: str = "") -> dict[str, 
     }
 
 
+def build_source_auto_tag_metrics(summary: dict[str, Any]) -> dict[str, float]:
+    total_videos = max(0, int(summary.get("total_videos", 0) or 0))
+    media_ready = max(0, int(summary.get("media_ready", 0) or 0))
+
+    def total_ratio(value: Any) -> float:
+        if total_videos <= 0:
+            return 0.0
+        return float(int(value or 0)) / float(total_videos)
+
+    def media_ratio(value: Any) -> float:
+        if media_ready <= 0:
+            return 0.0
+        return float(int(value or 0)) / float(media_ready)
+
+    metrics: dict[str, float] = {
+        "total_videos": float(total_videos),
+        "complete_count": float(int(summary.get("complete_count", 0) or 0)),
+        "pending_total": float(int(summary.get("pending_total", 0) or 0)),
+        "english_subtitles_ready": float(int(summary.get("english_subtitles_ready", 0) or 0)),
+        "english_subtitles_missing": float(int(summary.get("english_subtitles_missing", 0) or 0)),
+        "source_text_ready": float(int(summary.get("source_text_ready", 0) or 0)),
+        "source_text_missing": float(int(summary.get("source_text_missing", 0) or 0)),
+        "ja_subtitles_ready": float(int(summary.get("ja_subtitles_ready", 0) or 0)),
+        "ja_subtitles_missing": float(int(summary.get("ja_subtitles_missing", 0) or 0)),
+        "ja_subtitles_ready_playable": float(int(summary.get("ja_subtitles_ready_playable", 0) or 0)),
+        "ja_subtitles_missing_playable": float(int(summary.get("ja_subtitles_missing_playable", 0) or 0)),
+        "meta_ready": float(int(summary.get("meta_ready", 0) or 0)),
+        "meta_missing": float(int(summary.get("meta_missing", 0) or 0)),
+        "media_ready": float(media_ready),
+        "media_missing": float(int(summary.get("media_missing", 0) or 0)),
+        "asr_ready": float(int(summary.get("asr_ready", 0) or 0)),
+        "asr_pending": float(int(summary.get("asr_pending", 0) or 0)),
+        "loudness_ready": float(int(summary.get("loudness_ready", 0) or 0)),
+        "loudness_pending": float(int(summary.get("loudness_pending", 0) or 0)),
+    }
+    metrics["claude_subtitles_ready"] = metrics["ja_subtitles_ready"]
+    metrics["claude_subtitles_missing"] = metrics["ja_subtitles_missing"]
+    metrics["claude_subtitles_ready_playable"] = metrics["ja_subtitles_ready_playable"]
+    metrics["claude_subtitles_missing_playable"] = metrics["ja_subtitles_missing_playable"]
+
+    metrics["complete_ratio"] = total_ratio(summary.get("complete_count", 0))
+    metrics["pending_ratio"] = total_ratio(summary.get("pending_total", 0))
+    metrics["english_subtitles_ready_ratio"] = total_ratio(summary.get("english_subtitles_ready", 0))
+    metrics["english_subtitles_missing_ratio"] = total_ratio(summary.get("english_subtitles_missing", 0))
+    metrics["source_text_ready_ratio"] = total_ratio(summary.get("source_text_ready", 0))
+    metrics["source_text_missing_ratio"] = total_ratio(summary.get("source_text_missing", 0))
+    metrics["ja_subtitles_ready_ratio"] = total_ratio(summary.get("ja_subtitles_ready", 0))
+    metrics["ja_subtitles_missing_ratio"] = total_ratio(summary.get("ja_subtitles_missing", 0))
+    metrics["ja_subtitles_ready_playable_ratio"] = media_ratio(summary.get("ja_subtitles_ready_playable", 0))
+    metrics["ja_subtitles_missing_playable_ratio"] = media_ratio(summary.get("ja_subtitles_missing_playable", 0))
+    metrics["claude_subtitles_ready_ratio"] = metrics["ja_subtitles_ready_ratio"]
+    metrics["claude_subtitles_missing_ratio"] = metrics["ja_subtitles_missing_ratio"]
+    metrics["claude_subtitles_ready_playable_ratio"] = metrics["ja_subtitles_ready_playable_ratio"]
+    metrics["claude_subtitles_missing_playable_ratio"] = metrics["ja_subtitles_missing_playable_ratio"]
+    metrics["meta_ready_ratio"] = total_ratio(summary.get("meta_ready", 0))
+    metrics["meta_missing_ratio"] = total_ratio(summary.get("meta_missing", 0))
+    metrics["media_ready_ratio"] = total_ratio(summary.get("media_ready", 0))
+    metrics["media_missing_ratio"] = total_ratio(summary.get("media_missing", 0))
+    metrics["asr_ready_ratio"] = media_ratio(summary.get("asr_ready", 0))
+    metrics["asr_pending_ratio"] = media_ratio(summary.get("asr_pending", 0))
+    metrics["loudness_ready_ratio"] = media_ratio(summary.get("loudness_ready", 0))
+    metrics["loudness_pending_ratio"] = media_ratio(summary.get("loudness_pending", 0))
+    return metrics
+
+
+def compute_source_auto_tags(
+    summary: dict[str, Any] | None,
+    rules: list[AutoTagRule],
+) -> list[str]:
+    if summary is None or not rules:
+        return []
+    total_videos = max(0, int(summary.get("total_videos", 0) or 0))
+    metrics = build_source_auto_tag_metrics(summary)
+    matched_tags: list[str] = []
+    for rule in rules:
+        if total_videos < int(rule.min_total_videos):
+            continue
+        value = float(metrics.get(rule.metric, 0.0))
+        threshold = float(rule.threshold)
+        matched = False
+        if rule.comparator == "gte":
+            matched = value >= threshold
+        elif rule.comparator == "gt":
+            matched = value > threshold
+        elif rule.comparator == "lte":
+            matched = value <= threshold
+        elif rule.comparator == "lt":
+            matched = value < threshold
+        elif rule.comparator == "eq":
+            matched = math.isclose(value, threshold, rel_tol=1e-9, abs_tol=1e-9)
+        if matched:
+            matched_tags.append(rule.tag)
+    return normalize_source_tags(matched_tags)
+
+
+def merge_source_tag_sets(manual_tags: Any, auto_tags: Any) -> list[str]:
+    return normalize_source_tags([*normalize_source_tags(manual_tags), *normalize_source_tags(auto_tags)])
+
+
+def apply_source_tags_payload(
+    payload: dict[str, Any],
+    manual_tags: Any,
+    auto_tags: Any,
+) -> dict[str, Any]:
+    normalized_manual_tags = normalize_source_tags(manual_tags)
+    normalized_auto_tags = normalize_source_tags(auto_tags)
+    payload["manual_tags"] = normalized_manual_tags
+    payload["auto_tags"] = normalized_auto_tags
+    payload["tags"] = merge_source_tag_sets(normalized_manual_tags, normalized_auto_tags)
+    return payload
+
+
 def accumulate_workspace_source_processing_summary(
     target: dict[str, Any],
     summary: dict[str, Any],
@@ -11995,6 +12247,8 @@ def accumulate_workspace_source_processing_summary(
         "source_text_missing",
         "ja_subtitles_ready",
         "ja_subtitles_missing",
+        "ja_subtitles_ready_playable",
+        "ja_subtitles_missing_playable",
         "meta_ready",
         "meta_missing",
         "media_ready",
@@ -12157,6 +12411,13 @@ def collect_workspace_source_processing_summary(
         )
         summary["ja_subtitles_ready"] = int(summary["ja_subtitles_ready"]) + int(ja_ready)
         summary["ja_subtitles_missing"] = int(summary["ja_subtitles_missing"]) + int(not ja_ready)
+        if media_ready:
+            summary["ja_subtitles_ready_playable"] = int(summary["ja_subtitles_ready_playable"]) + int(
+                ja_ready
+            )
+            summary["ja_subtitles_missing_playable"] = int(
+                summary["ja_subtitles_missing_playable"]
+            ) + int(not ja_ready)
 
         if media_ready:
             summary["asr_ready"] = int(summary["asr_ready"]) + int(asr_ready)
@@ -12456,11 +12717,11 @@ def normalize_source_target_id(raw_value: Any) -> str:
 
 
 def serialize_source_target(source: SourceConfig, video_count: int = 0) -> dict[str, Any]:
-    return {
+    return apply_source_tags_payload(
+        {
         "id": source.id,
         "platform": source.platform,
         "enabled": bool(source.enabled),
-        "tags": list(source.tags),
         "watch_kind": source.watch_kind,
         "target_handle": source.target_handle or "",
         "handle": source.handle or "",
@@ -12468,7 +12729,10 @@ def serialize_source_target(source: SourceConfig, video_count: int = 0) -> dict[
         "data_dir": str(source.data_dir),
         "origin": source.origin,
         "video_count": max(0, int(video_count)),
-    }
+        },
+        manual_tags=source.tags,
+        auto_tags=[],
+    )
 
 
 def build_web_handler(
@@ -12674,8 +12938,11 @@ def build_web_handler(
             self.end_headers()
             self.wfile.write(payload)
 
+        def _load_config_bundle(self) -> tuple[GlobalConfig, list[SourceConfig]]:
+            return load_config(web_config_path)
+
         def _load_all_config_sources(self) -> list[SourceConfig]:
-            _, sources = load_config(web_config_path)
+            _, sources = self._load_config_bundle()
             return sources
 
         def _resolve_effective_source_scope(self) -> set[str] | None:
@@ -12719,12 +12986,13 @@ def build_web_handler(
 
         def _handle_api_source_targets_get(self) -> None:
             try:
-                configured_sources = self._load_all_config_sources()
+                global_config, configured_sources = self._load_config_bundle()
             except (FileNotFoundError, ValueError, KeyError) as exc:
                 self._send_error_json(500, f"Failed to read config: {exc}")
                 return
 
             video_count_by_source: dict[str, int] = {}
+            processing_summary_by_source: dict[str, dict[str, Any]] = {}
             with self._open_connection() as connection:
                 rows = connection.execute(
                     """
@@ -12736,6 +13004,15 @@ def build_web_handler(
                 for row in rows:
                     source_id = str(row["source_id"] or "")
                     video_count_by_source[source_id] = int(row["video_count"] or 0)
+                processing_summary = collect_workspace_source_processing_summary(
+                    connection=connection,
+                    source_ids=[source.id for source in configured_sources],
+                )
+                processing_summary_by_source = {
+                    str(item.get("source_id") or "").strip(): item
+                    for item in cast(list[dict[str, Any]], processing_summary.get("sources") or [])
+                    if str(item.get("source_id") or "").strip()
+                }
 
             effective_scope = self._resolve_effective_source_scope()
             targets: list[dict[str, Any]] = []
@@ -12744,6 +13021,11 @@ def build_web_handler(
                     source,
                     video_count=video_count_by_source.get(source.id, 0),
                 )
+                auto_tags = compute_source_auto_tags(
+                    processing_summary_by_source.get(source.id),
+                    global_config.auto_tag_rules,
+                )
+                apply_source_tags_payload(item, manual_tags=source.tags, auto_tags=auto_tags)
                 if effective_scope is None:
                     item["active_in_web"] = True
                 else:
@@ -13453,10 +13735,25 @@ def build_web_handler(
                     source_ids=source_scope,
                     run_limit=import_run_limit,
                 )
-            source_config_by_id = self._load_config_source_map()
+            try:
+                global_config, configured_sources = self._load_config_bundle()
+            except (FileNotFoundError, ValueError, KeyError):
+                global_config = GlobalConfig(
+                    ledger_db=DEFAULT_LEDGER_DB,
+                    ledger_csv=DEFAULT_LEDGER_CSV,
+                    source_order="random",
+                    auto_tag_rules=[],
+                )
+                configured_sources = []
+            source_config_by_id = {
+                source.id: source
+                for source in configured_sources
+            }
             for item in cast(list[dict[str, Any]], source_processing.get("sources") or []):
                 source_config = source_config_by_id.get(str(item.get("source_id") or "").strip())
-                item["tags"] = list(source_config.tags) if source_config is not None else []
+                manual_tags = list(source_config.tags) if source_config is not None else []
+                auto_tags = compute_source_auto_tags(item, global_config.auto_tag_rules)
+                apply_source_tags_payload(item, manual_tags=manual_tags, auto_tags=auto_tags)
             review_hints_by_card_id = load_workspace_review_hints(workspace_root)
             review_cards = apply_workspace_review_hints(review_cards, review_hints_by_card_id)
             translation_qa_by_card_id = load_workspace_translation_qa(workspace_root)

@@ -7070,6 +7070,10 @@ function formatSourceTags(rawValue) {
   return normalizeSourceTags(rawValue).join(", ");
 }
 
+function sourceTargetManualTags(item) {
+  return normalizeSourceTags(item?.manual_tags ?? item?.tags);
+}
+
 function createSourceTagList(rawValue, className = "source-tag-list") {
   const tags = normalizeSourceTags(rawValue);
   if (!tags.length) {
@@ -7092,7 +7096,7 @@ function buildSourceTargetFormTagSuggestions() {
   const statsByTag = new Map();
   const targets = Array.isArray(state.sourceTargets) ? state.sourceTargets : [];
   for (const item of targets) {
-    for (const tag of normalizeSourceTags(item?.tags)) {
+    for (const tag of sourceTargetManualTags(item)) {
       const key = tag.toLocaleLowerCase();
       if (!statsByTag.has(key)) {
         statsByTag.set(key, { label: tag, count: 0, active: false });
@@ -7573,7 +7577,10 @@ function renderSourceTargetItemRow(item) {
 function refreshSourceTargetFormState() {
   const sourceId = String(elements.sourceTargetIdInput?.value || "").trim();
   const existingItem = findSourceTargetById(sourceId);
-  const groupingHint = " タグを複数付けると、一覧では各タグの section に重複表示されます。";
+  const groupingHint = (
+    " タグを複数付けると、一覧では各タグの section に重複表示されます。"
+    + " 自動タグは一覧と filter にだけ反映され、ここでは手動タグを編集します。"
+  );
   if (elements.sourceTargetSaveBtn) {
     elements.sourceTargetSaveBtn.textContent = existingItem ? "更新" : "追加";
   }
@@ -7609,7 +7616,7 @@ function setSourceTargetFormFromItem(item = null) {
     elements.sourceTargetDataDirInput.value = target ? String(target.data_dir || "") : "";
   }
   if (elements.sourceTargetTagsInput) {
-    elements.sourceTargetTagsInput.value = target ? formatSourceTags(target.tags) : "";
+    elements.sourceTargetTagsInput.value = target ? formatSourceTags(sourceTargetManualTags(target)) : "";
   }
   if (elements.sourceTargetEnabledInput) {
     elements.sourceTargetEnabledInput.checked = target ? Boolean(target.enabled) : true;
@@ -7624,7 +7631,7 @@ function buildSourceTargetPayloadFromItem(item, overrides = {}) {
     target_handle: String(item?.target_handle || item?.handle || ""),
     url: String(item?.url || ""),
     data_dir: String(item?.data_dir || ""),
-    tags: normalizeSourceTags(item?.tags),
+    tags: sourceTargetManualTags(item),
     enabled: Boolean(item?.enabled),
     ...overrides,
   };
