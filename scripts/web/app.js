@@ -7179,6 +7179,28 @@ function sourceTargetOriginLabel(origin) {
   return "config";
 }
 
+function sourceTargetRemoveActionLabel(item) {
+  const normalized = String(item?.origin || "").trim().toLowerCase();
+  if (normalized === "managed_override") {
+    return "override解除";
+  }
+  if (normalized === "config") {
+    return "config固定";
+  }
+  return "監視解除";
+}
+
+function sourceTargetRemoveActionTitle(item) {
+  const normalized = String(item?.origin || "").trim().toLowerCase();
+  if (normalized === "managed_override") {
+    return "この source の override 設定だけを解除します。ローカルの動画・字幕・meta は削除しません。";
+  }
+  if (normalized === "config") {
+    return "config 側の定義はここからは解除できません。";
+  }
+  return "この source を監視ターゲット一覧から外します。ローカルの動画・字幕・meta は削除しません。";
+}
+
 function findSourceTargetById(sourceId) {
   const lookupId = String(sourceId || "").trim();
   if (!lookupId) {
@@ -7464,7 +7486,7 @@ function buildSourceTargetGroupSummary(group) {
   return [
     `sources:${Number(group?.itemCount || 0)}`,
     `enabled:${Number(group?.enabledCount || 0)}`,
-    `pending:${Number(group?.pendingTotal || 0)}`,
+    `未完了(tracked):${Number(group?.pendingTotal || 0)}`,
     `英字幕未DL:${Number(group?.englishSubtitlesMissing || 0)}`,
     `loudness未処理:${Number(group?.loudnessPending || 0)}`,
   ].join(" • ");
@@ -7498,7 +7520,7 @@ function renderSourceTargetItemRow(item) {
   if (Number(item?.pending_total || 0) > 0) {
     const pendingBadge = document.createElement("span");
     pendingBadge.className = "workspace-badge missing";
-    pendingBadge.textContent = `pending ${Number(item?.pending_total || 0)}`;
+    pendingBadge.textContent = `未完了 ${Number(item?.pending_total || 0)}`;
     badges.appendChild(pendingBadge);
   }
 
@@ -7543,18 +7565,27 @@ function renderSourceTargetItemRow(item) {
   });
   actions.appendChild(toggleBtn);
 
+  const randomPlayBtn = document.createElement("button");
+  randomPlayBtn.type = "button";
+  randomPlayBtn.className = "workspace-jump-btn workspace-artifact-btn";
+  randomPlayBtn.textContent = "ランダム再生";
+  randomPlayBtn.title = "この source の再生可能動画からランダムに1本選んで開きます。";
+  randomPlayBtn.addEventListener("click", () => {
+    const sourceId = String(item?.id || "").trim();
+    loadFeed(sourceId, true, "", state.translationFilter).catch((error) => {
+      setStatus(error.message, "error");
+    });
+  });
+  actions.appendChild(randomPlayBtn);
+
   const removeBtn = document.createElement("button");
   removeBtn.type = "button";
   removeBtn.className = "workspace-jump-btn workspace-artifact-btn";
   const origin = String(item?.origin || "").trim().toLowerCase();
-  if (origin === "managed_override") {
-    removeBtn.textContent = "override解除";
-  } else {
-    removeBtn.textContent = "削除";
-  }
+  removeBtn.textContent = sourceTargetRemoveActionLabel(item);
+  removeBtn.title = sourceTargetRemoveActionTitle(item);
   if (origin === "config") {
     removeBtn.disabled = true;
-    removeBtn.title = "config 側の定義はここからは削除できません。";
   } else {
     removeBtn.addEventListener("click", () => {
       removeSourceTargetOverride(item).catch((error) => setStatus(error.message, "error"));
@@ -7697,6 +7728,23 @@ async function removeSourceTargetOverride(item) {
   if (!sourceId) {
     return;
   }
+  const actionLabel = sourceTargetRemoveActionLabel(item);
+  const confirmation = window.prompt(
+    [
+      `${actionLabel}の確認: ${sourceId}`,
+      sourceTargetRemoveActionTitle(item),
+      "続けるには source id をそのまま入力してください。",
+    ].join("\n"),
+    ""
+  );
+  if (confirmation === null) {
+    setStatus(`${actionLabel}をキャンセルしました: ${sourceId}`, "info");
+    return;
+  }
+  if (String(confirmation).trim() !== sourceId) {
+    setStatus(`${actionLabel}を中止しました。source id が一致しません。`, "error");
+    return;
+  }
   await apiRequest("/api/source-targets/remove", {
     method: "POST",
     body: JSON.stringify({ id: sourceId }),
@@ -7705,7 +7753,7 @@ async function removeSourceTargetOverride(item) {
     setSourceTargetFormFromItem(null);
   }
   await loadSourceTargets({ silent: true });
-  setStatus(`ターゲット設定を解除しました: ${sourceId}`, "ok");
+  setStatus(`${actionLabel}しました: ${sourceId}（ローカルファイルは削除していません）`, "ok");
 }
 
 function renderSourceTargetsPanel() {
@@ -7865,7 +7913,12 @@ function createWorkspaceSourceMetric(label, value, accentClass = "") {
 
   const valueNode = document.createElement("span");
   valueNode.className = "workspace-source-metric-value";
-  valueNode.textContent = String(Number(value || 0));
+  if (typeof value === "number") {
+    valueNode.textContent = String(Number(value || 0));
+  } else {
+    const renderedValue = String(value ?? "").trim();
+    valueNode.textContent = renderedValue || "0";
+  }
 
   const labelNode = document.createElement("span");
   labelNode.className = "workspace-source-metric-label";
@@ -7879,6 +7932,16 @@ function createWorkspaceSourceMetric(label, value, accentClass = "") {
 function buildWorkspaceSourceSummaryCard(summary) {
   const card = document.createElement("article");
   card.className = "workspace-source-status-card";
+  const trackedTotal = Number(summary?.total_videos || 0);
+  const playableTotal = Number(summary?.media_ready || 0);
+  const completeCount = Number(summary?.complete_count || 0);
+  const pendingTotal = Number(summary?.pending_total || 0);
+  const claudePlayableReady = Number(summary?.ja_subtitles_ready_playable || 0);
+  const englishMissing = Number(summary?.english_subtitles_missing || 0);
+  const loudnessPending = Number(summary?.loudness_pending || 0);
+  const metaMissing = Number(summary?.meta_missing || 0);
+  const mediaMissing = Number(summary?.media_missing || 0);
+  const sourceTextMissing = Number(summary?.source_text_missing || 0);
 
   const head = document.createElement("div");
   head.className = "workspace-source-status-head";
@@ -7889,7 +7952,9 @@ function buildWorkspaceSourceSummaryCard(summary) {
 
   const badge = document.createElement("span");
   badge.className = "workspace-badge";
-  badge.textContent = `完了 ${Number(summary?.complete_count || 0)}/${Number(summary?.total_videos || 0)}`;
+  badge.textContent = playableTotal > 0
+    ? `完了 ${completeCount}/${playableTotal} playable`
+    : `完了 ${completeCount}/${trackedTotal}`;
 
   head.appendChild(title);
   head.appendChild(badge);
@@ -7921,11 +7986,11 @@ function buildWorkspaceSourceSummaryCard(summary) {
 
   const chartValue = document.createElement("span");
   chartValue.className = "workspace-source-chart-value";
-  chartValue.textContent = String(Number(summary?.total_videos || 0));
+  chartValue.textContent = String(trackedTotal);
 
   const chartLabel = document.createElement("span");
   chartLabel.className = "workspace-source-chart-label";
-  chartLabel.textContent = "videos";
+  chartLabel.textContent = "tracked";
 
   chartHole.appendChild(chartValue);
   chartHole.appendChild(chartLabel);
@@ -7933,7 +7998,9 @@ function buildWorkspaceSourceSummaryCard(summary) {
 
   const chartMeta = document.createElement("p");
   chartMeta.className = "workspace-item-meta";
-  chartMeta.textContent = `pending:${Number(summary?.pending_total || 0)} • source_text:${Number(summary?.source_text_ready || 0)}/${Number(summary?.total_videos || 0)}`;
+  chartMeta.textContent = playableTotal > 0
+    ? `playable:${playableTotal} • Claude:${claudePlayableReady}/${playableTotal} • 未完了(tracked):${pendingTotal}`
+    : `未完了(tracked):${pendingTotal} • tracked:${trackedTotal}`;
 
   chartWrap.appendChild(chart);
   chartWrap.appendChild(chartMeta);
@@ -7962,22 +8029,22 @@ function buildWorkspaceSourceSummaryCard(summary) {
   const metrics = document.createElement("div");
   metrics.className = "workspace-source-metrics";
   metrics.appendChild(
-    createWorkspaceSourceMetric("英字幕未DL", Number(summary?.english_subtitles_missing || 0), "warn")
+    createWorkspaceSourceMetric("英字幕未DL", `${englishMissing}/${trackedTotal}`, "warn")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("JA/Claude字幕", Number(summary?.ja_subtitles_ready || 0), "ok")
+    createWorkspaceSourceMetric("JA/Claude字幕", `${claudePlayableReady}/${playableTotal}`, "ok")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("loudness未処理", Number(summary?.loudness_pending || 0), "warn")
+    createWorkspaceSourceMetric("loudness未処理", `${loudnessPending}/${playableTotal}`, "warn")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("meta未取得", Number(summary?.meta_missing || 0))
+    createWorkspaceSourceMetric("meta未取得", `${metaMissing}/${trackedTotal}`)
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("media未取得", Number(summary?.media_missing || 0))
+    createWorkspaceSourceMetric("media未取得", `${mediaMissing}/${trackedTotal}`)
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("字幕/ASR不足", Number(summary?.source_text_missing || 0))
+    createWorkspaceSourceMetric("字幕/ASR不足", `${sourceTextMissing}/${trackedTotal}`)
   );
 
   detail.appendChild(legend);
@@ -8004,14 +8071,18 @@ function renderWorkspaceSourceProcessing() {
   const sources = Array.isArray(sourceProcessing?.sources) ? sourceProcessing.sources : [];
   const sourceCount = Number(totals?.source_count || sources.length || 0);
   const totalVideos = Number(totals?.total_videos || 0);
+  const playableTotal = Number(totals?.media_ready || 0);
   const completeCount = Number(totals?.complete_count || 0);
   const pendingTotal = Number(totals?.pending_total || 0);
+  const claudePlayableReady = Number(totals?.ja_subtitles_ready_playable || 0);
 
   if (elements.workspaceSourceProcessingSummary) {
     if (sourceCount <= 0 || totalVideos <= 0) {
       elements.workspaceSourceProcessingSummary.textContent = "source集計対象の動画がまだありません。";
     } else {
-      elements.workspaceSourceProcessingSummary.textContent = `${sourceCount} source • videos=${totalVideos} • complete=${completeCount} • pending=${pendingTotal}`;
+      elements.workspaceSourceProcessingSummary.textContent = playableTotal > 0
+        ? `${sourceCount} source • tracked=${totalVideos} • playable=${playableTotal} • complete=${completeCount}/${playableTotal} • Claude=${claudePlayableReady}/${playableTotal} • 未完了(tracked)=${pendingTotal}`
+        : `${sourceCount} source • tracked=${totalVideos} • complete=${completeCount} • 未完了(tracked)=${pendingTotal}`;
     }
   }
 
