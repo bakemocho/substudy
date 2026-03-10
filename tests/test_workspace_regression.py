@@ -4166,6 +4166,93 @@ enabled = true
         self.assertTrue(stats["last_served_at"])
         self.assertTrue(stats["last_completed_at"])
 
+    def test_feed_translation_filter_supports_variants(self):
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        video_specs = [
+            ("storiesofcz", "video-ja", "ja", "video-ja.mp4", "video-ja.ja.vtt"),
+            ("storiesofcz", "video-ja-local", "ja-local", "video-ja-local.mp4", "video-ja-local.ja-local.vtt"),
+            ("storiesofcz", "video-ja-asr-local", "ja-asr-local", "video-ja-asr-local.mp4", "video-ja-asr-local.ja-asr-local.vtt"),
+            ("storiesofcz", "video-no-ja", "", "video-no-ja.mp4", ""),
+        ]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            for source_id, video_id, language, media_name, subtitle_name in video_specs:
+                media_path = self.workspace_root / media_name
+                media_path.write_bytes(b"")
+                connection.execute(
+                    """
+                    INSERT INTO videos(
+                        source_id,
+                        video_id,
+                        title,
+                        media_path,
+                        has_media,
+                        synced_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (source_id, video_id, video_id, str(media_path), 1, now_iso),
+                )
+                if subtitle_name:
+                    subtitle_path = self.workspace_root / subtitle_name
+                    subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+                    connection.execute(
+                        """
+                        INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (source_id, video_id, language, str(subtitle_path), "vtt"),
+                    )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+
+        def fetch_video_ids(filter_value: str) -> tuple[str, list[str]]:
+            url = f"http://{host}:{port}/api/feed?limit=20&offset=0&translation_filter={urllib.parse.quote(filter_value)}"
+            with urllib.request.urlopen(url, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read().decode("utf-8"))
+            return (
+                str(payload.get("translation_filter") or ""),
+                [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            )
+
+        echoed_filter, video_ids = fetch_video_ids("ja_only")
+        self.assertEqual(echoed_filter, "ja_only")
+        self.assertEqual(set(video_ids), {"video-ja", "video-ja-local", "video-ja-asr-local"})
+
+        echoed_filter, video_ids = fetch_video_ids("ja")
+        self.assertEqual(echoed_filter, "ja")
+        self.assertEqual(video_ids, ["video-ja"])
+
+        echoed_filter, video_ids = fetch_video_ids("ja-local")
+        self.assertEqual(echoed_filter, "ja-local")
+        self.assertEqual(video_ids, ["video-ja-local"])
+
+        echoed_filter, video_ids = fetch_video_ids("ja-asr-local")
+        self.assertEqual(echoed_filter, "ja-asr-local")
+        self.assertEqual(video_ids, ["video-ja-asr-local"])
+
+        echoed_filter, video_ids = fetch_video_ids("ja_missing")
+        self.assertEqual(echoed_filter, "ja_missing")
+        self.assertEqual(video_ids, ["video-no-ja"])
+
 
 if __name__ == "__main__":
     unittest.main()

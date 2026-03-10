@@ -43,7 +43,14 @@ const SHALLOW_SKIP_RATIO = 0.2;
 const COMPLETE_WATCH_RATIO = 0.9;
 const RANKED_POOL_SIZE = 24;
 const RECENT_HISTORY_LOOKBACK = 12;
-const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
+const TRANSLATION_FILTER_VALUES = new Set([
+  "all",
+  "ja_only",
+  "ja",
+  "ja-local",
+  "ja-asr-local",
+  "ja_missing",
+]);
 const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
 const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
 const TRANSLATION_VARIANT_LABELS = Object.freeze({
@@ -1359,6 +1366,21 @@ function hasJaSubtitleTrack(video) {
     const label = String(track?.label || "").trim().toLowerCase();
     return label === "ja" || label.startsWith("ja-");
   });
+}
+
+function videoMatchesTranslationFilter(video, filterValue) {
+  const safeFilter = normalizeTranslationFilter(filterValue, "all");
+  if (safeFilter === "all") {
+    return true;
+  }
+  const variants = collectAvailableTranslationVariants(video);
+  if (safeFilter === "ja_only") {
+    return variants.length > 0;
+  }
+  if (safeFilter === "ja_missing") {
+    return variants.length === 0;
+  }
+  return variants.includes(safeFilter);
 }
 
 function collectAvailableTranslationVariants(video) {
@@ -9568,11 +9590,7 @@ async function loadFeed(
     && (!TRANSLATION_FILTER_VALUES.has(serverFilter) || serverFilter !== state.translationFilter)
   );
   if (serverFilterMismatch) {
-    loadedVideos = loadedVideos.filter((video) => (
-      state.translationFilter === "ja_only"
-        ? hasJaSubtitleTrack(video)
-        : !hasJaSubtitleTrack(video)
-    ));
+    loadedVideos = loadedVideos.filter((video) => videoMatchesTranslationFilter(video, state.translationFilter));
   }
   if (normalizedSourceTags.length) {
     loadedVideos = loadedVideos.filter((video) => sourceMatchesAnyFeedTag(video?.source_id, normalizedSourceTags));

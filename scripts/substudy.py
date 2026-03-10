@@ -13288,7 +13288,14 @@ def build_web_handler(
                 self._send_error_json(403, "Source is not allowed.")
                 return
             translation_filter = str(query.get("translation_filter", ["all"])[0] or "all").strip().lower()
-            if translation_filter not in {"all", "ja_only", "ja_missing"}:
+            if translation_filter not in {
+                "all",
+                "ja_only",
+                "ja",
+                "ja-local",
+                "ja-asr-local",
+                "ja_missing",
+            }:
                 translation_filter = "all"
 
             limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
@@ -13320,6 +13327,89 @@ def build_web_handler(
                 )
                 """
 
+            def ja_variant_exists_clause(video_alias: str, variant: str) -> str:
+                normalized_variant = str(variant or "").strip().lower()
+                if normalized_variant == "ja_only":
+                    return ja_subtitle_exists_clause(video_alias)
+                if normalized_variant == "ja_missing":
+                    return f"NOT ({ja_subtitle_exists_clause(video_alias)})"
+                if normalized_variant == "ja-asr-local":
+                    return f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM subtitles sja
+                        WHERE sja.source_id = {video_alias}.source_id
+                          AND sja.video_id = {video_alias}.video_id
+                          AND (
+                            LOWER(COALESCE(sja.language, '')) = 'ja-asr-local'
+                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-asr-local-%'
+                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja-asr-local.%'
+                          )
+                    )
+                    """
+                if normalized_variant == "ja-local":
+                    return f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM subtitles sja
+                        WHERE sja.source_id = {video_alias}.source_id
+                          AND sja.video_id = {video_alias}.video_id
+                          AND (
+                            LOWER(COALESCE(sja.language, '')) = 'ja-local'
+                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-local-%'
+                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja-local.%'
+                          )
+                    )
+                    """
+                if normalized_variant == "ja":
+                    return f"""
+                    EXISTS (
+                        SELECT 1
+                        FROM subtitles sja
+                        WHERE sja.source_id = {video_alias}.source_id
+                          AND sja.video_id = {video_alias}.video_id
+                          AND (
+                            LOWER(COALESCE(sja.language, '')) = 'ja'
+                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-%'
+                            OR LOWER(COALESCE(sja.language, '')) LIKE '%japanese%'
+                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja.%'
+                          )
+                          AND LOWER(COALESCE(sja.language, '')) NOT LIKE 'ja-local%'
+                          AND LOWER(COALESCE(sja.language, '')) NOT LIKE 'ja-asr-local%'
+                          AND LOWER(COALESCE(sja.subtitle_path, '')) NOT LIKE '%.ja-local.%'
+                          AND LOWER(COALESCE(sja.subtitle_path, '')) NOT LIKE '%.ja-asr-local.%'
+                    )
+                    """
+                return ""
+
+            def public_tracks_match_translation_filter(
+                public_tracks: list[dict[str, Any]],
+                filter_value: str,
+            ) -> bool:
+                normalized_filter = str(filter_value or "all").strip().lower()
+                if normalized_filter == "all":
+                    return True
+                variants: set[str] = set()
+                for track in public_tracks:
+                    if str(track.get("kind") or "").strip().lower() != "subtitle":
+                        continue
+                    label = str(track.get("label") or "").strip().lower()
+                    if not label:
+                        continue
+                    if label == "ja-asr-local" or label.startswith("ja-asr-local-"):
+                        variants.add("ja-asr-local")
+                        continue
+                    if label == "ja-local" or label.startswith("ja-local-"):
+                        variants.add("ja-local")
+                        continue
+                    if label == "ja" or label.startswith("ja-") or "japanese" in label:
+                        variants.add("ja")
+                if normalized_filter == "ja_only":
+                    return bool(variants)
+                if normalized_filter == "ja_missing":
+                    return not variants
+                return normalized_filter in variants
+
             where_clauses = [
                 "v.has_media = 1",
                 "v.media_path IS NOT NULL",
@@ -13332,10 +13422,9 @@ def build_web_handler(
             if source_filter:
                 where_clauses.append("v.source_id = ?")
                 params.append(source_filter)
-            if translation_filter == "ja_only":
-                where_clauses.append(ja_subtitle_exists_clause("v"))
-            elif translation_filter == "ja_missing":
-                where_clauses.append(f"NOT ({ja_subtitle_exists_clause('v')})")
+            translation_filter_clause = ja_variant_exists_clause("v", translation_filter)
+            if translation_filter_clause:
+                where_clauses.append(translation_filter_clause)
 
             with self._open_connection() as connection:
                 rows = connection.execute(
@@ -13431,10 +13520,9 @@ def build_web_handler(
                     placeholders = ",".join("?" for _ in sorted(effective_scope))
                     source_where_clauses.append(f"source_id IN ({placeholders})")
                     source_params.extend(sorted(effective_scope))
-                if translation_filter == "ja_only":
-                    source_where_clauses.append(ja_subtitle_exists_clause("videos"))
-                elif translation_filter == "ja_missing":
-                    source_where_clauses.append(f"NOT ({ja_subtitle_exists_clause('videos')})")
+                source_translation_filter_clause = ja_variant_exists_clause("videos", translation_filter)
+                if source_translation_filter_clause:
+                    source_where_clauses.append(source_translation_filter_clause)
                 source_rows = connection.execute(
                     f"""
                     SELECT source_id, media_path
@@ -13487,19 +13575,7 @@ def build_web_handler(
                         }
                         for track in tracks
                     ]
-                    has_ja_track = any(
-                        (
-                            str(track["kind"]).strip().lower() == "subtitle"
-                            and (
-                                str(track["label"]).strip().lower() == "ja"
-                                or str(track["label"]).strip().lower().startswith("ja-")
-                            )
-                        )
-                        for track in public_tracks
-                    )
-                    if translation_filter == "ja_only" and not has_ja_track:
-                        continue
-                    if translation_filter == "ja_missing" and has_ja_track:
+                    if not public_tracks_match_translation_filter(public_tracks, translation_filter):
                         continue
                     videos.append(
                         {
