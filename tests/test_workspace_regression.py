@@ -4253,6 +4253,100 @@ enabled = true
         self.assertEqual(echoed_filter, "ja_missing")
         self.assertEqual(video_ids, ["video-no-ja"])
 
+    def test_feed_tracks_expose_upstream_vs_generated_origins(self):
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        media_path = self.workspace_root / "video-origin.mp4"
+        media_path.write_bytes(b"")
+        upstream_subtitle_path = self.workspace_root / "video-origin.eng-US.vtt"
+        upstream_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+        generated_subtitle_path = self.workspace_root / "video-origin.ja.vtt"
+        generated_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "video-origin", "origin", str(media_path), 1, now_iso),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "video-origin", "eng-US", str(upstream_subtitle_path), "vtt"),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "video-origin", "ja", str(generated_subtitle_path), "vtt"),
+            )
+            self.mod.record_translation_run(
+                connection=connection,
+                source_id="storiesofcz",
+                video_id="video-origin",
+                source_path=upstream_subtitle_path,
+                output_path=generated_subtitle_path,
+                cue_count=2,
+                cue_match=True,
+                agent="claude-opus-4-6",
+                method="manual-import",
+                method_version="manual-import-v1",
+                summary="generated ja subtitle",
+                source_lang="en",
+                target_lang="ja",
+                status="active",
+                started_at=now_iso,
+                finished_at=now_iso,
+            )
+            self.mod.ensure_subtitles_origin_columns(connection)
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        video = next(
+            item for item in payload.get("videos", [])
+            if str(item.get("video_id") or "") == "video-origin"
+        )
+        tracks = {str(track.get("language") or track.get("label") or ""): track for track in video.get("tracks", [])}
+        self.assertEqual(tracks["eng-US"]["origin_kind"], "upstream")
+        self.assertEqual(tracks["eng-US"]["origin_label"], "Upstream")
+        self.assertIn("[Upstream]", str(tracks["eng-US"]["display_label"]))
+        self.assertEqual(tracks["ja"]["origin_kind"], "generated")
+        self.assertEqual(tracks["ja"]["origin_label"], "Generated")
+        self.assertIn("[Generated]", str(tracks["ja"]["display_label"]))
+
 
 if __name__ == "__main__":
     unittest.main()

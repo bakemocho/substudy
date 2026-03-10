@@ -55,9 +55,9 @@ const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-lo
 const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
 const TRANSLATION_VARIANT_LABELS = Object.freeze({
   auto: "自動",
-  ja: "ja（高品質claude和訳）",
-  "ja-local": "ja-local（ローカル和訳）",
-  "ja-asr-local": "ja-asr-local（ASRローカル和訳）",
+  ja: "ja",
+  "ja-local": "ja-local（Generated）",
+  "ja-asr-local": "ja-asr-local（Generated/ASR）",
 });
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
@@ -2213,7 +2213,7 @@ function normalizedTrackKind(track) {
 }
 
 function normalizedTrackLabel(track) {
-  return String(track?.label || "").trim().toLowerCase();
+  return String(track?.language || track?.label || "").trim().toLowerCase();
 }
 
 function getJaTrackVariant(track) {
@@ -2319,7 +2319,8 @@ function renderTrackOptions(video) {
   for (const track of video.tracks) {
     const option = document.createElement("option");
     option.value = track.track_id;
-    option.textContent = `${track.label} (${track.kind})`;
+    const label = String(track?.display_label || track?.label || "");
+    option.textContent = `${label} (${track.kind})`;
     elements.trackSelect.appendChild(option);
   }
 

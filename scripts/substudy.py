@@ -3816,6 +3816,88 @@ def scan_subtitles_for_video(source: SourceConfig, video_id: str) -> list[tuple[
     return results
 
 
+def normalize_subtitle_origin_kind(value: Any, fallback: str = "upstream") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"upstream", "generated"}:
+        return normalized
+    safe_fallback = str(fallback or "upstream").strip().lower()
+    return safe_fallback if safe_fallback in {"upstream", "generated"} else "upstream"
+
+
+def build_translation_output_origin_lookup(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+) -> dict[str, tuple[str, str]]:
+    rows = connection.execute(
+        """
+        SELECT output_path, agent, method_version
+        FROM translation_runs
+        WHERE source_id = ?
+          AND video_id = ?
+          AND output_path IS NOT NULL
+          AND output_path <> ''
+        ORDER BY run_id DESC
+        """,
+        (source_id, video_id),
+    ).fetchall()
+    lookup: dict[str, tuple[str, str]] = {}
+    for row in rows:
+        output_path = str(row["output_path"] or "").strip()
+        if not output_path or output_path in lookup:
+            continue
+        agent = str(row["agent"] or "").strip().lower()
+        method_version = str(row["method_version"] or "").strip().lower()
+        if "source-track=asr" in method_version:
+            origin_detail = "translate-local-asr" if agent == "local-llm" else "generated-asr"
+        elif agent == "local-llm":
+            origin_detail = "translate-local"
+        elif agent:
+            origin_detail = f"generated:{agent}"
+        else:
+            origin_detail = "generated"
+        lookup[output_path] = ("generated", origin_detail)
+    return lookup
+
+
+def classify_subtitle_origin(
+    language: str | None,
+    subtitle_path: Path,
+    translation_output_origin_lookup: dict[str, tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    subtitle_key = str(subtitle_path)
+    if translation_output_origin_lookup and subtitle_key in translation_output_origin_lookup:
+        return translation_output_origin_lookup[subtitle_key]
+
+    normalized_language = str(language or "").strip().lower()
+    path_value = subtitle_key.strip().lower()
+    if (
+        normalized_language == "ja-asr-local"
+        or normalized_language.startswith("ja-asr-local-")
+        or ".ja-asr-local." in path_value
+    ):
+        return ("generated", "translate-local-asr")
+    if (
+        normalized_language == "ja-local"
+        or normalized_language.startswith("ja-local-")
+        or ".ja-local." in path_value
+    ):
+        return ("generated", "translate-local")
+    return ("upstream", "tiktok")
+
+
+def format_subtitle_track_origin_label(origin_kind: str, origin_detail: str) -> str:
+    safe_kind = normalize_subtitle_origin_kind(origin_kind, "upstream")
+    safe_detail = str(origin_detail or "").strip().lower()
+    if safe_kind == "generated":
+        if safe_detail == "translate-local-asr":
+            return "Generated/ASR"
+        if safe_detail == "translate-local":
+            return "Generated"
+        return "Generated"
+    return "Upstream"
+
+
 def create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -3865,6 +3947,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             video_id TEXT NOT NULL,
             language TEXT,
             subtitle_path TEXT NOT NULL,
+            origin_kind TEXT NOT NULL DEFAULT 'upstream',
+            origin_detail TEXT NOT NULL DEFAULT '',
             ext TEXT,
             PRIMARY KEY (source_id, video_id, subtitle_path),
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
@@ -4125,6 +4209,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
     ensure_translation_stage_runs_table(connection)
+    ensure_subtitles_origin_columns(connection)
     ensure_dictionary_bookmarks_schema(connection)
     ensure_dictionary_import_runs_table(connection)
 
@@ -4182,6 +4267,96 @@ def ensure_video_playback_stats_columns(connection: sqlite3.Connection) -> None:
         connection.execute(
             f"ALTER TABLE video_playback_stats ADD COLUMN {column_name} {column_type}"
         )
+
+
+def ensure_subtitles_origin_columns(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA table_info(subtitles)").fetchall()
+    if not rows:
+        return
+    existing_columns = {str(row[1]) for row in rows}
+    required_columns = {
+        "origin_kind": "TEXT NOT NULL DEFAULT 'upstream'",
+        "origin_detail": "TEXT NOT NULL DEFAULT ''",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name in existing_columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE subtitles ADD COLUMN {column_name} {column_type}"
+        )
+
+    connection.execute(
+        """
+        UPDATE subtitles
+        SET origin_kind = 'generated',
+            origin_detail = 'translate-local'
+        WHERE (
+                LOWER(COALESCE(language, '')) = 'ja-local'
+             OR LOWER(COALESCE(language, '')) LIKE 'ja-local-%'
+             OR LOWER(COALESCE(subtitle_path, '')) LIKE '%.ja-local.%'
+        )
+        """
+    )
+    connection.execute(
+        """
+        UPDATE subtitles
+        SET origin_kind = 'generated',
+            origin_detail = 'translate-local-asr'
+        WHERE (
+                LOWER(COALESCE(language, '')) = 'ja-asr-local'
+             OR LOWER(COALESCE(language, '')) LIKE 'ja-asr-local-%'
+             OR LOWER(COALESCE(subtitle_path, '')) LIKE '%.ja-asr-local.%'
+        )
+        """
+    )
+    connection.execute(
+        """
+        UPDATE subtitles
+        SET origin_kind = 'generated',
+            origin_detail = (
+                SELECT CASE
+                    WHEN LOWER(COALESCE(tr.method_version, '')) LIKE '%source-track=asr%'
+                    THEN CASE
+                        WHEN LOWER(COALESCE(tr.agent, '')) = 'local-llm' THEN 'translate-local-asr'
+                        ELSE 'generated-asr'
+                    END
+                    ELSE CASE
+                        WHEN LOWER(COALESCE(tr.agent, '')) = 'local-llm' THEN 'translate-local'
+                        WHEN TRIM(COALESCE(tr.agent, '')) != '' THEN 'generated:' || LOWER(TRIM(tr.agent))
+                        ELSE 'generated'
+                    END
+                END
+                FROM translation_runs tr
+                WHERE tr.source_id = subtitles.source_id
+                  AND tr.video_id = subtitles.video_id
+                  AND tr.output_path = subtitles.subtitle_path
+                ORDER BY tr.run_id DESC
+                LIMIT 1
+            )
+        WHERE EXISTS (
+            SELECT 1
+            FROM translation_runs tr
+            WHERE tr.source_id = subtitles.source_id
+              AND tr.video_id = subtitles.video_id
+              AND tr.output_path = subtitles.subtitle_path
+        )
+        """
+    )
+    connection.execute(
+        """
+        UPDATE subtitles
+        SET origin_kind = 'upstream'
+        WHERE TRIM(COALESCE(origin_kind, '')) = ''
+        """
+    )
+    connection.execute(
+        """
+        UPDATE subtitles
+        SET origin_detail = 'tiktok'
+        WHERE LOWER(COALESCE(origin_kind, '')) = 'upstream'
+          AND TRIM(COALESCE(origin_detail, '')) = ''
+        """
+    )
 
 
 def ensure_dictionary_schema(connection: sqlite3.Connection) -> None:
@@ -4866,6 +5041,11 @@ def upsert_video_and_subtitles(
     subtitle_records: list[tuple[str, Path, str]],
     synced_at: str,
 ) -> None:
+    translation_output_origin_lookup = build_translation_output_origin_lookup(
+        connection=connection,
+        source_id=source.id,
+        video_id=video_id,
+    )
     media_path_value = str(media_path) if media_path else None
     media_ext = media_path.suffix.lstrip(".") if media_path else None
     media_size = None
@@ -4979,6 +5159,11 @@ def upsert_video_and_subtitles(
         (source.id, video_id),
     )
     for language, subtitle_path, extension in subtitle_records:
+        origin_kind, origin_detail = classify_subtitle_origin(
+            language=language,
+            subtitle_path=subtitle_path,
+            translation_output_origin_lookup=translation_output_origin_lookup,
+        )
         connection.execute(
             """
             INSERT INTO subtitles (
@@ -4986,10 +5171,20 @@ def upsert_video_and_subtitles(
                 video_id,
                 language,
                 subtitle_path,
+                origin_kind,
+                origin_detail,
                 ext
-            ) VALUES (?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (source.id, video_id, language, str(subtitle_path), extension),
+            (
+                source.id,
+                video_id,
+                language,
+                str(subtitle_path),
+                origin_kind,
+                origin_detail,
+                extension,
+            ),
         )
 
 
@@ -11570,13 +11765,18 @@ def collect_video_tracks(
                     "track_id": f"asr:{encode_path_token(asr_path)}",
                     "kind": "asr",
                     "label": "ASR",
+                    "language": "ASR",
+                    "origin_kind": "generated",
+                    "origin_detail": "asr",
+                    "origin_label": "Generated/ASR",
+                    "display_label": "[Generated/ASR] ASR",
                     "path": asr_key,
                 }
             )
 
     subtitle_rows = connection.execute(
         """
-        SELECT language, subtitle_path, ext
+        SELECT language, subtitle_path, origin_kind, origin_detail, ext
         FROM subtitles
         WHERE source_id = ?
           AND video_id = ?
@@ -11584,7 +11784,12 @@ def collect_video_tracks(
         """,
         (source_id, video_id),
     ).fetchall()
-    for language, subtitle_path_value, ext in subtitle_rows:
+    translation_output_origin_lookup = build_translation_output_origin_lookup(
+        connection=connection,
+        source_id=source_id,
+        video_id=video_id,
+    )
+    for language, subtitle_path_value, origin_kind_value, origin_detail_value, ext in subtitle_rows:
         subtitle_path = Path(str(subtitle_path_value))
         subtitle_key = str(subtitle_path)
         if not subtitle_path.exists() or not subtitle_path.is_file():
@@ -11595,11 +11800,25 @@ def collect_video_tracks(
         language_label = str(language).strip() if language not in (None, "") else ""
         ext_label = str(ext).upper() if ext not in (None, "") else subtitle_path.suffix.lstrip(".").upper()
         label = language_label or f"TikTok ({ext_label or 'SUB'})"
+        origin_kind, origin_detail = classify_subtitle_origin(
+            language=language_label,
+            subtitle_path=subtitle_path,
+            translation_output_origin_lookup=translation_output_origin_lookup,
+        )
+        stored_origin_kind = normalize_subtitle_origin_kind(origin_kind_value, origin_kind)
+        stored_origin_detail = str(origin_detail_value or "").strip() or origin_detail
+        origin_label = format_subtitle_track_origin_label(stored_origin_kind, stored_origin_detail)
+        display_label = f"[{origin_label}] {label}"
         tracks.append(
             {
                 "track_id": f"subtitle:{encode_path_token(subtitle_path)}",
                 "kind": "subtitle",
                 "label": label,
+                "language": language_label,
+                "origin_kind": stored_origin_kind,
+                "origin_detail": stored_origin_detail,
+                "origin_label": origin_label,
+                "display_label": display_label,
                 "path": subtitle_key,
             }
         )
@@ -13572,6 +13791,11 @@ def build_web_handler(
                             "track_id": track["track_id"],
                             "kind": track["kind"],
                             "label": track["label"],
+                            "language": track.get("language", track["label"]),
+                            "origin_kind": track.get("origin_kind", "upstream"),
+                            "origin_detail": track.get("origin_detail", ""),
+                            "origin_label": track.get("origin_label", ""),
+                            "display_label": track.get("display_label", track["label"]),
                         }
                         for track in tracks
                     ]
