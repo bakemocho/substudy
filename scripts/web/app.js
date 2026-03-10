@@ -127,6 +127,15 @@ const state = {
   feedSourceId: "",
   feedSourceTags: [],
   feedTagRestoreSourceId: "",
+  playbackStatsSourceId: "",
+  playbackStatsVideoId: "",
+  playbackStatsPendingPlayCount: 0,
+  playbackStatsPendingWatchSeconds: 0,
+  playbackStatsPendingCompletedCount: 0,
+  playbackStatsPlayStartMs: null,
+  playbackStatsCountedPlay: false,
+  playbackStatsCountedComplete: false,
+  playbackStatsLastPositionSeconds: null,
   index: 0,
   shuffleMode: true,
   shuffleQueue: [],
@@ -498,6 +507,37 @@ function formatShortIso(value) {
   const hour = String(parsed.getHours()).padStart(2, "0");
   const minute = String(parsed.getMinutes()).padStart(2, "0");
   return `${year}-${month}-${day} ${hour}:${minute}`;
+}
+
+function normalizePlaybackStats(raw) {
+  const stats = raw && typeof raw === "object" ? raw : {};
+  const totalWatchSeconds = Number(stats.total_watch_seconds);
+  const lastPositionSeconds = Number(stats.last_position_seconds);
+  return {
+    play_count: Math.max(0, Number.parseInt(stats.play_count, 10) || 0),
+    total_watch_seconds: Number.isFinite(totalWatchSeconds) ? Math.max(0, totalWatchSeconds) : 0,
+    completed_count: Math.max(0, Number.parseInt(stats.completed_count, 10) || 0),
+    last_played_at: String(stats.last_played_at || "").trim(),
+    last_position_seconds: Number.isFinite(lastPositionSeconds) ? Math.max(0, lastPositionSeconds) : null,
+  };
+}
+
+function formatPlaybackStatsSummary(video) {
+  const stats = normalizePlaybackStats(video?.playback_stats);
+  const parts = [];
+  if (stats.play_count > 0) {
+    parts.push(`再生${stats.play_count}回`);
+  }
+  if (stats.total_watch_seconds > 0) {
+    parts.push(`視聴${formatDuration(stats.total_watch_seconds)}`);
+  }
+  if (stats.completed_count > 0) {
+    parts.push(`完走${stats.completed_count}`);
+  }
+  if (stats.last_played_at) {
+    parts.push(`直近${formatShortIso(stats.last_played_at)}`);
+  }
+  return parts.join(" • ");
 }
 
 function formatBytesShort(value) {
@@ -1653,19 +1693,155 @@ function renderVideoMeta(video) {
   const total = state.videos.length;
   const descriptionLike = (video.description || video.title || "").trim();
   const duration = formatDuration(video.duration);
-  const secondaryLine = [
+  const secondaryParts = [
     `${current} / ${total}`,
     video.source_id || "",
     video.uploader || "",
     video.upload_date || "",
     duration,
-  ]
-    .filter(Boolean)
-    .join(" • ");
+  ].filter(Boolean);
+  const playbackStatsSummary = formatPlaybackStatsSummary(video);
+  if (playbackStatsSummary) {
+    secondaryParts.push(playbackStatsSummary);
+  }
+  const secondaryLine = secondaryParts.join(" • ");
   elements.metaPrimaryLine.textContent = descriptionLike || "(説明なし)";
   elements.metaSecondaryLine.textContent = secondaryLine;
   elements.metaTabBtn.textContent = shortenForTab(descriptionLike || "description");
   elements.metaPanel.scrollTop = 0;
+}
+
+function resetPlaybackStatsSession(video = null) {
+  state.playbackStatsSourceId = String(video?.source_id || "").trim();
+  state.playbackStatsVideoId = String(video?.video_id || "").trim();
+  state.playbackStatsPendingPlayCount = 0;
+  state.playbackStatsPendingWatchSeconds = 0;
+  state.playbackStatsPendingCompletedCount = 0;
+  state.playbackStatsPlayStartMs = null;
+  state.playbackStatsCountedPlay = false;
+  state.playbackStatsCountedComplete = false;
+  state.playbackStatsLastPositionSeconds = null;
+}
+
+function playbackStatsSessionMatchesCurrentVideo() {
+  const video = currentVideo();
+  if (!video) {
+    return false;
+  }
+  return (
+    state.playbackStatsSourceId === String(video.source_id || "").trim()
+    && state.playbackStatsVideoId === String(video.video_id || "").trim()
+  );
+}
+
+function syncPlaybackStatsPositionFromPlayer() {
+  const currentTime = Number(elements.videoPlayer?.currentTime);
+  if (Number.isFinite(currentTime) && currentTime >= 0) {
+    state.playbackStatsLastPositionSeconds = currentTime;
+  }
+}
+
+function accumulatePendingPlaybackWatchSeconds() {
+  if (state.playbackStatsPlayStartMs === null) {
+    syncPlaybackStatsPositionFromPlayer();
+    return;
+  }
+  const nowMs = performance.now();
+  const deltaSeconds = Math.max(0, (nowMs - state.playbackStatsPlayStartMs) / 1000);
+  state.playbackStatsPendingWatchSeconds += deltaSeconds;
+  state.playbackStatsPlayStartMs = (
+    elements.videoPlayer
+    && !elements.videoPlayer.paused
+    && playbackStatsSessionMatchesCurrentVideo()
+  ) ? nowMs : null;
+  syncPlaybackStatsPositionFromPlayer();
+}
+
+function hasPendingPlaybackStats() {
+  return (
+    state.playbackStatsPendingPlayCount > 0
+    || state.playbackStatsPendingCompletedCount > 0
+    || state.playbackStatsPendingWatchSeconds >= 0.25
+  );
+}
+
+function applyPlaybackStatsToVideo(sourceId, videoId, playbackStats) {
+  const stats = normalizePlaybackStats(playbackStats);
+  for (const video of state.videos) {
+    if (
+      String(video?.source_id || "").trim() === String(sourceId || "").trim()
+      && String(video?.video_id || "").trim() === String(videoId || "").trim()
+    ) {
+      video.playback_stats = stats;
+      if (currentVideo() === video) {
+        renderVideoMeta(video);
+      }
+      break;
+    }
+  }
+}
+
+async function flushPlaybackStats(options = {}) {
+  const { useBeacon = false, suppressErrors = true } = options;
+  const sourceId = String(state.playbackStatsSourceId || "").trim();
+  const videoId = String(state.playbackStatsVideoId || "").trim();
+  if (!sourceId || !videoId) {
+    return null;
+  }
+
+  accumulatePendingPlaybackWatchSeconds();
+  if (!hasPendingPlaybackStats()) {
+    return null;
+  }
+
+  const payload = {
+    source_id: sourceId,
+    video_id: videoId,
+    play_increment: state.playbackStatsPendingPlayCount,
+    watch_seconds: Math.round(state.playbackStatsPendingWatchSeconds * 1000) / 1000,
+    completed_increment: state.playbackStatsPendingCompletedCount,
+    last_position_seconds: state.playbackStatsLastPositionSeconds,
+  };
+
+  state.playbackStatsPendingPlayCount = 0;
+  state.playbackStatsPendingWatchSeconds = 0;
+  state.playbackStatsPendingCompletedCount = 0;
+
+  if (useBeacon) {
+    try {
+      const body = JSON.stringify(payload);
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon("/api/playback-stats/record", blob)) {
+        return null;
+      }
+    } catch (_error) {
+      // Fall back to keepalive fetch below.
+    }
+    fetch("/api/playback-stats/record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true,
+    }).catch(() => {});
+    return null;
+  }
+
+  try {
+    const response = await apiRequest("/api/playback-stats/record", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    applyPlaybackStatsToVideo(sourceId, videoId, response?.playback_stats || null);
+    return response;
+  } catch (error) {
+    state.playbackStatsPendingPlayCount += payload.play_increment;
+    state.playbackStatsPendingWatchSeconds += payload.watch_seconds;
+    state.playbackStatsPendingCompletedCount += payload.completed_increment;
+    if (!suppressErrors) {
+      throw error;
+    }
+    return null;
+  }
 }
 
 function normalizedTrackKind(track) {
@@ -8838,6 +9014,7 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
     return;
   }
 
+  flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
   clearCountdown();
   closeLyricReel();
   state.index = Math.max(0, Math.min(index, state.videos.length - 1));
@@ -8846,6 +9023,7 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
   }
 
   const video = currentVideo();
+  resetPlaybackStatsSession(video);
   const videoSourceId = String(video?.source_id || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
   elements.videoPlayer.src = video.media_url;
@@ -8898,11 +9076,25 @@ function applyFeedSelectionWithoutVideoReload(index, playbackTimeSec = null) {
   if (!state.videos.length) {
     return;
   }
+  const previousSourceId = String(state.playbackStatsSourceId || "").trim();
+  const previousVideoId = String(state.playbackStatsVideoId || "").trim();
   state.index = Math.max(0, Math.min(index, state.videos.length - 1));
   resetPlaybackTracking(state.index);
   const video = currentVideo();
   if (!video) {
     return;
+  }
+  const currentSourceId = String(video?.source_id || "").trim();
+  const currentVideoId = String(video?.video_id || "").trim();
+  if (
+    previousSourceId
+    && previousVideoId
+    && (previousSourceId !== currentSourceId || previousVideoId !== currentVideoId)
+  ) {
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
+    resetPlaybackStatsSession(video);
+  } else if (!previousSourceId || !previousVideoId) {
+    resetPlaybackStatsSession(video);
   }
   const videoSourceId = String(video?.source_id || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
@@ -8949,7 +9141,10 @@ async function applyLoadedFeedState(options = {}) {
   state.feedSourceId = normalizedSourceTags.length ? "" : String(sourceId || "").trim();
   state.feedSourceTags = normalizedSourceTags;
   state.feedTagRestoreSourceId = normalizedSourceTags.length ? String(restoreSourceId || "").trim() : "";
-  state.videos = Array.isArray(videos) ? videos : [];
+  state.videos = (Array.isArray(videos) ? videos : []).map((video) => ({
+    ...video,
+    playback_stats: normalizePlaybackStats(video?.playback_stats),
+  }));
   state.sources = Array.isArray(sources) ? sources : [];
   state.index = 0;
   state.rangeStartMs = null;
@@ -8959,8 +9154,10 @@ async function applyLoadedFeedState(options = {}) {
   renderSourceOptions(state.feedSourceId, state.feedSourceTags);
 
   if (!state.videos.length) {
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
     elements.videoPlayer.removeAttribute("src");
     elements.videoPlayer.load();
+    resetPlaybackStatsSession(null);
     updateVideoProgressTimer();
     releasePlayerCardSnapLock(false);
     updateUrlVideoSelection(
@@ -10206,15 +10403,27 @@ function bindEvents() {
   elements.videoPlayer.addEventListener("timeupdate", () => {
     updateVideoProgressTimer();
     syncUrlPlaybackPosition(false);
+    syncPlaybackStatsPositionFromPlayer();
     enforceDictionaryHoverLoop();
     updateSubtitleFromPlayback();
   });
   elements.videoPlayer.addEventListener("play", () => {
+    if (!playbackStatsSessionMatchesCurrentVideo()) {
+      resetPlaybackStatsSession(currentVideo());
+    }
+    if (!state.playbackStatsCountedPlay) {
+      state.playbackStatsPendingPlayCount += 1;
+      state.playbackStatsCountedPlay = true;
+      flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
+    }
+    state.playbackStatsPlayStartMs = performance.now();
     closeLyricReel();
     updateVideoProgressTimer();
     updatePlayPauseButton();
   });
   elements.videoPlayer.addEventListener("pause", () => {
+    accumulatePendingPlaybackWatchSeconds();
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
     stopDictionaryHoverLoop();
     updateVideoProgressTimer();
     syncUrlPlaybackPosition(true);
@@ -10242,6 +10451,12 @@ function bindEvents() {
     updateMuteButtonLabel();
   });
   elements.videoPlayer.addEventListener("ended", () => {
+    accumulatePendingPlaybackWatchSeconds();
+    if (!state.playbackStatsCountedComplete) {
+      state.playbackStatsPendingCompletedCount += 1;
+      state.playbackStatsCountedComplete = true;
+    }
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
     updateVideoProgressTimer();
     if (!state.autoplayContinuous) {
       return;
@@ -10282,7 +10497,11 @@ function bindEvents() {
   }, { passive: true });
   window.addEventListener("wheel", handleWindowWheelForPlayerSnap, { passive: false });
   window.addEventListener("beforeunload", () => {
+    flushPlaybackStats({ useBeacon: true, suppressErrors: true });
     syncUrlPlaybackPosition(true);
+  });
+  window.addEventListener("pagehide", () => {
+    flushPlaybackStats({ useBeacon: true, suppressErrors: true });
   });
 }
 

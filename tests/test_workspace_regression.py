@@ -3947,6 +3947,105 @@ enabled = true
         self.assertTrue(updated_payload["videos"][0]["is_favorite"])
         self.assertFalse(updated_payload["videos"][0]["is_disliked"])
 
+    def test_playback_stats_record_and_feed(self):
+        media_path = self.workspace_root / "storiesofcz_stats.mp4"
+        media_path.write_bytes(b"")
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "7622222222222222222", "stats", str(media_path), 1, now_iso),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
+        stats_url = f"http://{host}:{port}/api/playback-stats/record"
+
+        stats_request_1 = urllib.request.Request(
+            stats_url,
+            data=json.dumps(
+                {
+                    "source_id": "storiesofcz",
+                    "video_id": "7622222222222222222",
+                    "play_increment": 1,
+                    "watch_seconds": 12.5,
+                    "completed_increment": 0,
+                    "last_position_seconds": 13,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(stats_request_1, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload_1 = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload_1["playback_stats"]["play_count"], 1)
+        self.assertAlmostEqual(payload_1["playback_stats"]["total_watch_seconds"], 12.5, places=3)
+        self.assertEqual(payload_1["playback_stats"]["completed_count"], 0)
+        self.assertEqual(payload_1["playback_stats"]["last_position_seconds"], 13.0)
+
+        stats_request_2 = urllib.request.Request(
+            stats_url,
+            data=json.dumps(
+                {
+                    "source_id": "storiesofcz",
+                    "video_id": "7622222222222222222",
+                    "play_increment": 0,
+                    "watch_seconds": 7.25,
+                    "completed_increment": 1,
+                    "last_position_seconds": 61,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(stats_request_2, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload_2 = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload_2["playback_stats"]["play_count"], 1)
+        self.assertAlmostEqual(payload_2["playback_stats"]["total_watch_seconds"], 19.75, places=3)
+        self.assertEqual(payload_2["playback_stats"]["completed_count"], 1)
+        self.assertEqual(payload_2["playback_stats"]["last_position_seconds"], 61.0)
+        self.assertTrue(payload_2["playback_stats"]["last_played_at"])
+
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            feed_payload = json.loads(response.read().decode("utf-8"))
+        stats = feed_payload["videos"][0]["playback_stats"]
+        self.assertEqual(stats["play_count"], 1)
+        self.assertAlmostEqual(stats["total_watch_seconds"], 19.75, places=3)
+        self.assertEqual(stats["completed_count"], 1)
+        self.assertEqual(stats["last_position_seconds"], 61.0)
+        self.assertTrue(stats["last_played_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

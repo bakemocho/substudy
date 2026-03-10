@@ -4033,6 +4033,20 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS video_playback_stats (
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            play_count INTEGER NOT NULL DEFAULT 0,
+            total_watch_seconds REAL NOT NULL DEFAULT 0,
+            completed_count INTEGER NOT NULL DEFAULT 0,
+            last_played_at TEXT,
+            last_position_seconds REAL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, video_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
         CREATE TABLE IF NOT EXISTS subtitle_bookmarks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id TEXT NOT NULL,
@@ -4084,6 +4098,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_favorites(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_dislikes_created_at
             ON video_dislikes(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_video_playback_stats_last_played
+            ON video_playback_stats(last_played_at DESC, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
             ON subtitle_bookmarks(source_id, video_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
@@ -4972,7 +4988,13 @@ def prune_source_videos_full_rebuild(
         )
 
     # Keep side tables consistent when full rebuild drops videos that no longer exist.
-    for table_name in ("video_favorites", "video_dislikes", "subtitle_bookmarks", "video_notes"):
+    for table_name in (
+        "video_favorites",
+        "video_dislikes",
+        "video_playback_stats",
+        "subtitle_bookmarks",
+        "video_notes",
+    ):
         connection.execute(
             f"""
             DELETE FROM {table_name}
@@ -13304,6 +13326,11 @@ def build_web_handler(
                         v.media_path,
                         COALESCE(vf.created_at, '') AS favorite_created_at,
                         COALESCE(vd.created_at, '') AS disliked_created_at,
+                        COALESCE(vps.play_count, 0) AS playback_play_count,
+                        COALESCE(vps.total_watch_seconds, 0) AS playback_total_watch_seconds,
+                        COALESCE(vps.completed_count, 0) AS playback_completed_count,
+                        COALESCE(vps.last_played_at, '') AS playback_last_played_at,
+                        vps.last_position_seconds AS playback_last_position_seconds,
                         CASE
                             WHEN vf.video_id IS NULL THEN 0
                             ELSE 1
@@ -13322,6 +13349,9 @@ def build_web_handler(
                     LEFT JOIN video_dislikes vd
                       ON vd.source_id = v.source_id
                      AND vd.video_id = v.video_id
+                    LEFT JOIN video_playback_stats vps
+                      ON vps.source_id = v.source_id
+                     AND vps.video_id = v.video_id
                     LEFT JOIN video_notes vn
                       ON vn.source_id = v.source_id
                      AND vn.video_id = v.video_id
@@ -13446,6 +13476,21 @@ def build_web_handler(
                                 if row["disliked_created_at"] in (None, "")
                                 else str(row["disliked_created_at"])
                             ),
+                            "playback_stats": {
+                                "play_count": max(0, int(row["playback_play_count"] or 0)),
+                                "total_watch_seconds": (
+                                    0.0
+                                    if row["playback_total_watch_seconds"] in (None, "")
+                                    else max(0.0, float(row["playback_total_watch_seconds"]))
+                                ),
+                                "completed_count": max(0, int(row["playback_completed_count"] or 0)),
+                                "last_played_at": (
+                                    ""
+                                    if row["playback_last_played_at"] in (None, "")
+                                    else str(row["playback_last_played_at"])
+                                ),
+                                "last_position_seconds": safe_float(row["playback_last_position_seconds"]),
+                            },
                             "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
                             "audio_lufs": safe_float(row["audio_lufs"]),
                             "audio_gain_db": safe_float(row["audio_gain_db"]),
@@ -14074,6 +14119,176 @@ def build_web_handler(
                 ),
             }
 
+        def _fetch_video_playback_stats(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+        ) -> dict[str, Any]:
+            row = connection.execute(
+                """
+                SELECT
+                    play_count,
+                    total_watch_seconds,
+                    completed_count,
+                    last_played_at,
+                    last_position_seconds
+                FROM video_playback_stats
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "play_count": 0,
+                    "total_watch_seconds": 0.0,
+                    "completed_count": 0,
+                    "last_played_at": "",
+                    "last_position_seconds": None,
+                }
+            return {
+                "play_count": max(0, int(row["play_count"] or 0)),
+                "total_watch_seconds": (
+                    0.0
+                    if row["total_watch_seconds"] in (None, "")
+                    else max(0.0, float(row["total_watch_seconds"]))
+                ),
+                "completed_count": max(0, int(row["completed_count"] or 0)),
+                "last_played_at": (
+                    ""
+                    if row["last_played_at"] in (None, "")
+                    else str(row["last_played_at"])
+                ),
+                "last_position_seconds": safe_float(row["last_position_seconds"]),
+            }
+
+        def _record_video_playback_stats(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+            play_increment: int,
+            watch_seconds: float,
+            completed_increment: int,
+            last_position_seconds: float | None,
+        ) -> dict[str, Any]:
+            row = connection.execute(
+                """
+                SELECT
+                    play_count,
+                    total_watch_seconds,
+                    completed_count,
+                    last_played_at,
+                    last_position_seconds,
+                    created_at
+                FROM video_playback_stats
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
+            now_iso = now_utc_iso()
+            safe_play_increment = max(0, int(play_increment))
+            safe_watch_seconds = max(0.0, float(watch_seconds))
+            safe_completed_increment = max(0, int(completed_increment))
+            safe_last_position_seconds = (
+                None
+                if last_position_seconds is None
+                else max(0.0, float(last_position_seconds))
+            )
+
+            if row is None:
+                created_at = now_iso
+                play_count = safe_play_increment
+                total_watch_seconds = safe_watch_seconds
+                completed_count = safe_completed_increment
+                last_played_at = (
+                    now_iso
+                    if (safe_play_increment > 0 or safe_watch_seconds > 0 or safe_completed_increment > 0)
+                    else ""
+                )
+                connection.execute(
+                    """
+                    INSERT INTO video_playback_stats (
+                        source_id,
+                        video_id,
+                        play_count,
+                        total_watch_seconds,
+                        completed_count,
+                        last_played_at,
+                        last_position_seconds,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_id,
+                        video_id,
+                        play_count,
+                        total_watch_seconds,
+                        completed_count,
+                        last_played_at or None,
+                        safe_last_position_seconds,
+                        created_at,
+                        now_iso,
+                    ),
+                )
+            else:
+                created_at = (
+                    now_iso
+                    if row["created_at"] in (None, "")
+                    else str(row["created_at"])
+                )
+                play_count = max(0, int(row["play_count"] or 0)) + safe_play_increment
+                total_watch_seconds = (
+                    0.0
+                    if row["total_watch_seconds"] in (None, "")
+                    else max(0.0, float(row["total_watch_seconds"]))
+                ) + safe_watch_seconds
+                completed_count = max(0, int(row["completed_count"] or 0)) + safe_completed_increment
+                last_played_at = (
+                    now_iso
+                    if (safe_play_increment > 0 or safe_watch_seconds > 0 or safe_completed_increment > 0)
+                    else (
+                        ""
+                        if row["last_played_at"] in (None, "")
+                        else str(row["last_played_at"])
+                    )
+                )
+                next_last_position_seconds = (
+                    safe_last_position_seconds
+                    if safe_last_position_seconds is not None
+                    else safe_float(row["last_position_seconds"])
+                )
+                connection.execute(
+                    """
+                    UPDATE video_playback_stats
+                    SET play_count = ?,
+                        total_watch_seconds = ?,
+                        completed_count = ?,
+                        last_played_at = ?,
+                        last_position_seconds = ?,
+                        updated_at = ?
+                    WHERE source_id = ?
+                      AND video_id = ?
+                    """,
+                    (
+                        play_count,
+                        total_watch_seconds,
+                        completed_count,
+                        last_played_at or None,
+                        next_last_position_seconds,
+                        now_iso,
+                        source_id,
+                        video_id,
+                    ),
+                )
+
+            return self._fetch_video_playback_stats(connection, source_id, video_id)
+
         def _toggle_video_preference_mark(
             self,
             connection: sqlite3.Connection,
@@ -14215,6 +14430,65 @@ def build_web_handler(
                     "is_disliked": disliked,
                     "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
                     "cleared_favorite": cleared_favorite,
+                }
+            )
+
+        def _handle_api_record_playback_stats(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            try:
+                play_increment = int(payload.get("play_increment", 0) or 0)
+                completed_increment = int(payload.get("completed_increment", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_error_json(400, "play_increment and completed_increment must be integers.")
+                return
+            try:
+                watch_seconds = float(payload.get("watch_seconds", 0) or 0)
+            except (TypeError, ValueError):
+                self._send_error_json(400, "watch_seconds must be numeric.")
+                return
+            last_position_seconds_raw = payload.get("last_position_seconds")
+            if last_position_seconds_raw in (None, ""):
+                last_position_seconds = None
+            else:
+                try:
+                    last_position_seconds = float(last_position_seconds_raw)
+                except (TypeError, ValueError):
+                    self._send_error_json(400, "last_position_seconds must be numeric.")
+                    return
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+                stats_payload = self._record_video_playback_stats(
+                    connection=connection,
+                    source_id=source_id,
+                    video_id=video_id,
+                    play_increment=play_increment,
+                    watch_seconds=watch_seconds,
+                    completed_increment=completed_increment,
+                    last_position_seconds=last_position_seconds,
+                )
+                connection.commit()
+
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "playback_stats": stats_payload,
                 }
             )
 
@@ -14490,6 +14764,9 @@ def build_web_handler(
                     return
                 if path == "/api/dislikes/toggle":
                     self._handle_api_toggle_dislike()
+                    return
+                if path == "/api/playback-stats/record":
+                    self._handle_api_record_playback_stats()
                     return
                 if path == "/api/video-note":
                     self._handle_api_upsert_video_note()
