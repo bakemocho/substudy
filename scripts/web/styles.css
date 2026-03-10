@@ -662,6 +662,14 @@ body {
   color: #ffd6df;
 }
 
+.preference-btn-soft-negative.active,
+.preference-btn-soft-negative.active:hover,
+.preference-btn-soft-negative.active:focus-visible {
+  border-color: rgba(255, 184, 116, 0.84);
+  background: rgba(69, 44, 12, 0.94);
+  color: #ffe4bf;
+}
+
 .volume-wrap {
   display: grid;
   grid-template-columns: minmax(110px, 132px) minmax(0, 1fr);

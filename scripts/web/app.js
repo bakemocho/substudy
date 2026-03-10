@@ -42,6 +42,8 @@ const SHALLOW_SKIP_MAX_SECONDS = 10;
 const SHALLOW_SKIP_RATIO = 0.2;
 const COMPLETE_WATCH_RATIO = 0.9;
 const RANKED_POOL_SIZE = 24;
+const RANKED_UNSEEN_POOL_SIZE = 18;
+const RANKED_UNSEEN_PICK_PROBABILITY = 0.82;
 const RECENT_HISTORY_LOOKBACK = 12;
 const TRANSLATION_FILTER_VALUES = new Set([
   "all",
@@ -366,6 +368,7 @@ const elements = {
   nextBtn: document.getElementById("nextBtn"),
   favoriteBtn: document.getElementById("favoriteBtn"),
   dislikeBtn: document.getElementById("dislikeBtn"),
+  notInterestedBtn: document.getElementById("notInterestedBtn"),
   muteBtn: document.getElementById("muteBtn"),
   volumeSlider: document.getElementById("volumeSlider"),
   playerActions: document.querySelector(".player-actions"),
@@ -692,10 +695,13 @@ function computeVideoInterestValue(video) {
   const hasMetadata = hasMeaningfulVideoMetadata(video);
   let score = 0;
   if (video.is_favorite) {
-    score += 4.5;
+    score += 3.4;
   }
   if (video.is_disliked) {
-    score -= 10.0;
+    score -= 12.0;
+  }
+  if (video.is_not_interested) {
+    score -= 4.6;
   }
   score += stats.completed_count * 1.8;
   score += watchRatio * 1.4;
@@ -715,6 +721,10 @@ function computeVideoInterestValue(video) {
   return score;
 }
 
+function isAllSourcesFeedScope() {
+  return !String(state.feedSourceId || "").trim() && !normalizeFeedSourceTags(state.feedSourceTags).length;
+}
+
 function buildAffinityMaps() {
   const sourceAffinity = new Map();
   const tagAffinity = new Map();
@@ -723,6 +733,7 @@ function buildAffinityMaps() {
     const observed = (
       video?.is_favorite
       || video?.is_disliked
+      || video?.is_not_interested
       || (Number(video?.cue_bookmark_count) || 0) > 0
       || (Number(video?.dictionary_bookmark_count) || 0) > 0
       || stats.impression_count > 0
@@ -790,6 +801,40 @@ function computeRecentSourcePenalty(candidateSourceId) {
   return penalty;
 }
 
+function computeRecentTagPenalty(candidateSourceTags) {
+  if (!Array.isArray(candidateSourceTags) || !candidateSourceTags.length) {
+    return 0;
+  }
+  const candidateTagSet = new Set(
+    candidateSourceTags
+      .map((tag) => String(tag || "").trim().toLocaleLowerCase())
+      .filter(Boolean)
+  );
+  if (!candidateTagSet.size) {
+    return 0;
+  }
+  const recentIndices = state.playbackHistory.slice(-4);
+  let overlapCount = 0;
+  for (const historyIndex of recentIndices) {
+    const video = state.videos[historyIndex];
+    if (!video) {
+      continue;
+    }
+    const sourceId = String(video.source_id || "").trim();
+    const recentTags = resolveSourceTagsForSourceId(sourceId);
+    const hasOverlap = recentTags.some((tag) => (
+      candidateTagSet.has(String(tag || "").trim().toLocaleLowerCase())
+    ));
+    if (hasOverlap) {
+      overlapCount += 1;
+    }
+  }
+  if (overlapCount <= 0) {
+    return 0;
+  }
+  return -1.2 - ((overlapCount - 1) * 0.75);
+}
+
 function computeRecentVideoPenalty(candidateIndex) {
   const recentIndices = state.playbackHistory.slice(-RECENT_HISTORY_LOOKBACK);
   if (recentIndices.slice(-4).includes(candidateIndex)) {
@@ -819,26 +864,33 @@ function computeCandidateShuffleScore(index, affinityMaps) {
       sum + (affinityMaps.tagAffinity.get(String(tag || "").trim().toLocaleLowerCase()) || 0)
     ), 0) / sourceTags.length
     : 0;
-  const freshBonus = stats.impression_count === 0
-    ? 2.2
+  const unseenBonus = stats.impression_count === 0
+    ? 7.8
     : stats.play_count === 0
-      ? 0.9
+      ? 2.6
       : 0;
+  const allSourcesNoveltyBonus = isAllSourcesFeedScope() && stats.impression_count === 0 ? 2.4 : 0;
   const watchRatio = duration > 0 ? Math.min(1.5, stats.total_watch_seconds / duration) : 0;
-  const translationBonus = hasJaSubtitleTrack(video) ? 0.2 : 0;
-  const repetitionPenalty = 0.55 * Math.log1p(stats.impression_count);
-  const lastPlayedPenalty = stats.last_played_at ? 0.35 : 0;
+  const translationBonus = hasJaSubtitleTrack(video) ? 0.3 : 0;
+  const repetitionPenalty = (0.95 * Math.log1p(stats.impression_count)) + (0.55 * Math.log1p(stats.play_count));
+  const lastPlayedPenalty = stats.last_played_at ? 0.65 : 0;
+  const favoriteExposurePenalty = video.is_favorite ? 0.75 * Math.log1p(stats.impression_count) : 0;
+  const softNegativePenalty = video.is_not_interested ? 2.0 : 0;
   return (
     computeVideoInterestValue(video)
     + sourceAffinity * 0.9
-    + tagAffinity * 0.55
-    + freshBonus
+    + tagAffinity * 0.42
+    + unseenBonus
+    + allSourcesNoveltyBonus
     + translationBonus
     + watchRatio * 0.4
     + computeRecentSourcePenalty(sourceId)
+    + computeRecentTagPenalty(sourceTags)
     + computeRecentVideoPenalty(index)
     - repetitionPenalty
     - lastPlayedPenalty
+    - favoriteExposurePenalty
+    - softNegativePenalty
   );
 }
 
@@ -870,17 +922,25 @@ function computeRankedShuffleIndex() {
   }
   const affinityMaps = buildAffinityMaps();
   const rankedCandidates = [];
+  const unseenCandidates = [];
   for (let idx = 0; idx < state.videos.length; idx += 1) {
     if (idx === state.index) {
       continue;
     }
+    const video = state.videos[idx];
+    const stats = normalizePlaybackStats(video?.playback_stats);
     const score = computeCandidateShuffleScore(idx, affinityMaps);
     if (!Number.isFinite(score)) {
       continue;
     }
-    rankedCandidates.push({ index: idx, score });
+    const candidate = { index: idx, score };
+    rankedCandidates.push(candidate);
+    if (stats.impression_count === 0) {
+      unseenCandidates.push(candidate);
+    }
   }
   rankedCandidates.sort((left, right) => right.score - left.score);
+  unseenCandidates.sort((left, right) => right.score - left.score);
   if (!rankedCandidates.length) {
     const fallback = [];
     for (let idx = 0; idx < state.videos.length; idx += 1) {
@@ -892,6 +952,9 @@ function computeRankedShuffleIndex() {
       fallback.push(state.index);
     }
     return fallback.length ? fallback[Math.floor(Math.random() * fallback.length)] : -1;
+  }
+  if (unseenCandidates.length && Math.random() < RANKED_UNSEEN_PICK_PROBABILITY) {
+    return chooseWeightedRankedIndex(unseenCandidates.slice(0, RANKED_UNSEEN_POOL_SIZE));
   }
   return chooseWeightedRankedIndex(rankedCandidates.slice(0, RANKED_POOL_SIZE));
 }
@@ -1068,19 +1131,26 @@ function updateVideoPreferenceButtons() {
     elements.favoriteBtn.textContent = "☆ ファボ";
     elements.favoriteBtn.classList.remove("active");
     elements.favoriteBtn.setAttribute("aria-pressed", "false");
-    elements.dislikeBtn.textContent = "✕ パス";
+    elements.dislikeBtn.textContent = "✕ 嫌い";
     elements.dislikeBtn.classList.remove("active");
     elements.dislikeBtn.setAttribute("aria-pressed", "false");
+    elements.notInterestedBtn.textContent = "△ 好きじゃない";
+    elements.notInterestedBtn.classList.remove("active");
+    elements.notInterestedBtn.setAttribute("aria-pressed", "false");
     return;
   }
   const favoriteActive = Boolean(video.is_favorite);
   const dislikeActive = Boolean(video.is_disliked);
+  const notInterestedActive = Boolean(video.is_not_interested);
   elements.favoriteBtn.textContent = favoriteActive ? "★ ファボ済" : "☆ ファボ";
   elements.favoriteBtn.classList.toggle("active", favoriteActive);
   elements.favoriteBtn.setAttribute("aria-pressed", favoriteActive ? "true" : "false");
-  elements.dislikeBtn.textContent = dislikeActive ? "✕ パス済" : "✕ パス";
+  elements.dislikeBtn.textContent = dislikeActive ? "✕ 嫌い済" : "✕ 嫌い";
   elements.dislikeBtn.classList.toggle("active", dislikeActive);
   elements.dislikeBtn.setAttribute("aria-pressed", dislikeActive ? "true" : "false");
+  elements.notInterestedBtn.textContent = notInterestedActive ? "△ 好きじゃない済" : "△ 好きじゃない";
+  elements.notInterestedBtn.classList.toggle("active", notInterestedActive);
+  elements.notInterestedBtn.setAttribute("aria-pressed", notInterestedActive ? "true" : "false");
 }
 
 function updateMetaDrawerState() {
@@ -9761,12 +9831,22 @@ async function prevVideo() {
   await openVideo(state.index - 1, true, "push");
 }
 
+function applyVideoPreferencePayload(video, payload) {
+  video.is_favorite = Boolean(payload.is_favorite);
+  video.favorite_created_at = String(payload.favorite_created_at || "");
+  video.is_disliked = Boolean(payload.is_disliked);
+  video.disliked_created_at = String(payload.disliked_created_at || "");
+  video.is_not_interested = Boolean(payload.is_not_interested);
+  video.not_interested_created_at = String(payload.not_interested_created_at || "");
+}
+
 async function toggleFavorite() {
   const video = currentVideo();
   if (!video) {
     return;
   }
   const wasDisliked = Boolean(video.is_disliked);
+  const wasNotInterested = Boolean(video.is_not_interested);
 
   const payload = await apiRequest("/api/favorites/toggle", {
     method: "POST",
@@ -9776,14 +9856,22 @@ async function toggleFavorite() {
     }),
   });
 
-  video.is_favorite = Boolean(payload.is_favorite);
-  video.favorite_created_at = String(payload.favorite_created_at || "");
-  video.is_disliked = Boolean(payload.is_disliked);
-  video.disliked_created_at = String(payload.disliked_created_at || "");
+  applyVideoPreferencePayload(video, payload);
   updateVideoPreferenceButtons();
+  const clearedLabels = [];
+  if (wasDisliked && !video.is_disliked) {
+    clearedLabels.push("嫌い");
+  }
+  if (wasNotInterested && !video.is_not_interested) {
+    clearedLabels.push("好きじゃない");
+  }
   setStatus(
     video.is_favorite
-      ? (wasDisliked ? "動画をファボしました。パスを解除しました。" : "動画をファボしました。")
+      ? (
+        clearedLabels.length
+          ? `動画をファボしました。${clearedLabels.join(" / ")}を解除しました。`
+          : "動画をファボしました。"
+      )
       : "ファボを解除しました。",
     "ok",
   );
@@ -9795,6 +9883,7 @@ async function toggleDislike() {
     return;
   }
   const wasFavorite = Boolean(video.is_favorite);
+  const wasNotInterested = Boolean(video.is_not_interested);
 
   const payload = await apiRequest("/api/dislikes/toggle", {
     method: "POST",
@@ -9804,15 +9893,60 @@ async function toggleDislike() {
     }),
   });
 
-  video.is_favorite = Boolean(payload.is_favorite);
-  video.favorite_created_at = String(payload.favorite_created_at || "");
-  video.is_disliked = Boolean(payload.is_disliked);
-  video.disliked_created_at = String(payload.disliked_created_at || "");
+  applyVideoPreferencePayload(video, payload);
   updateVideoPreferenceButtons();
+  const clearedLabels = [];
+  if (wasFavorite && !video.is_favorite) {
+    clearedLabels.push("ファボ");
+  }
+  if (wasNotInterested && !video.is_not_interested) {
+    clearedLabels.push("好きじゃない");
+  }
   setStatus(
     video.is_disliked
-      ? (wasFavorite ? "動画をパス扱いにしました。ファボを解除しました。" : "動画をパス扱いにしました。")
-      : "パス扱いを解除しました。",
+      ? (
+        clearedLabels.length
+          ? `動画を嫌い扱いにしました。${clearedLabels.join(" / ")}を解除しました。`
+          : "動画を嫌い扱いにしました。"
+      )
+      : "嫌い扱いを解除しました。",
+    "ok",
+  );
+}
+
+async function toggleNotInterested() {
+  const video = currentVideo();
+  if (!video) {
+    return;
+  }
+  const wasFavorite = Boolean(video.is_favorite);
+  const wasDisliked = Boolean(video.is_disliked);
+
+  const payload = await apiRequest("/api/not-interested/toggle", {
+    method: "POST",
+    body: JSON.stringify({
+      source_id: video.source_id,
+      video_id: video.video_id,
+    }),
+  });
+
+  applyVideoPreferencePayload(video, payload);
+  updateVideoPreferenceButtons();
+  const clearedLabels = [];
+  if (wasFavorite && !video.is_favorite) {
+    clearedLabels.push("ファボ");
+  }
+  if (wasDisliked && !video.is_disliked) {
+    clearedLabels.push("嫌い");
+  }
+  setStatus(
+    video.is_not_interested
+      ? (
+        clearedLabels.length
+          ? `動画を好きじゃない扱いにしました。${clearedLabels.join(" / ")}を解除しました。`
+          : "動画を好きじゃない扱いにしました。"
+      )
+      : "好きじゃない扱いを解除しました。",
     "ok",
   );
 }
@@ -10730,6 +10864,10 @@ function bindEvents() {
   });
   elements.dislikeBtn.addEventListener("click", () => {
     toggleDislike().catch((error) => setStatus(error.message, "error"));
+    resetControlsToggleFade();
+  });
+  elements.notInterestedBtn.addEventListener("click", () => {
+    toggleNotInterested().catch((error) => setStatus(error.message, "error"));
     resetControlsToggleFade();
   });
   elements.metaTabBtn.addEventListener("click", () => toggleMetaDrawer());

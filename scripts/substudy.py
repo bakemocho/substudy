@@ -4452,6 +4452,14 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS video_not_interested (
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (source_id, video_id),
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
         CREATE TABLE IF NOT EXISTS video_playback_stats (
             source_id TEXT NOT NULL,
             video_id TEXT NOT NULL,
@@ -4522,6 +4530,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_favorites(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_dislikes_created_at
             ON video_dislikes(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_video_not_interested_created_at
+            ON video_not_interested(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_playback_stats_last_played
             ON video_playback_stats(last_played_at DESC, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
@@ -5547,6 +5557,7 @@ def prune_source_videos_full_rebuild(
     for table_name in (
         "video_favorites",
         "video_dislikes",
+        "video_not_interested",
         "video_playback_stats",
         "subtitle_bookmarks",
         "video_notes",
@@ -14035,6 +14046,7 @@ def build_web_handler(
                         v.media_path,
                         COALESCE(vf.created_at, '') AS favorite_created_at,
                         COALESCE(vd.created_at, '') AS disliked_created_at,
+                        COALESCE(vni.created_at, '') AS not_interested_created_at,
                         COALESCE(vps.impression_count, 0) AS playback_impression_count,
                         COALESCE(vps.play_count, 0) AS playback_play_count,
                         COALESCE(vps.total_watch_seconds, 0) AS playback_total_watch_seconds,
@@ -14053,6 +14065,10 @@ def build_web_handler(
                             WHEN vd.video_id IS NULL THEN 0
                             ELSE 1
                         END AS is_disliked,
+                        CASE
+                            WHEN vni.video_id IS NULL THEN 0
+                            ELSE 1
+                        END AS is_not_interested,
                         (
                             SELECT COUNT(DISTINCT (
                                 COALESCE(sb.track, '')
@@ -14088,6 +14104,9 @@ def build_web_handler(
                     LEFT JOIN video_dislikes vd
                       ON vd.source_id = v.source_id
                      AND vd.video_id = v.video_id
+                    LEFT JOIN video_not_interested vni
+                      ON vni.source_id = v.source_id
+                     AND vni.video_id = v.video_id
                     LEFT JOIN video_playback_stats vps
                       ON vps.source_id = v.source_id
                      AND vps.video_id = v.video_id
@@ -14206,6 +14225,12 @@ def build_web_handler(
                                 ""
                                 if row["disliked_created_at"] in (None, "")
                                 else str(row["disliked_created_at"])
+                            ),
+                            "is_not_interested": bool(row["is_not_interested"]),
+                            "not_interested_created_at": (
+                                ""
+                                if row["not_interested_created_at"] in (None, "")
+                                else str(row["not_interested_created_at"])
                             ),
                             "cue_bookmark_count": max(0, int(row["cue_bookmark_count"] or 0)),
                             "dictionary_bookmark_count": max(
@@ -14855,6 +14880,16 @@ def build_web_handler(
                 """,
                 (source_id, video_id),
             ).fetchone()
+            not_interested_row = connection.execute(
+                """
+                SELECT created_at
+                FROM video_not_interested
+                WHERE source_id = ?
+                  AND video_id = ?
+                LIMIT 1
+                """,
+                (source_id, video_id),
+            ).fetchone()
             return {
                 "is_favorite": favorite_row is not None,
                 "favorite_created_at": (
@@ -14867,6 +14902,15 @@ def build_web_handler(
                     ""
                     if dislike_row is None or dislike_row["created_at"] in (None, "")
                     else str(dislike_row["created_at"])
+                ),
+                "is_not_interested": not_interested_row is not None,
+                "not_interested_created_at": (
+                    ""
+                    if (
+                        not_interested_row is None
+                        or not_interested_row["created_at"] in (None, "")
+                    )
+                    else str(not_interested_row["created_at"])
                 ),
             }
 
@@ -15128,8 +15172,8 @@ def build_web_handler(
             source_id: str,
             video_id: str,
             selected_table: str,
-            cleared_table: str | None = None,
-        ) -> tuple[bool, bool]:
+            cleared_tables: Iterable[str] = (),
+        ) -> tuple[bool, set[str]]:
             existing = connection.execute(
                 f"""
                 SELECT 1
@@ -15148,8 +15192,8 @@ def build_web_handler(
                     """,
                     (source_id, video_id, now_utc_iso()),
                 )
-                cleared_other = False
-                if cleared_table:
+                cleared_other_tables: set[str] = set()
+                for cleared_table in cleared_tables:
                     other_existing = connection.execute(
                         f"""
                         SELECT 1
@@ -15160,7 +15204,9 @@ def build_web_handler(
                         """,
                         (source_id, video_id),
                     ).fetchone()
-                    cleared_other = other_existing is not None
+                    if other_existing is None:
+                        continue
+                    cleared_other_tables.add(str(cleared_table))
                     if other_existing is not None:
                         connection.execute(
                             f"""
@@ -15170,7 +15216,7 @@ def build_web_handler(
                             """,
                             (source_id, video_id),
                         )
-                return True, cleared_other
+                return True, cleared_other_tables
 
             connection.execute(
                 f"""
@@ -15180,7 +15226,7 @@ def build_web_handler(
                 """,
                 (source_id, video_id),
             )
-            return False, False
+            return False, set()
 
         def _handle_api_toggle_favorite(self) -> None:
             try:
@@ -15202,12 +15248,12 @@ def build_web_handler(
                     self._send_error_json(404, "Video not found.")
                     return
 
-                favorited, cleared_dislike = self._toggle_video_preference_mark(
+                favorited, cleared_tables = self._toggle_video_preference_mark(
                     connection=connection,
                     source_id=source_id,
                     video_id=video_id,
                     selected_table="video_favorites",
-                    cleared_table="video_dislikes",
+                    cleared_tables=("video_dislikes", "video_not_interested"),
                 )
                 state_payload = self._fetch_video_preference_state(connection, source_id, video_id)
                 connection.commit()
@@ -15220,7 +15266,10 @@ def build_web_handler(
                     "favorite_created_at": str(state_payload["favorite_created_at"] or ""),
                     "is_disliked": bool(state_payload["is_disliked"]),
                     "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
-                    "cleared_dislike": cleared_dislike,
+                    "is_not_interested": bool(state_payload["is_not_interested"]),
+                    "not_interested_created_at": str(state_payload["not_interested_created_at"] or ""),
+                    "cleared_dislike": "video_dislikes" in cleared_tables,
+                    "cleared_not_interested": "video_not_interested" in cleared_tables,
                 }
             )
 
@@ -15244,12 +15293,12 @@ def build_web_handler(
                     self._send_error_json(404, "Video not found.")
                     return
 
-                disliked, cleared_favorite = self._toggle_video_preference_mark(
+                disliked, cleared_tables = self._toggle_video_preference_mark(
                     connection=connection,
                     source_id=source_id,
                     video_id=video_id,
                     selected_table="video_dislikes",
-                    cleared_table="video_favorites",
+                    cleared_tables=("video_favorites", "video_not_interested"),
                 )
                 state_payload = self._fetch_video_preference_state(connection, source_id, video_id)
                 connection.commit()
@@ -15262,7 +15311,55 @@ def build_web_handler(
                     "favorite_created_at": str(state_payload["favorite_created_at"] or ""),
                     "is_disliked": disliked,
                     "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
-                    "cleared_favorite": cleared_favorite,
+                    "is_not_interested": bool(state_payload["is_not_interested"]),
+                    "not_interested_created_at": str(state_payload["not_interested_created_at"] or ""),
+                    "cleared_favorite": "video_favorites" in cleared_tables,
+                    "cleared_not_interested": "video_not_interested" in cleared_tables,
+                }
+            )
+
+        def _handle_api_toggle_not_interested(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            source_id = self._normalize_source(payload.get("source_id"))
+            video_id = self._normalize_source(payload.get("video_id"))
+            if source_id is None or video_id is None:
+                self._send_error_json(400, "source_id and video_id are required.")
+                return
+            if not self._is_source_allowed(source_id):
+                self._send_error_json(403, "Source is not allowed.")
+                return
+
+            with self._open_connection() as connection:
+                if not self._validate_video_exists(connection, source_id, video_id):
+                    self._send_error_json(404, "Video not found.")
+                    return
+
+                not_interested, cleared_tables = self._toggle_video_preference_mark(
+                    connection=connection,
+                    source_id=source_id,
+                    video_id=video_id,
+                    selected_table="video_not_interested",
+                    cleared_tables=("video_favorites", "video_dislikes"),
+                )
+                state_payload = self._fetch_video_preference_state(connection, source_id, video_id)
+                connection.commit()
+
+            self._send_json(
+                {
+                    "source_id": source_id,
+                    "video_id": video_id,
+                    "is_favorite": bool(state_payload["is_favorite"]),
+                    "favorite_created_at": str(state_payload["favorite_created_at"] or ""),
+                    "is_disliked": bool(state_payload["is_disliked"]),
+                    "disliked_created_at": str(state_payload["disliked_created_at"] or ""),
+                    "is_not_interested": not_interested,
+                    "not_interested_created_at": str(state_payload["not_interested_created_at"] or ""),
+                    "cleared_favorite": "video_favorites" in cleared_tables,
+                    "cleared_dislike": "video_dislikes" in cleared_tables,
                 }
             )
 
@@ -15606,6 +15703,9 @@ def build_web_handler(
                     return
                 if path == "/api/dislikes/toggle":
                     self._handle_api_toggle_dislike()
+                    return
+                if path == "/api/not-interested/toggle":
+                    self._handle_api_toggle_not_interested()
                     return
                 if path == "/api/playback-stats/record":
                     self._handle_api_record_playback_stats()

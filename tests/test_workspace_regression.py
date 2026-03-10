@@ -4439,7 +4439,7 @@ enabled = true
         self.assertIn("storiesofcz", source_ids)
         self.assertIn("ortbake", source_ids)
 
-    def test_feed_and_toggle_dislike_state(self):
+    def test_feed_and_toggle_preference_state(self):
         media_path = self.workspace_root / "storiesofcz.mp4"
         media_path.write_bytes(b"")
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
@@ -4481,6 +4481,7 @@ enabled = true
         feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
         favorite_url = f"http://{host}:{port}/api/favorites/toggle"
         dislike_url = f"http://{host}:{port}/api/dislikes/toggle"
+        not_interested_url = f"http://{host}:{port}/api/not-interested/toggle"
         toggle_body = json.dumps(
             {
                 "source_id": "storiesofcz",
@@ -4494,6 +4495,20 @@ enabled = true
         self.assertEqual(payload.get("count"), 1)
         self.assertFalse(payload["videos"][0]["is_favorite"])
         self.assertFalse(payload["videos"][0]["is_disliked"])
+        self.assertFalse(payload["videos"][0]["is_not_interested"])
+
+        not_interested_request = urllib.request.Request(
+            not_interested_url,
+            data=toggle_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(not_interested_request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            not_interested_payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(not_interested_payload["is_not_interested"])
+        self.assertFalse(not_interested_payload["is_favorite"])
+        self.assertFalse(not_interested_payload["is_disliked"])
 
         dislike_request = urllib.request.Request(
             dislike_url,
@@ -4506,6 +4521,7 @@ enabled = true
             dislike_payload = json.loads(response.read().decode("utf-8"))
         self.assertTrue(dislike_payload["is_disliked"])
         self.assertFalse(dislike_payload["is_favorite"])
+        self.assertFalse(dislike_payload["is_not_interested"])
 
         favorite_request = urllib.request.Request(
             favorite_url,
@@ -4518,12 +4534,14 @@ enabled = true
             favorite_payload = json.loads(response.read().decode("utf-8"))
         self.assertTrue(favorite_payload["is_favorite"])
         self.assertFalse(favorite_payload["is_disliked"])
+        self.assertFalse(favorite_payload["is_not_interested"])
 
         with urllib.request.urlopen(feed_url, timeout=5) as response:
             self.assertEqual(response.status, 200)
             updated_payload = json.loads(response.read().decode("utf-8"))
         self.assertTrue(updated_payload["videos"][0]["is_favorite"])
         self.assertFalse(updated_payload["videos"][0]["is_disliked"])
+        self.assertFalse(updated_payload["videos"][0]["is_not_interested"])
 
     def test_playback_stats_record_and_feed(self):
         media_path = self.workspace_root / "storiesofcz_stats.mp4"
