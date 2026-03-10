@@ -178,6 +178,10 @@ RE_RETRY_MISSING_ARTIFACT = re.compile(
     r"(subtitle file missing after download attempt|did not write a terminal download_state row)",
     re.IGNORECASE,
 )
+RE_TIKTOK_ERROR_VIDEO_ID = re.compile(
+    r"ERROR:\s*\[TikTok\]\s*(?P<video_id>\d{10,})\s*:\s*(?P<message>.+)",
+    re.IGNORECASE,
+)
 
 _YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
 _YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
@@ -1940,6 +1944,56 @@ def attempted_chunk_target_ids(plan: ChunkedYtdlpStagePlan) -> list[str]:
     return attempted_ids
 
 
+def extract_tiktok_transient_retry_video_ids(
+    output_text: str | None,
+    candidate_video_ids: Iterable[str],
+) -> list[str]:
+    candidate_set = {
+        str(video_id or "").strip()
+        for video_id in candidate_video_ids
+        if str(video_id or "").strip()
+    }
+    if not candidate_set:
+        return []
+    retry_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for line in str(output_text or "").splitlines():
+        match = RE_TIKTOK_ERROR_VIDEO_ID.search(line)
+        if match is None:
+            continue
+        video_id = str(match.group("video_id") or "").strip()
+        if video_id not in candidate_set or video_id in seen_ids:
+            continue
+        message = str(match.group("message") or "").strip()
+        if not RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message):
+            continue
+        seen_ids.add(video_id)
+        retry_ids.append(video_id)
+    return retry_ids
+
+
+def extract_tiktok_error_video_ids(
+    output_text: str | None,
+    candidate_video_ids: Iterable[str],
+) -> set[str]:
+    candidate_set = {
+        str(video_id or "").strip()
+        for video_id in candidate_video_ids
+        if str(video_id or "").strip()
+    }
+    if not candidate_set:
+        return set()
+    error_ids: set[str] = set()
+    for line in str(output_text or "").splitlines():
+        match = RE_TIKTOK_ERROR_VIDEO_ID.search(line)
+        if match is None:
+            continue
+        video_id = str(match.group("video_id") or "").strip()
+        if video_id in candidate_set:
+            error_ids.add(video_id)
+    return error_ids
+
+
 def run_interleaved_chunked_ytdlp_stage_plans(
     plans: list[ChunkedYtdlpStagePlan],
     dry_run: bool,
@@ -1972,6 +2026,46 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                     command,
                     dry_run=dry_run,
                 )
+                transient_retry_ids = extract_tiktok_transient_retry_video_ids(
+                    output_text,
+                    [video_id for video_id, _url in chunk_pairs],
+                )
+                if transient_retry_ids:
+                    original_error_ids = extract_tiktok_error_video_ids(
+                        output_text,
+                        [video_id for video_id, _url in chunk_pairs],
+                    )
+                    retry_id_set = set(transient_retry_ids)
+                    retry_pairs = [
+                        (video_id, url)
+                        for video_id, url in chunk_pairs
+                        if video_id in retry_id_set
+                    ]
+                    if retry_pairs:
+                        print(
+                            f"[{plan.stage}] {plan.source.id}: retry transient TikTok webpage errors "
+                            f"targets={len(retry_pairs)}"
+                        )
+                        write_urls_file(
+                            plan.active_urls_file,
+                            [url for _video_id, url in retry_pairs],
+                        )
+                        retry_command = [*plan.build_command(), "-a", str(plan.active_urls_file)]
+                        retry_exit_code, retry_output_text = run_command_with_output(
+                            retry_command,
+                            dry_run=dry_run,
+                        )
+                        if retry_exit_code == 0:
+                            if plan.exit_code != 0 and original_error_ids.issubset(retry_id_set):
+                                plan.exit_code = 0
+                                output_text = retry_output_text
+                        else:
+                            plan.exit_code = retry_exit_code
+                            output_text = retry_output_text
+                            plan.error = summarize_command_failure(
+                                retry_output_text,
+                                retry_exit_code,
+                            )
                 if plan.exit_code != 0:
                     plan.error = summarize_command_failure(output_text, plan.exit_code)
             except Exception as exc:

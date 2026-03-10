@@ -234,6 +234,77 @@ class WorkspaceRegressionTests(unittest.TestCase):
         popen_kwargs = popen_mock.call_args.kwargs
         self.assertTrue(popen_kwargs["start_new_session"])
 
+    def test_run_interleaved_chunked_ytdlp_stage_plans_retries_transient_tiktok_errors(self):
+        source_root = self.workspace_root / "transient_retry_source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        active_urls_file = source.media_archive.parent / "tmp" / "retry_urls.txt"
+        active_urls_file.parent.mkdir(parents=True, exist_ok=True)
+        observed_batches: list[list[str]] = []
+
+        def fake_run_command(command, dry_run=False):
+            self.assertFalse(dry_run)
+            args = list(command)
+            urls_path = Path(args[args.index("-a") + 1])
+            batch_ids = [url.rstrip("/").rsplit("/", 1)[-1] for url in urls_path.read_text(encoding="utf-8").splitlines()]
+            observed_batches.append(batch_ids)
+            if len(observed_batches) == 1:
+                return (
+                    1,
+                    "ERROR: [TikTok] 7437177985746226487: Unable to extract universal data for rehydration",
+                )
+            return (0, "")
+
+        plan = self.mod.ChunkedYtdlpStagePlan(
+            source=source,
+            stage="subs",
+            active_urls_file=active_urls_file,
+            build_command=lambda: ["fake-ytdlp"],
+            command_template=["fake-ytdlp"],
+            url_chunks=[[
+                ("7437177985746226487", "https://www.tiktok.com/@storiesofcz/video/7437177985746226487"),
+                ("7436457164912299319", "https://www.tiktok.com/@storiesofcz/video/7436457164912299319"),
+            ]],
+            target_ids=["7437177985746226487", "7436457164912299319"],
+            resolved_target_ids=["7437177985746226487", "7436457164912299319"],
+            unresolved_target_ids=[],
+            started_at="2026-03-10T00:00:00+00:00",
+            run_id=None,
+        )
+
+        with mock.patch.object(self.mod, "run_command_with_output", side_effect=fake_run_command):
+            self.mod.run_interleaved_chunked_ytdlp_stage_plans([plan], dry_run=False)
+
+        self.assertEqual(
+            observed_batches,
+            [
+                ["7437177985746226487", "7436457164912299319"],
+                ["7437177985746226487"],
+            ],
+        )
+        self.assertEqual(plan.chunk_index, 1)
+        self.assertIsNone(plan.error)
+
     def test_import_monitor_records_latest_summary(self):
         input_path = self.workspace_root / "exports" / "llm" / "enriched_missing.jsonl"
         input_path.write_text("", encoding="utf-8")
@@ -4257,7 +4328,7 @@ data_dir = "{source_root}"
                     connection=connection,
                 )
 
-            self.assertEqual(len(commands), 1)
+            self.assertEqual(len(commands), 2)
 
             state_rows = connection.execute(
                 """
