@@ -3622,6 +3622,50 @@ data_dir = "{beta_root}"
         self.assertEqual(len(alpha_meta), 6)
         self.assertEqual(len(beta_meta), 1)
 
+    def test_sync_main_treats_zero_limit_as_unbounded(self):
+        source_root = self.workspace_root / "sync_zero_limit"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                self.mod.sys,
+                "argv",
+                [
+                    "substudy.py",
+                    "sync",
+                    "--config",
+                    str(config_path),
+                    "--dry-run",
+                    "--skip-media",
+                    "--skip-meta",
+                ],
+            ),
+            mock.patch.object(self.mod, "run_legacy_sync_sources") as run_sync_mock,
+        ):
+            result = self.mod.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run_sync_mock.call_args.kwargs["limit"], None)
+
     def test_sync_source_skips_retry_subtitle_when_local_file_exists(self):
         source_root = self.workspace_root / "storiesofcz_subs_retry_existing"
         source_root.mkdir(parents=True, exist_ok=True)

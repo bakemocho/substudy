@@ -1892,6 +1892,16 @@ def build_run_local_urls_file(source: SourceConfig) -> Path:
     return source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
 
 
+def normalize_optional_stage_limit(raw_value: Any) -> int | None:
+    if raw_value in (None, ""):
+        return None
+    try:
+        normalized = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
+
+
 @dataclass
 class SyncSourceRunResult:
     new_media_ids: list[str] = field(default_factory=list)
@@ -17995,6 +18005,7 @@ def main() -> int:
             sync_connection.execute("PRAGMA journal_mode=WAL")
             create_schema(sync_connection)
         try:
+            sync_stage_limit = normalize_optional_stage_limit(getattr(args, "limit", None))
             run_legacy_sync_sources(
                 sources=run_sources,
                 dry_run=bool(args.dry_run),
@@ -18005,7 +18016,7 @@ def main() -> int:
                 metered_media_mode=metered_media_mode,
                 metered_min_archive_ids=metered_min_archive_ids,
                 metered_playlist_end=metered_playlist_end,
-                limit=max(0, int(getattr(args, "limit", 0))),
+                limit=sync_stage_limit,
             )
         finally:
             if sync_connection is not None:
