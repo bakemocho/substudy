@@ -650,6 +650,68 @@ def subtitle_language_matches_sub_langs(language: str | None, sub_langs_raw: Any
     return False
 
 
+def subtitle_label_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in re.split(r"[^a-z0-9]+", str(value or "").strip().lower())
+        if token
+    }
+
+
+def subtitle_path_label_hints(subtitle_path: str | None) -> list[str]:
+    name = Path(str(subtitle_path or "").strip()).name.lower()
+    if not name:
+        return []
+    parts = [part.strip() for part in name.split(".") if part.strip()]
+    if len(parts) <= 2:
+        return []
+    return parts[1:-1]
+
+
+def is_japanese_subtitle_label(language: str | None, subtitle_path: str | None = None) -> bool:
+    normalized = str(language or "").strip().lower()
+    path_hints = subtitle_path_label_hints(subtitle_path)
+    if not normalized and not path_hints:
+        return False
+    if (
+        normalized in {"ja", "jp", "jpn"}
+        or normalized.startswith("ja-")
+        or normalized.startswith("jp-")
+        or normalized.startswith("jpn-")
+        or "japanese" in normalized
+    ):
+        return True
+    label_tokens = subtitle_label_tokens(normalized)
+    if label_tokens & {"ja", "jp", "jpn", "japanese"}:
+        return True
+    path_tokens = {
+        token
+        for hint in path_hints
+        for token in subtitle_label_tokens(hint)
+    }
+    return bool(path_tokens & {"ja", "jp", "jpn", "japanese"})
+
+
+def classify_ja_subtitle_variant(language: str | None, subtitle_path: str | None = None) -> str:
+    normalized = str(language or "").strip().lower()
+    path_hints = subtitle_path_label_hints(subtitle_path)
+    if (
+        normalized == "ja-asr-local"
+        or normalized.startswith("ja-asr-local-")
+        or any(hint == "ja-asr-local" or hint.startswith("ja-asr-local-") for hint in path_hints)
+    ):
+        return "ja-asr-local"
+    if (
+        normalized == "ja-local"
+        or normalized.startswith("ja-local-")
+        or any(hint == "ja-local" or hint.startswith("ja-local-") for hint in path_hints)
+    ):
+        return "ja-local"
+    if is_japanese_subtitle_label(language, subtitle_path):
+        return "ja"
+    return ""
+
+
 def resolve_managed_targets_path(config_path: Path) -> Path:
     candidate = config_path.expanduser()
     if not candidate.is_absolute():
@@ -12627,13 +12689,7 @@ def collect_workspace_review_and_missing_rows(
 
 
 def is_workspace_ja_subtitle(language: str | None, subtitle_path: str | None) -> bool:
-    normalized = str(language or "").strip().lower()
-    path_value = str(subtitle_path or "").strip().lower()
-    return (
-        normalized == "ja"
-        or normalized.startswith("ja-")
-        or ".ja." in path_value
-    )
+    return bool(classify_ja_subtitle_variant(language, subtitle_path))
 
 
 def is_workspace_english_subtitle(language: str | None, subtitle_path: str | None) -> bool:
@@ -13815,6 +13871,48 @@ def build_web_handler(
                 )
                 return
 
+            def any_japanese_subtitle_sql(subtitle_alias: str) -> str:
+                language_expr = f"LOWER(COALESCE({subtitle_alias}.language, ''))"
+                path_expr = f"LOWER(COALESCE({subtitle_alias}.subtitle_path, ''))"
+                return f"""
+                (
+                    {language_expr} = 'ja'
+                    OR {language_expr} LIKE 'ja-%'
+                    OR {language_expr} = 'jp'
+                    OR {language_expr} LIKE 'jp-%'
+                    OR {language_expr} = 'jpn'
+                    OR {language_expr} LIKE 'jpn-%'
+                    OR {language_expr} LIKE '%.ja'
+                    OR {language_expr} LIKE '%.ja-%'
+                    OR {language_expr} LIKE '%.jp'
+                    OR {language_expr} LIKE '%.jp-%'
+                    OR {language_expr} LIKE '%.jpn'
+                    OR {language_expr} LIKE '%.jpn-%'
+                    OR {language_expr} LIKE '%japanese%'
+                    OR {path_expr} LIKE '%.ja.%'
+                    OR {path_expr} LIKE '%.ja-%'
+                    OR {path_expr} LIKE '%.jp.%'
+                    OR {path_expr} LIKE '%.jp-%'
+                    OR {path_expr} LIKE '%.jpn.%'
+                    OR {path_expr} LIKE '%.jpn-%'
+                    OR {path_expr} LIKE '%japanese%'
+                )
+                """
+
+            def generated_japanese_subtitle_exclusion_sql(subtitle_alias: str) -> str:
+                language_expr = f"LOWER(COALESCE({subtitle_alias}.language, ''))"
+                path_expr = f"LOWER(COALESCE({subtitle_alias}.subtitle_path, ''))"
+                return f"""
+                (
+                    {language_expr} NOT LIKE 'ja-local%'
+                    AND {language_expr} NOT LIKE 'ja-asr-local%'
+                    AND {path_expr} NOT LIKE '%.ja-local.%'
+                    AND {path_expr} NOT LIKE '%.ja-local-%'
+                    AND {path_expr} NOT LIKE '%.ja-asr-local.%'
+                    AND {path_expr} NOT LIKE '%.ja-asr-local-%'
+                )
+                """
+
             def ja_subtitle_exists_clause(video_alias: str) -> str:
                 return f"""
                 EXISTS (
@@ -13822,11 +13920,7 @@ def build_web_handler(
                     FROM subtitles sja
                     WHERE sja.source_id = {video_alias}.source_id
                       AND sja.video_id = {video_alias}.video_id
-                      AND (
-                        LOWER(COALESCE(sja.language, '')) = 'ja'
-                        OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-%'
-                        OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja.%'
-                      )
+                      AND {any_japanese_subtitle_sql('sja')}
                 )
                 """
 
@@ -13871,16 +13965,8 @@ def build_web_handler(
                         FROM subtitles sja
                         WHERE sja.source_id = {video_alias}.source_id
                           AND sja.video_id = {video_alias}.video_id
-                          AND (
-                            LOWER(COALESCE(sja.language, '')) = 'ja'
-                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-%'
-                            OR LOWER(COALESCE(sja.language, '')) LIKE '%japanese%'
-                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja.%'
-                          )
-                          AND LOWER(COALESCE(sja.language, '')) NOT LIKE 'ja-local%'
-                          AND LOWER(COALESCE(sja.language, '')) NOT LIKE 'ja-asr-local%'
-                          AND LOWER(COALESCE(sja.subtitle_path, '')) NOT LIKE '%.ja-local.%'
-                          AND LOWER(COALESCE(sja.subtitle_path, '')) NOT LIKE '%.ja-asr-local.%'
+                          AND {any_japanese_subtitle_sql('sja')}
+                          AND {generated_japanese_subtitle_exclusion_sql('sja')}
                     )
                     """
                 return ""
@@ -13899,14 +13985,9 @@ def build_web_handler(
                     label = str(track.get("label") or "").strip().lower()
                     if not label:
                         continue
-                    if label == "ja-asr-local" or label.startswith("ja-asr-local-"):
-                        variants.add("ja-asr-local")
-                        continue
-                    if label == "ja-local" or label.startswith("ja-local-"):
-                        variants.add("ja-local")
-                        continue
-                    if label == "ja" or label.startswith("ja-") or "japanese" in label:
-                        variants.add("ja")
+                    variant = classify_ja_subtitle_variant(label, label)
+                    if variant:
+                        variants.add(variant)
                 if normalized_filter == "ja_only":
                     return bool(variants)
                 if normalized_filter == "ja_missing":

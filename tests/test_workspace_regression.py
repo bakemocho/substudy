@@ -141,6 +141,24 @@ class WorkspaceRegressionTests(unittest.TestCase):
             self.mod.subtitle_language_matches_sub_langs("NA.eng-US", "en.*,en")
         )
 
+    def test_classify_ja_subtitle_variant_accepts_upstream_japanese_codes(self):
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant("NA.jpn-JP"),
+            "ja",
+        )
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant("JP.ja-JP"),
+            "ja",
+        )
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant("ja-local"),
+            "ja-local",
+        )
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant("ja-asr-local"),
+            "ja-asr-local",
+        )
+
     def test_run_command_with_output_streams_and_returns_combined_text(self):
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
@@ -4685,7 +4703,7 @@ enabled = true
     def test_feed_translation_filter_supports_variants(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
         video_specs = [
-            ("storiesofcz", "video-ja", "ja", "video-ja.mp4", "video-ja.ja.vtt"),
+            ("storiesofcz", "video-ja", "NA.jpn-JP", "video-ja.mp4", "video-ja.NA.jpn-JP.vtt"),
             ("storiesofcz", "video-ja-local", "ja-local", "video-ja-local.mp4", "video-ja-local.ja-local.vtt"),
             ("storiesofcz", "video-ja-asr-local", "ja-asr-local", "video-ja-asr-local.mp4", "video-ja-asr-local.ja-asr-local.vtt"),
             ("storiesofcz", "video-no-ja", "", "video-no-ja.mp4", ""),

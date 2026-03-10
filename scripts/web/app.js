@@ -55,7 +55,7 @@ const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-lo
 const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
 const TRANSLATION_VARIANT_LABELS = Object.freeze({
   auto: "自動",
-  ja: "ja",
+  ja: "ja（Upstream）",
   "ja-local": "ja-local（Generated）",
   "ja-asr-local": "ja-asr-local（Generated/ASR）",
 });
@@ -2216,6 +2216,39 @@ function normalizedTrackLabel(track) {
   return String(track?.language || track?.label || "").trim().toLowerCase();
 }
 
+function subtitleLabelTokens(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .split(/[^a-z0-9]+/u)
+    .filter(Boolean);
+}
+
+function isJapaneseTrackLabel(label) {
+  const normalized = String(label || "").trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (
+    normalized === "ja" ||
+    normalized === "jp" ||
+    normalized === "jpn" ||
+    normalized.startsWith("ja-") ||
+    normalized.startsWith("jp-") ||
+    normalized.startsWith("jpn-") ||
+    normalized.includes("japanese")
+  ) {
+    return true;
+  }
+  const tokens = new Set(subtitleLabelTokens(normalized));
+  return (
+    tokens.has("ja") ||
+    tokens.has("jp") ||
+    tokens.has("jpn") ||
+    tokens.has("japanese")
+  );
+}
+
 function getJaTrackVariant(track) {
   if (normalizedTrackKind(track) !== "subtitle") {
     return "";
@@ -2230,7 +2263,7 @@ function getJaTrackVariant(track) {
   if (label === "ja-local" || label.startsWith("ja-local-")) {
     return "ja-local";
   }
-  if (label === "ja" || label.startsWith("ja-") || label.includes("japanese")) {
+  if (isJapaneseTrackLabel(label)) {
     return "ja";
   }
   return "";
