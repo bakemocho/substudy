@@ -37,6 +37,12 @@ const PLAYER_CARD_SNAP_RELEASE_DELTA = 180;
 const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
 const PLAYER_CARD_SNAP_NUDGE_PX = 3.2;
 const PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH = 920;
+const FAST_SKIP_THRESHOLD_SECONDS = 3;
+const SHALLOW_SKIP_MAX_SECONDS = 10;
+const SHALLOW_SKIP_RATIO = 0.2;
+const COMPLETE_WATCH_RATIO = 0.9;
+const RANKED_POOL_SIZE = 24;
+const RECENT_HISTORY_LOOKBACK = 12;
 const TRANSLATION_FILTER_VALUES = new Set(["all", "ja_only", "ja_missing"]);
 const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
 const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
@@ -129,12 +135,16 @@ const state = {
   feedTagRestoreSourceId: "",
   playbackStatsSourceId: "",
   playbackStatsVideoId: "",
+  playbackStatsPendingImpressionCount: 0,
   playbackStatsPendingPlayCount: 0,
   playbackStatsPendingWatchSeconds: 0,
   playbackStatsPendingCompletedCount: 0,
+  playbackStatsPendingFastSkipCount: 0,
+  playbackStatsPendingShallowSkipCount: 0,
   playbackStatsPlayStartMs: null,
   playbackStatsCountedPlay: false,
   playbackStatsCountedComplete: false,
+  playbackStatsCountedSkip: false,
   playbackStatsLastPositionSeconds: null,
   index: 0,
   shuffleMode: true,
@@ -511,13 +521,21 @@ function formatShortIso(value) {
 
 function normalizePlaybackStats(raw) {
   const stats = raw && typeof raw === "object" ? raw : {};
+  const impressionCount = Number(stats.impression_count);
   const totalWatchSeconds = Number(stats.total_watch_seconds);
+  const fastSkipCount = Number(stats.fast_skip_count);
+  const shallowSkipCount = Number(stats.shallow_skip_count);
   const lastPositionSeconds = Number(stats.last_position_seconds);
   return {
+    impression_count: Number.isFinite(impressionCount) ? Math.max(0, Math.round(impressionCount)) : 0,
     play_count: Math.max(0, Number.parseInt(stats.play_count, 10) || 0),
     total_watch_seconds: Number.isFinite(totalWatchSeconds) ? Math.max(0, totalWatchSeconds) : 0,
     completed_count: Math.max(0, Number.parseInt(stats.completed_count, 10) || 0),
+    fast_skip_count: Number.isFinite(fastSkipCount) ? Math.max(0, Math.round(fastSkipCount)) : 0,
+    shallow_skip_count: Number.isFinite(shallowSkipCount) ? Math.max(0, Math.round(shallowSkipCount)) : 0,
+    last_served_at: String(stats.last_served_at || "").trim(),
     last_played_at: String(stats.last_played_at || "").trim(),
+    last_completed_at: String(stats.last_completed_at || "").trim(),
     last_position_seconds: Number.isFinite(lastPositionSeconds) ? Math.max(0, lastPositionSeconds) : null,
   };
 }
@@ -590,31 +608,215 @@ function shuffleIndices(indices) {
   return cloned;
 }
 
-function refillShuffleQueue(currentIndex) {
-  const candidates = [];
-  for (let idx = 0; idx < state.videos.length; idx += 1) {
-    if (idx !== currentIndex) {
-      candidates.push(idx);
-    }
+function computeVideoInterestValue(video) {
+  if (!video) {
+    return 0;
   }
-  if (!candidates.length && currentIndex >= 0) {
-    candidates.push(currentIndex);
+  const stats = normalizePlaybackStats(video.playback_stats);
+  const duration = Math.max(20, getVideoDurationSeconds(video));
+  const watchRatio = Math.min(2.5, stats.total_watch_seconds / duration);
+  let score = 0;
+  if (video.is_favorite) {
+    score += 4.5;
   }
-  state.shuffleQueue = shuffleIndices(candidates);
+  if (video.is_disliked) {
+    score -= 10.0;
+  }
+  score += stats.completed_count * 1.8;
+  score += watchRatio * 1.4;
+  score += Math.max(0, stats.play_count - 1) * 0.35;
+  score -= stats.fast_skip_count * 2.8;
+  score -= stats.shallow_skip_count * 1.2;
+  return score;
 }
 
-function chooseNextShuffleIndex() {
+function buildAffinityMaps() {
+  const sourceAffinity = new Map();
+  const tagAffinity = new Map();
+  for (const video of state.videos) {
+    const stats = normalizePlaybackStats(video?.playback_stats);
+    const observed = (
+      video?.is_favorite
+      || video?.is_disliked
+      || stats.impression_count > 0
+      || stats.play_count > 0
+      || stats.completed_count > 0
+      || stats.fast_skip_count > 0
+      || stats.shallow_skip_count > 0
+    );
+    if (!observed) {
+      continue;
+    }
+    const interest = computeVideoInterestValue(video);
+    const sourceId = String(video?.source_id || "").trim();
+    if (sourceId) {
+      if (!sourceAffinity.has(sourceId)) {
+        sourceAffinity.set(sourceId, { total: 0, count: 0 });
+      }
+      const entry = sourceAffinity.get(sourceId);
+      entry.total += interest;
+      entry.count += 1;
+    }
+    for (const tag of resolveSourceTagsForSourceId(sourceId)) {
+      const key = String(tag || "").trim().toLocaleLowerCase();
+      if (!key) {
+        continue;
+      }
+      if (!tagAffinity.has(key)) {
+        tagAffinity.set(key, { total: 0, count: 0 });
+      }
+      const entry = tagAffinity.get(key);
+      entry.total += interest;
+      entry.count += 1;
+    }
+  }
+  const averagedSourceAffinity = new Map();
+  for (const [sourceId, entry] of sourceAffinity.entries()) {
+    averagedSourceAffinity.set(sourceId, entry.count > 0 ? entry.total / entry.count : 0);
+  }
+  const averagedTagAffinity = new Map();
+  for (const [tag, entry] of tagAffinity.entries()) {
+    averagedTagAffinity.set(tag, entry.count > 0 ? entry.total / entry.count : 0);
+  }
+  return { sourceAffinity: averagedSourceAffinity, tagAffinity: averagedTagAffinity };
+}
+
+function computeRecentSourcePenalty(candidateSourceId) {
+  const recentIndices = state.playbackHistory.slice(-3);
+  let penalty = 0;
+  let matchCount = 0;
+  for (const historyIndex of recentIndices) {
+    const video = state.videos[historyIndex];
+    if (!video) {
+      continue;
+    }
+    if (String(video.source_id || "").trim() === candidateSourceId) {
+      matchCount += 1;
+    }
+  }
+  if (matchCount > 0) {
+    penalty -= 2.2;
+  }
+  if (matchCount > 1) {
+    penalty -= 1.8 * (matchCount - 1);
+  }
+  return penalty;
+}
+
+function computeRecentVideoPenalty(candidateIndex) {
+  const recentIndices = state.playbackHistory.slice(-RECENT_HISTORY_LOOKBACK);
+  if (recentIndices.slice(-4).includes(candidateIndex)) {
+    return -6.0;
+  }
+  if (recentIndices.includes(candidateIndex)) {
+    return -2.5;
+  }
+  return 0;
+}
+
+function computeCandidateShuffleScore(index, affinityMaps) {
+  const video = state.videos[index];
+  if (!video) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  if (video.is_disliked) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  const stats = normalizePlaybackStats(video.playback_stats);
+  const duration = getVideoDurationSeconds(video);
+  const sourceId = String(video.source_id || "").trim();
+  const sourceTags = resolveSourceTagsForSourceId(sourceId);
+  const sourceAffinity = affinityMaps.sourceAffinity.get(sourceId) || 0;
+  const tagAffinity = sourceTags.length
+    ? sourceTags.reduce((sum, tag) => (
+      sum + (affinityMaps.tagAffinity.get(String(tag || "").trim().toLocaleLowerCase()) || 0)
+    ), 0) / sourceTags.length
+    : 0;
+  const freshBonus = stats.impression_count === 0
+    ? 2.2
+    : stats.play_count === 0
+      ? 0.9
+      : 0;
+  const watchRatio = duration > 0 ? Math.min(1.5, stats.total_watch_seconds / duration) : 0;
+  const translationBonus = hasJaSubtitleTrack(video) ? 0.2 : 0;
+  const repetitionPenalty = 0.55 * Math.log1p(stats.impression_count);
+  const lastPlayedPenalty = stats.last_played_at ? 0.35 : 0;
+  return (
+    computeVideoInterestValue(video)
+    + sourceAffinity * 0.9
+    + tagAffinity * 0.55
+    + freshBonus
+    + translationBonus
+    + watchRatio * 0.4
+    + computeRecentSourcePenalty(sourceId)
+    + computeRecentVideoPenalty(index)
+    - repetitionPenalty
+    - lastPlayedPenalty
+  );
+}
+
+function chooseWeightedRankedIndex(rankedCandidates) {
+  if (!rankedCandidates.length) {
+    return -1;
+  }
+  const bestScore = rankedCandidates[0].score;
+  const weights = rankedCandidates.map((candidate) => (
+    Math.max(0.05, Math.exp((candidate.score - bestScore) / 2.2))
+  ));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  if (!(totalWeight > 0)) {
+    return rankedCandidates[0].index;
+  }
+  let cursor = Math.random() * totalWeight;
+  for (let idx = 0; idx < rankedCandidates.length; idx += 1) {
+    cursor -= weights[idx];
+    if (cursor <= 0) {
+      return rankedCandidates[idx].index;
+    }
+  }
+  return rankedCandidates[rankedCandidates.length - 1].index;
+}
+
+function computeRankedShuffleIndex() {
   if (!state.videos.length) {
     return -1;
   }
-  if (!state.shuffleQueue.length) {
-    refillShuffleQueue(state.index);
+  const affinityMaps = buildAffinityMaps();
+  const rankedCandidates = [];
+  for (let idx = 0; idx < state.videos.length; idx += 1) {
+    if (idx === state.index) {
+      continue;
+    }
+    const score = computeCandidateShuffleScore(idx, affinityMaps);
+    if (!Number.isFinite(score)) {
+      continue;
+    }
+    rankedCandidates.push({ index: idx, score });
   }
-  const next = state.shuffleQueue.shift();
-  if (typeof next !== "number") {
-    return -1;
+  rankedCandidates.sort((left, right) => right.score - left.score);
+  if (!rankedCandidates.length) {
+    const fallback = [];
+    for (let idx = 0; idx < state.videos.length; idx += 1) {
+      if (idx !== state.index) {
+        fallback.push(idx);
+      }
+    }
+    if (!fallback.length && state.index >= 0) {
+      fallback.push(state.index);
+    }
+    return fallback.length ? fallback[Math.floor(Math.random() * fallback.length)] : -1;
   }
-  return next;
+  return chooseWeightedRankedIndex(rankedCandidates.slice(0, RANKED_POOL_SIZE));
+}
+
+function chooseNextShuffleIndex() {
+  if (state.shuffleQueue.length) {
+    const queuedIndex = state.shuffleQueue.shift();
+    if (typeof queuedIndex === "number") {
+      return queuedIndex;
+    }
+  }
+  return computeRankedShuffleIndex();
 }
 
 function resetPlaybackTracking(initialIndex) {
@@ -1714,12 +1916,16 @@ function renderVideoMeta(video) {
 function resetPlaybackStatsSession(video = null) {
   state.playbackStatsSourceId = String(video?.source_id || "").trim();
   state.playbackStatsVideoId = String(video?.video_id || "").trim();
+  state.playbackStatsPendingImpressionCount = 0;
   state.playbackStatsPendingPlayCount = 0;
   state.playbackStatsPendingWatchSeconds = 0;
   state.playbackStatsPendingCompletedCount = 0;
+  state.playbackStatsPendingFastSkipCount = 0;
+  state.playbackStatsPendingShallowSkipCount = 0;
   state.playbackStatsPlayStartMs = null;
   state.playbackStatsCountedPlay = false;
   state.playbackStatsCountedComplete = false;
+  state.playbackStatsCountedSkip = false;
   state.playbackStatsLastPositionSeconds = null;
 }
 
@@ -1759,8 +1965,11 @@ function accumulatePendingPlaybackWatchSeconds() {
 
 function hasPendingPlaybackStats() {
   return (
-    state.playbackStatsPendingPlayCount > 0
+    state.playbackStatsPendingImpressionCount > 0
+    || state.playbackStatsPendingPlayCount > 0
     || state.playbackStatsPendingCompletedCount > 0
+    || state.playbackStatsPendingFastSkipCount > 0
+    || state.playbackStatsPendingShallowSkipCount > 0
     || state.playbackStatsPendingWatchSeconds >= 0.25
   );
 }
@@ -1781,6 +1990,50 @@ function applyPlaybackStatsToVideo(sourceId, videoId, playbackStats) {
   }
 }
 
+function getVideoDurationSeconds(video) {
+  const duration = Number(video?.duration);
+  return Number.isFinite(duration) && duration > 0 ? duration : 0;
+}
+
+function classifyCurrentVideoSkip() {
+  const video = currentVideo();
+  if (!video || !playbackStatsSessionMatchesCurrentVideo()) {
+    return { fast: 0, shallow: 0 };
+  }
+  if (state.playbackStatsCountedSkip || state.playbackStatsCountedComplete || !state.playbackStatsCountedPlay) {
+    return { fast: 0, shallow: 0 };
+  }
+  const currentTime = Number(elements.videoPlayer?.currentTime);
+  if (!Number.isFinite(currentTime) || currentTime < 0) {
+    return { fast: 0, shallow: 0 };
+  }
+  const duration = getVideoDurationSeconds(video);
+  const watchRatio = duration > 0 ? currentTime / duration : 0;
+  if (watchRatio >= COMPLETE_WATCH_RATIO) {
+    return { fast: 0, shallow: 0 };
+  }
+  if (currentTime < FAST_SKIP_THRESHOLD_SECONDS) {
+    return { fast: 1, shallow: 0 };
+  }
+  const shallowThreshold = duration > 0
+    ? Math.min(SHALLOW_SKIP_MAX_SECONDS, duration * SHALLOW_SKIP_RATIO)
+    : SHALLOW_SKIP_MAX_SECONDS;
+  if (currentTime < shallowThreshold || watchRatio < SHALLOW_SKIP_RATIO) {
+    return { fast: 0, shallow: 1 };
+  }
+  return { fast: 0, shallow: 0 };
+}
+
+function recordSkipSignalForCurrentVideo() {
+  const skipCounts = classifyCurrentVideoSkip();
+  if (skipCounts.fast <= 0 && skipCounts.shallow <= 0) {
+    return;
+  }
+  state.playbackStatsPendingFastSkipCount += skipCounts.fast;
+  state.playbackStatsPendingShallowSkipCount += skipCounts.shallow;
+  state.playbackStatsCountedSkip = true;
+}
+
 async function flushPlaybackStats(options = {}) {
   const { useBeacon = false, suppressErrors = true } = options;
   const sourceId = String(state.playbackStatsSourceId || "").trim();
@@ -1797,15 +2050,21 @@ async function flushPlaybackStats(options = {}) {
   const payload = {
     source_id: sourceId,
     video_id: videoId,
+    impression_increment: state.playbackStatsPendingImpressionCount,
     play_increment: state.playbackStatsPendingPlayCount,
     watch_seconds: Math.round(state.playbackStatsPendingWatchSeconds * 1000) / 1000,
     completed_increment: state.playbackStatsPendingCompletedCount,
+    fast_skip_increment: state.playbackStatsPendingFastSkipCount,
+    shallow_skip_increment: state.playbackStatsPendingShallowSkipCount,
     last_position_seconds: state.playbackStatsLastPositionSeconds,
   };
 
+  state.playbackStatsPendingImpressionCount = 0;
   state.playbackStatsPendingPlayCount = 0;
   state.playbackStatsPendingWatchSeconds = 0;
   state.playbackStatsPendingCompletedCount = 0;
+  state.playbackStatsPendingFastSkipCount = 0;
+  state.playbackStatsPendingShallowSkipCount = 0;
 
   if (useBeacon) {
     try {
@@ -1834,9 +2093,12 @@ async function flushPlaybackStats(options = {}) {
     applyPlaybackStatsToVideo(sourceId, videoId, response?.playback_stats || null);
     return response;
   } catch (error) {
+    state.playbackStatsPendingImpressionCount += payload.impression_increment;
     state.playbackStatsPendingPlayCount += payload.play_increment;
     state.playbackStatsPendingWatchSeconds += payload.watch_seconds;
     state.playbackStatsPendingCompletedCount += payload.completed_increment;
+    state.playbackStatsPendingFastSkipCount += payload.fast_skip_increment;
+    state.playbackStatsPendingShallowSkipCount += payload.shallow_skip_increment;
     if (!suppressErrors) {
       throw error;
     }
@@ -5528,6 +5790,12 @@ function peekUpcomingVideoForPrefetch() {
       const historyIndex = state.playbackHistory[state.historyPointer + 1];
       return state.videos[historyIndex] || null;
     }
+    if (!state.shuffleQueue.length) {
+      const previewIndex = computeRankedShuffleIndex();
+      if (previewIndex >= 0) {
+        state.shuffleQueue = [previewIndex];
+      }
+    }
     if (state.shuffleQueue.length) {
       return state.videos[state.shuffleQueue[0]] || null;
     }
@@ -9014,6 +9282,7 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
     return;
   }
 
+  recordSkipSignalForCurrentVideo();
   flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
   clearCountdown();
   closeLyricReel();
@@ -9024,6 +9293,8 @@ async function openVideo(index, autoplay = true, historyMode = "push", startTime
 
   const video = currentVideo();
   resetPlaybackStatsSession(video);
+  state.playbackStatsPendingImpressionCount = 1;
+  flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
   const videoSourceId = String(video?.source_id || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
   elements.videoPlayer.src = video.media_url;
@@ -9091,10 +9362,15 @@ function applyFeedSelectionWithoutVideoReload(index, playbackTimeSec = null) {
     && previousVideoId
     && (previousSourceId !== currentSourceId || previousVideoId !== currentVideoId)
   ) {
+    recordSkipSignalForCurrentVideo();
     flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
     resetPlaybackStatsSession(video);
+    state.playbackStatsPendingImpressionCount = 1;
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
   } else if (!previousSourceId || !previousVideoId) {
     resetPlaybackStatsSession(video);
+    state.playbackStatsPendingImpressionCount = 1;
+    flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
   }
   const videoSourceId = String(video?.source_id || "").trim();
   state.translationVariant = getTranslationVariantPreferenceForSource(videoSourceId);
@@ -9154,6 +9430,7 @@ async function applyLoadedFeedState(options = {}) {
   renderSourceOptions(state.feedSourceId, state.feedSourceTags);
 
   if (!state.videos.length) {
+    recordSkipSignalForCurrentVideo();
     flushPlaybackStats({ useBeacon: false, suppressErrors: true }).catch(() => {});
     elements.videoPlayer.removeAttribute("src");
     elements.videoPlayer.load();
@@ -10497,10 +10774,12 @@ function bindEvents() {
   }, { passive: true });
   window.addEventListener("wheel", handleWindowWheelForPlayerSnap, { passive: false });
   window.addEventListener("beforeunload", () => {
+    recordSkipSignalForCurrentVideo();
     flushPlaybackStats({ useBeacon: true, suppressErrors: true });
     syncUrlPlaybackPosition(true);
   });
   window.addEventListener("pagehide", () => {
+    recordSkipSignalForCurrentVideo();
     flushPlaybackStats({ useBeacon: true, suppressErrors: true });
   });
 }

@@ -3995,9 +3995,12 @@ enabled = true
                 {
                     "source_id": "storiesofcz",
                     "video_id": "7622222222222222222",
+                    "impression_increment": 1,
                     "play_increment": 1,
                     "watch_seconds": 12.5,
                     "completed_increment": 0,
+                    "fast_skip_increment": 0,
+                    "shallow_skip_increment": 1,
                     "last_position_seconds": 13,
                 }
             ).encode("utf-8"),
@@ -4007,10 +4010,14 @@ enabled = true
         with urllib.request.urlopen(stats_request_1, timeout=5) as response:
             self.assertEqual(response.status, 200)
             payload_1 = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(payload_1["playback_stats"]["impression_count"], 1)
         self.assertEqual(payload_1["playback_stats"]["play_count"], 1)
         self.assertAlmostEqual(payload_1["playback_stats"]["total_watch_seconds"], 12.5, places=3)
         self.assertEqual(payload_1["playback_stats"]["completed_count"], 0)
+        self.assertEqual(payload_1["playback_stats"]["fast_skip_count"], 0)
+        self.assertEqual(payload_1["playback_stats"]["shallow_skip_count"], 1)
         self.assertEqual(payload_1["playback_stats"]["last_position_seconds"], 13.0)
+        self.assertTrue(payload_1["playback_stats"]["last_served_at"])
 
         stats_request_2 = urllib.request.Request(
             stats_url,
@@ -4021,6 +4028,8 @@ enabled = true
                     "play_increment": 0,
                     "watch_seconds": 7.25,
                     "completed_increment": 1,
+                    "fast_skip_increment": 1,
+                    "shallow_skip_increment": 0,
                     "last_position_seconds": 61,
                 }
             ).encode("utf-8"),
@@ -4033,18 +4042,27 @@ enabled = true
         self.assertEqual(payload_2["playback_stats"]["play_count"], 1)
         self.assertAlmostEqual(payload_2["playback_stats"]["total_watch_seconds"], 19.75, places=3)
         self.assertEqual(payload_2["playback_stats"]["completed_count"], 1)
+        self.assertEqual(payload_2["playback_stats"]["impression_count"], 1)
+        self.assertEqual(payload_2["playback_stats"]["fast_skip_count"], 1)
+        self.assertEqual(payload_2["playback_stats"]["shallow_skip_count"], 1)
         self.assertEqual(payload_2["playback_stats"]["last_position_seconds"], 61.0)
         self.assertTrue(payload_2["playback_stats"]["last_played_at"])
+        self.assertTrue(payload_2["playback_stats"]["last_completed_at"])
 
         with urllib.request.urlopen(feed_url, timeout=5) as response:
             self.assertEqual(response.status, 200)
             feed_payload = json.loads(response.read().decode("utf-8"))
         stats = feed_payload["videos"][0]["playback_stats"]
+        self.assertEqual(stats["impression_count"], 1)
         self.assertEqual(stats["play_count"], 1)
         self.assertAlmostEqual(stats["total_watch_seconds"], 19.75, places=3)
         self.assertEqual(stats["completed_count"], 1)
+        self.assertEqual(stats["fast_skip_count"], 1)
+        self.assertEqual(stats["shallow_skip_count"], 1)
         self.assertEqual(stats["last_position_seconds"], 61.0)
         self.assertTrue(stats["last_played_at"])
+        self.assertTrue(stats["last_served_at"])
+        self.assertTrue(stats["last_completed_at"])
 
 
 if __name__ == "__main__":

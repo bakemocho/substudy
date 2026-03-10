@@ -4036,10 +4036,15 @@ def create_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS video_playback_stats (
             source_id TEXT NOT NULL,
             video_id TEXT NOT NULL,
+            impression_count INTEGER NOT NULL DEFAULT 0,
             play_count INTEGER NOT NULL DEFAULT 0,
             total_watch_seconds REAL NOT NULL DEFAULT 0,
             completed_count INTEGER NOT NULL DEFAULT 0,
+            fast_skip_count INTEGER NOT NULL DEFAULT 0,
+            shallow_skip_count INTEGER NOT NULL DEFAULT 0,
+            last_served_at TEXT,
             last_played_at TEXT,
+            last_completed_at TEXT,
             last_position_seconds REAL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -4116,6 +4121,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
     ensure_videos_loudness_columns(connection)
     ensure_source_access_state_columns(connection)
+    ensure_video_playback_stats_columns(connection)
     ensure_dictionary_schema(connection)
     ensure_translation_runs_table(connection)
     ensure_translation_stage_runs_table(connection)
@@ -4155,6 +4161,26 @@ def ensure_source_access_state_columns(connection: sqlite3.Connection) -> None:
             continue
         connection.execute(
             f"ALTER TABLE source_access_state ADD COLUMN {column_name} {column_type}"
+        )
+
+
+def ensure_video_playback_stats_columns(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("PRAGMA table_info(video_playback_stats)").fetchall()
+    if not rows:
+        return
+    existing_columns = {str(row[1]) for row in rows}
+    required_columns = {
+        "impression_count": "INTEGER NOT NULL DEFAULT 0",
+        "fast_skip_count": "INTEGER NOT NULL DEFAULT 0",
+        "shallow_skip_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_served_at": "TEXT",
+        "last_completed_at": "TEXT",
+    }
+    for column_name, column_type in required_columns.items():
+        if column_name in existing_columns:
+            continue
+        connection.execute(
+            f"ALTER TABLE video_playback_stats ADD COLUMN {column_name} {column_type}"
         )
 
 
@@ -13326,10 +13352,15 @@ def build_web_handler(
                         v.media_path,
                         COALESCE(vf.created_at, '') AS favorite_created_at,
                         COALESCE(vd.created_at, '') AS disliked_created_at,
+                        COALESCE(vps.impression_count, 0) AS playback_impression_count,
                         COALESCE(vps.play_count, 0) AS playback_play_count,
                         COALESCE(vps.total_watch_seconds, 0) AS playback_total_watch_seconds,
                         COALESCE(vps.completed_count, 0) AS playback_completed_count,
+                        COALESCE(vps.fast_skip_count, 0) AS playback_fast_skip_count,
+                        COALESCE(vps.shallow_skip_count, 0) AS playback_shallow_skip_count,
+                        COALESCE(vps.last_served_at, '') AS playback_last_served_at,
                         COALESCE(vps.last_played_at, '') AS playback_last_played_at,
+                        COALESCE(vps.last_completed_at, '') AS playback_last_completed_at,
                         vps.last_position_seconds AS playback_last_position_seconds,
                         CASE
                             WHEN vf.video_id IS NULL THEN 0
@@ -13477,6 +13508,7 @@ def build_web_handler(
                                 else str(row["disliked_created_at"])
                             ),
                             "playback_stats": {
+                                "impression_count": max(0, int(row["playback_impression_count"] or 0)),
                                 "play_count": max(0, int(row["playback_play_count"] or 0)),
                                 "total_watch_seconds": (
                                     0.0
@@ -13484,10 +13516,22 @@ def build_web_handler(
                                     else max(0.0, float(row["playback_total_watch_seconds"]))
                                 ),
                                 "completed_count": max(0, int(row["playback_completed_count"] or 0)),
+                                "fast_skip_count": max(0, int(row["playback_fast_skip_count"] or 0)),
+                                "shallow_skip_count": max(0, int(row["playback_shallow_skip_count"] or 0)),
+                                "last_served_at": (
+                                    ""
+                                    if row["playback_last_served_at"] in (None, "")
+                                    else str(row["playback_last_served_at"])
+                                ),
                                 "last_played_at": (
                                     ""
                                     if row["playback_last_played_at"] in (None, "")
                                     else str(row["playback_last_played_at"])
+                                ),
+                                "last_completed_at": (
+                                    ""
+                                    if row["playback_last_completed_at"] in (None, "")
+                                    else str(row["playback_last_completed_at"])
                                 ),
                                 "last_position_seconds": safe_float(row["playback_last_position_seconds"]),
                             },
@@ -14128,10 +14172,15 @@ def build_web_handler(
             row = connection.execute(
                 """
                 SELECT
+                    impression_count,
                     play_count,
                     total_watch_seconds,
                     completed_count,
+                    fast_skip_count,
+                    shallow_skip_count,
+                    last_served_at,
                     last_played_at,
+                    last_completed_at,
                     last_position_seconds
                 FROM video_playback_stats
                 WHERE source_id = ?
@@ -14142,13 +14191,19 @@ def build_web_handler(
             ).fetchone()
             if row is None:
                 return {
+                    "impression_count": 0,
                     "play_count": 0,
                     "total_watch_seconds": 0.0,
                     "completed_count": 0,
+                    "fast_skip_count": 0,
+                    "shallow_skip_count": 0,
+                    "last_served_at": "",
                     "last_played_at": "",
+                    "last_completed_at": "",
                     "last_position_seconds": None,
                 }
             return {
+                "impression_count": max(0, int(row["impression_count"] or 0)),
                 "play_count": max(0, int(row["play_count"] or 0)),
                 "total_watch_seconds": (
                     0.0
@@ -14156,10 +14211,22 @@ def build_web_handler(
                     else max(0.0, float(row["total_watch_seconds"]))
                 ),
                 "completed_count": max(0, int(row["completed_count"] or 0)),
+                "fast_skip_count": max(0, int(row["fast_skip_count"] or 0)),
+                "shallow_skip_count": max(0, int(row["shallow_skip_count"] or 0)),
+                "last_served_at": (
+                    ""
+                    if row["last_served_at"] in (None, "")
+                    else str(row["last_served_at"])
+                ),
                 "last_played_at": (
                     ""
                     if row["last_played_at"] in (None, "")
                     else str(row["last_played_at"])
+                ),
+                "last_completed_at": (
+                    ""
+                    if row["last_completed_at"] in (None, "")
+                    else str(row["last_completed_at"])
                 ),
                 "last_position_seconds": safe_float(row["last_position_seconds"]),
             }
@@ -14169,18 +14236,26 @@ def build_web_handler(
             connection: sqlite3.Connection,
             source_id: str,
             video_id: str,
+            impression_increment: int,
             play_increment: int,
             watch_seconds: float,
             completed_increment: int,
+            fast_skip_increment: int,
+            shallow_skip_increment: int,
             last_position_seconds: float | None,
         ) -> dict[str, Any]:
             row = connection.execute(
                 """
                 SELECT
+                    impression_count,
                     play_count,
                     total_watch_seconds,
                     completed_count,
+                    fast_skip_count,
+                    shallow_skip_count,
+                    last_served_at,
                     last_played_at,
+                    last_completed_at,
                     last_position_seconds,
                     created_at
                 FROM video_playback_stats
@@ -14191,9 +14266,12 @@ def build_web_handler(
                 (source_id, video_id),
             ).fetchone()
             now_iso = now_utc_iso()
+            safe_impression_increment = max(0, int(impression_increment))
             safe_play_increment = max(0, int(play_increment))
             safe_watch_seconds = max(0.0, float(watch_seconds))
             safe_completed_increment = max(0, int(completed_increment))
+            safe_fast_skip_increment = max(0, int(fast_skip_increment))
+            safe_shallow_skip_increment = max(0, int(shallow_skip_increment))
             safe_last_position_seconds = (
                 None
                 if last_position_seconds is None
@@ -14202,35 +14280,50 @@ def build_web_handler(
 
             if row is None:
                 created_at = now_iso
+                impression_count = safe_impression_increment
                 play_count = safe_play_increment
                 total_watch_seconds = safe_watch_seconds
                 completed_count = safe_completed_increment
+                fast_skip_count = safe_fast_skip_increment
+                shallow_skip_count = safe_shallow_skip_increment
+                last_served_at = now_iso if safe_impression_increment > 0 else ""
                 last_played_at = (
                     now_iso
                     if (safe_play_increment > 0 or safe_watch_seconds > 0 or safe_completed_increment > 0)
                     else ""
                 )
+                last_completed_at = now_iso if safe_completed_increment > 0 else ""
                 connection.execute(
                     """
                     INSERT INTO video_playback_stats (
                         source_id,
                         video_id,
+                        impression_count,
                         play_count,
                         total_watch_seconds,
                         completed_count,
+                        fast_skip_count,
+                        shallow_skip_count,
+                        last_served_at,
                         last_played_at,
+                        last_completed_at,
                         last_position_seconds,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         source_id,
                         video_id,
+                        impression_count,
                         play_count,
                         total_watch_seconds,
                         completed_count,
+                        fast_skip_count,
+                        shallow_skip_count,
+                        last_served_at or None,
                         last_played_at or None,
+                        last_completed_at or None,
                         safe_last_position_seconds,
                         created_at,
                         now_iso,
@@ -14242,6 +14335,7 @@ def build_web_handler(
                     if row["created_at"] in (None, "")
                     else str(row["created_at"])
                 )
+                impression_count = max(0, int(row["impression_count"] or 0)) + safe_impression_increment
                 play_count = max(0, int(row["play_count"] or 0)) + safe_play_increment
                 total_watch_seconds = (
                     0.0
@@ -14249,6 +14343,19 @@ def build_web_handler(
                     else max(0.0, float(row["total_watch_seconds"]))
                 ) + safe_watch_seconds
                 completed_count = max(0, int(row["completed_count"] or 0)) + safe_completed_increment
+                fast_skip_count = max(0, int(row["fast_skip_count"] or 0)) + safe_fast_skip_increment
+                shallow_skip_count = (
+                    max(0, int(row["shallow_skip_count"] or 0)) + safe_shallow_skip_increment
+                )
+                last_served_at = (
+                    now_iso
+                    if safe_impression_increment > 0
+                    else (
+                        ""
+                        if row["last_served_at"] in (None, "")
+                        else str(row["last_served_at"])
+                    )
+                )
                 last_played_at = (
                     now_iso
                     if (safe_play_increment > 0 or safe_watch_seconds > 0 or safe_completed_increment > 0)
@@ -14256,6 +14363,15 @@ def build_web_handler(
                         ""
                         if row["last_played_at"] in (None, "")
                         else str(row["last_played_at"])
+                    )
+                )
+                last_completed_at = (
+                    now_iso
+                    if safe_completed_increment > 0
+                    else (
+                        ""
+                        if row["last_completed_at"] in (None, "")
+                        else str(row["last_completed_at"])
                     )
                 )
                 next_last_position_seconds = (
@@ -14266,20 +14382,30 @@ def build_web_handler(
                 connection.execute(
                     """
                     UPDATE video_playback_stats
-                    SET play_count = ?,
+                    SET impression_count = ?,
+                        play_count = ?,
                         total_watch_seconds = ?,
                         completed_count = ?,
+                        fast_skip_count = ?,
+                        shallow_skip_count = ?,
+                        last_served_at = ?,
                         last_played_at = ?,
+                        last_completed_at = ?,
                         last_position_seconds = ?,
                         updated_at = ?
                     WHERE source_id = ?
                       AND video_id = ?
                     """,
                     (
+                        impression_count,
                         play_count,
                         total_watch_seconds,
                         completed_count,
+                        fast_skip_count,
+                        shallow_skip_count,
+                        last_served_at or None,
                         last_played_at or None,
+                        last_completed_at or None,
                         next_last_position_seconds,
                         now_iso,
                         source_id,
@@ -14449,10 +14575,16 @@ def build_web_handler(
                 return
 
             try:
+                impression_increment = int(payload.get("impression_increment", 0) or 0)
                 play_increment = int(payload.get("play_increment", 0) or 0)
                 completed_increment = int(payload.get("completed_increment", 0) or 0)
+                fast_skip_increment = int(payload.get("fast_skip_increment", 0) or 0)
+                shallow_skip_increment = int(payload.get("shallow_skip_increment", 0) or 0)
             except (TypeError, ValueError):
-                self._send_error_json(400, "play_increment and completed_increment must be integers.")
+                self._send_error_json(
+                    400,
+                    "impression_increment, play_increment, completed_increment, fast_skip_increment, and shallow_skip_increment must be integers.",
+                )
                 return
             try:
                 watch_seconds = float(payload.get("watch_seconds", 0) or 0)
@@ -14477,9 +14609,12 @@ def build_web_handler(
                     connection=connection,
                     source_id=source_id,
                     video_id=video_id,
+                    impression_increment=impression_increment,
                     play_increment=play_increment,
                     watch_seconds=watch_seconds,
                     completed_increment=completed_increment,
+                    fast_skip_increment=fast_skip_increment,
+                    shallow_skip_increment=shallow_skip_increment,
                     last_position_seconds=last_position_seconds,
                 )
                 connection.commit()
