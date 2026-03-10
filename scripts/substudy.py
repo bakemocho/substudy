@@ -12,6 +12,7 @@ import os
 import plistlib
 import random
 import re
+import signal
 import shlex
 import shutil
 import socket
@@ -23,7 +24,7 @@ import time
 import uuid
 import zlib
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, cast
@@ -248,6 +249,9 @@ class SourceConfig:
     subs_output_template: str
     meta_output_template: str
     origin: str
+    subtitle_existing_match_langs: str | None = None
+    subtitle_existing_origin_kind: str | None = None
+    subtitle_download_archive_enabled: bool = True
 
 
 @dataclass
@@ -616,6 +620,34 @@ def merge_ytdlp_sub_langs(primary_raw: Any, extra_raw: Any) -> str:
             seen.add(dedupe_key)
             merged.append(token)
     return ",".join(merged)
+
+
+def split_ytdlp_sub_langs(raw_value: Any) -> list[str]:
+    return merge_ytdlp_sub_langs(raw_value, "").split(",") if str(raw_value or "").strip() else []
+
+
+def subtitle_language_matches_sub_langs(language: str | None, sub_langs_raw: Any) -> bool:
+    normalized_language = str(language or "").strip()
+    if not normalized_language:
+        return False
+    candidate_languages = [normalized_language]
+    if "." in normalized_language:
+        parts = [part.strip() for part in normalized_language.split(".") if str(part).strip()]
+        for index in range(1, len(parts)):
+            candidate = ".".join(parts[index:])
+            if candidate and candidate not in candidate_languages:
+                candidate_languages.append(candidate)
+    for token in split_ytdlp_sub_langs(sub_langs_raw):
+        if token.casefold() == "all":
+            return True
+        for candidate_language in candidate_languages:
+            try:
+                if re.fullmatch(token, candidate_language, flags=re.IGNORECASE):
+                    return True
+            except re.error:
+                if candidate_language.casefold() == token.casefold():
+                    return True
+    return False
 
 
 def resolve_managed_targets_path(config_path: Path) -> Path:
@@ -1113,6 +1145,26 @@ def select_sources(all_sources: list[SourceConfig], selected_ids: list[str] | No
     return selected
 
 
+def apply_upstream_sub_langs_override(
+    sources: list[SourceConfig],
+    override_raw: Any,
+) -> list[SourceConfig]:
+    override_sub_langs = merge_ytdlp_sub_langs(override_raw, "")
+    if not override_sub_langs:
+        return list(sources)
+
+    return [
+        replace(
+            source,
+            sub_langs=override_sub_langs,
+            subtitle_existing_match_langs=override_sub_langs,
+            subtitle_existing_origin_kind="upstream",
+            subtitle_download_archive_enabled=False,
+        )
+        for source in sources
+    ]
+
+
 def order_sources_for_run(
     sources: list[SourceConfig],
     mode: str,
@@ -1275,8 +1327,73 @@ def _stream_text_pipe(
             chunks.append(chunk)
             target.write(chunk)
             target.flush()
+    except (OSError, ValueError):
+        return
     finally:
-        pipe.close()
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _terminate_process_group(
+    completed: subprocess.Popen[str],
+    wait_timeout_sec: float = 2.0,
+) -> None:
+    try:
+        if completed.poll() is not None:
+            return
+    except Exception:
+        return
+
+    terminated = False
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(completed.pid), signal.SIGTERM)
+            terminated = True
+        except ProcessLookupError:
+            return
+        except Exception:
+            terminated = False
+
+    if not terminated:
+        try:
+            completed.terminate()
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
+
+    try:
+        completed.wait(timeout=wait_timeout_sec)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        return
+
+    killed = False
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(completed.pid), signal.SIGKILL)
+            killed = True
+        except ProcessLookupError:
+            return
+        except Exception:
+            killed = False
+
+    if not killed:
+        try:
+            completed.kill()
+        except ProcessLookupError:
+            return
+        except Exception:
+            return
+
+    try:
+        completed.wait(timeout=wait_timeout_sec)
+    except Exception:
+        return
 
 
 def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str]:
@@ -1290,6 +1407,7 @@ def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
@@ -1300,6 +1418,7 @@ def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str
             "target": sys.stdout,
             "chunks": stdout_chunks,
         },
+        daemon=True,
     )
     stderr_thread = threading.Thread(
         target=_stream_text_pipe,
@@ -1308,12 +1427,29 @@ def run_command_with_output(command: list[str], dry_run: bool) -> tuple[int, str
             "target": sys.stderr,
             "chunks": stderr_chunks,
         },
+        daemon=True,
     )
     stdout_thread.start()
     stderr_thread.start()
-    return_code = completed.wait()
-    stdout_thread.join()
-    stderr_thread.join()
+    try:
+        return_code = completed.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+    except BaseException:
+        _terminate_process_group(completed)
+        try:
+            if completed.stdout is not None:
+                completed.stdout.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            if completed.stderr is not None:
+                completed.stderr.close()
+        except (OSError, ValueError):
+            pass
+        stdout_thread.join(timeout=2.0)
+        stderr_thread.join(timeout=2.0)
+        raise
     stdout_text = "".join(stdout_chunks)
     stderr_text = "".join(stderr_chunks)
     combined_output = "\n".join(
@@ -1680,6 +1816,15 @@ def chunk_items(items: list[Any], batch_size: int) -> list[list[Any]]:
     ]
 
 
+def apply_stage_target_limit(target_ids: list[str], limit: int | None) -> list[str]:
+    if limit is None:
+        return list(target_ids)
+    safe_limit = max(0, int(limit))
+    if safe_limit <= 0:
+        return []
+    return list(target_ids[:safe_limit])
+
+
 def build_run_local_urls_file(source: SourceConfig) -> Path:
     run_token = f"{int(time.time())}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     return source.media_archive.parent / "tmp" / f"urls.{run_token}.txt"
@@ -1784,9 +1929,19 @@ def prepare_subtitle_download_plan(
     safe_video_url: Callable[[str], str | None],
     source_cooldown_active: bool,
     source_cooldown_until: str | None,
+    limit: int | None = None,
     suppress_skip_log: bool = False,
 ) -> ChunkedYtdlpStagePlan | None:
-    subs_before_ids = set(read_archive_ids(source.subs_archive))
+    subs_before_ids = (
+        set(read_archive_ids(source.subs_archive))
+        if source.subtitle_download_archive_enabled
+        else set()
+    )
+    local_sub_ids = scan_existing_subtitle_ids(
+        source,
+        match_langs=source.subtitle_existing_match_langs,
+        origin_kind=source.subtitle_existing_origin_kind,
+    )
     if source_cooldown_active:
         if not suppress_skip_log:
             print(
@@ -1800,9 +1955,19 @@ def prepare_subtitle_download_plan(
         and not dry_run
         and not (strict_candidate_scope and metadata_candidate_ids is not None)
     ):
+        bootstrap_limit = (
+            max(1, int(limit))
+            if limit is not None and int(limit) > 0
+            else 200
+        )
         bootstrap_missing_sub_ids = get_subtitle_missing_bootstrap_ids(
             connection=connection,
             source_id=source.id,
+            existing_sub_ids=local_sub_ids,
+            require_db_missing_subtitles=not (
+                source.subtitle_existing_match_langs or source.subtitle_existing_origin_kind
+            ),
+            limit=bootstrap_limit,
         )
 
     if metadata_candidate_ids is not None:
@@ -1820,7 +1985,6 @@ def prepare_subtitle_download_plan(
             continue
         subtitle_candidate_ids.append(video_id)
 
-    local_sub_ids = set(scan_subtitles(source).keys())
     missing_sub_ids = [
         video_id
         for video_id in subtitle_candidate_ids
@@ -1862,6 +2026,7 @@ def prepare_subtitle_download_plan(
             continue
         seen_target_ids.add(video_id)
         subtitle_target_ids.append(video_id)
+    subtitle_target_ids = apply_stage_target_limit(subtitle_target_ids, limit)
 
     if not subtitle_target_ids:
         if connection is not None and not dry_run:
@@ -1932,12 +2097,10 @@ def prepare_subtitle_download_plan(
         )
 
     def build_subs_command() -> list[str]:
-        return [
+        command = [
             source.ytdlp_bin,
             *impersonate_flags,
             *cookie_flags,
-            "--download-archive",
-            str(source.subs_archive),
             "--continue",
             "--no-overwrites",
             *build_ytdlp_retry_flags(source, include_ignore_errors=True),
@@ -1952,6 +2115,12 @@ def prepare_subtitle_download_plan(
             str(source.subs_dir / source.subs_output_template),
             "--no-playlist",
         ]
+        if source.subtitle_download_archive_enabled:
+            command[1:1] = [
+                "--download-archive",
+                str(source.subs_archive),
+            ]
+        return command
 
     subs_command_template: list[str] | None = None
     if resolved_subtitle_target_ids:
@@ -2015,8 +2184,16 @@ def finalize_subtitle_download_plan(
         for video_id in plan.resolved_target_ids
         if video_id not in attempted_resolved_target_id_set
     ]
-    subs_after_ids = set(read_archive_ids(source.subs_archive))
-    local_sub_after_ids = set(scan_subtitles(source).keys())
+    subs_after_ids = (
+        set(read_archive_ids(source.subs_archive))
+        if source.subtitle_download_archive_enabled
+        else set()
+    )
+    local_sub_after_ids = scan_existing_subtitle_ids(
+        source,
+        match_langs=source.subtitle_existing_match_langs,
+        origin_kind=source.subtitle_existing_origin_kind,
+    )
     success_sub_ids = [
         video_id
         for video_id in attempted_resolved_target_ids
@@ -2181,6 +2358,7 @@ def prepare_metadata_download_plan(
     safe_video_url: Callable[[str], str | None],
     source_cooldown_active: bool,
     source_cooldown_until: str | None,
+    limit: int | None = None,
     suppress_skip_log: bool = False,
 ) -> ChunkedYtdlpStagePlan | None:
     if source_cooldown_active:
@@ -2248,6 +2426,7 @@ def prepare_metadata_download_plan(
             continue
         seen_target_ids.add(video_id)
         metadata_target_ids.append(video_id)
+    metadata_target_ids = apply_stage_target_limit(metadata_target_ids, limit)
 
     if not metadata_target_ids:
         print("metadata already up to date")
@@ -2496,6 +2675,7 @@ def sync_source(
     metered_playlist_end: int = DEFAULT_METERED_PLAYLIST_END,
     urls_file_override: Path | None = None,
     strict_candidate_scope: bool = False,
+    stage_limit: int | None = None,
     suppress_skip_subs_log: bool = False,
     suppress_skip_meta_log: bool = False,
 ) -> SyncSourceRunResult:
@@ -3404,6 +3584,7 @@ def sync_source(
             safe_video_url=safe_video_url,
             source_cooldown_active=source_cooldown_active,
             source_cooldown_until=source_cooldown_until,
+            limit=stage_limit,
             suppress_skip_log=suppress_skip_subs_log,
         )
         if subs_plan is not None:
@@ -3435,6 +3616,7 @@ def sync_source(
         safe_video_url=safe_video_url,
         source_cooldown_active=source_cooldown_active,
         source_cooldown_until=source_cooldown_until,
+        limit=stage_limit,
         suppress_skip_log=suppress_skip_meta_log,
     )
     if meta_plan is not None:
@@ -3460,6 +3642,7 @@ def run_legacy_sync_sources(
     metered_media_mode: str,
     metered_min_archive_ids: int,
     metered_playlist_end: int,
+    limit: int | None = None,
 ) -> None:
     source_results: dict[str, SyncSourceRunResult] = {}
     for source in sources:
@@ -3479,7 +3662,10 @@ def run_legacy_sync_sources(
 
     if not skip_subs:
         subtitle_plans: list[ChunkedYtdlpStagePlan] = []
+        remaining_subs_limit = None if limit is None else max(0, int(limit))
         for source in sources:
+            if remaining_subs_limit == 0:
+                break
             source_cooldown_active = False
             source_cooldown_until: str | None = None
             if connection is not None and not dry_run:
@@ -3512,9 +3698,12 @@ def run_legacy_sync_sources(
                 safe_video_url=safe_video_url,
                 source_cooldown_active=source_cooldown_active,
                 source_cooldown_until=source_cooldown_until,
+                limit=remaining_subs_limit,
             )
             if subtitle_plan is not None:
                 subtitle_plans.append(subtitle_plan)
+                if remaining_subs_limit is not None:
+                    remaining_subs_limit = max(0, remaining_subs_limit - len(subtitle_plan.target_ids))
 
         run_interleaved_chunked_ytdlp_stage_plans(subtitle_plans, dry_run=dry_run)
         for plan in subtitle_plans:
@@ -3533,7 +3722,10 @@ def run_legacy_sync_sources(
 
     if not skip_meta:
         metadata_plans: list[ChunkedYtdlpStagePlan] = []
+        remaining_meta_limit = None if limit is None else max(0, int(limit))
         for source in sources:
+            if remaining_meta_limit == 0:
+                break
             source_cooldown_active = False
             source_cooldown_until: str | None = None
             if connection is not None and not dry_run:
@@ -3565,9 +3757,12 @@ def run_legacy_sync_sources(
                 safe_video_url=safe_video_url,
                 source_cooldown_active=source_cooldown_active,
                 source_cooldown_until=source_cooldown_until,
+                limit=remaining_meta_limit,
             )
             if metadata_plan is not None:
                 metadata_plans.append(metadata_plan)
+                if remaining_meta_limit is not None:
+                    remaining_meta_limit = max(0, remaining_meta_limit - len(metadata_plan.target_ids))
 
         run_interleaved_chunked_ytdlp_stage_plans(metadata_plans, dry_run=dry_run)
         for plan in metadata_plans:
@@ -3826,6 +4021,40 @@ def scan_subtitles(source: SourceConfig) -> dict[str, list[tuple[str, Path, str]
     return subtitles
 
 
+def scan_existing_subtitle_ids(
+    source: SourceConfig,
+    *,
+    match_langs: str | None = None,
+    origin_kind: str | None = None,
+) -> set[str]:
+    subtitles = scan_subtitles(source)
+    if not match_langs and not origin_kind:
+        return set(subtitles.keys())
+
+    expected_origin_kind = (
+        normalize_subtitle_origin_kind(origin_kind)
+        if origin_kind not in (None, "")
+        else None
+    )
+    matching_ids: set[str] = set()
+    for video_id, tracks in subtitles.items():
+        for language, subtitle_path, _extension in tracks:
+            detected_origin_kind, _origin_detail = classify_subtitle_origin(
+                language,
+                subtitle_path,
+            )
+            if (
+                expected_origin_kind is not None
+                and normalize_subtitle_origin_kind(detected_origin_kind) != expected_origin_kind
+            ):
+                continue
+            if match_langs and not subtitle_language_matches_sub_langs(language, match_langs):
+                continue
+            matching_ids.add(video_id)
+            break
+    return matching_ids
+
+
 def scan_subtitles_for_video(source: SourceConfig, video_id: str) -> list[tuple[str, Path, str]]:
     if not source.subs_dir.exists():
         return []
@@ -3869,11 +4098,19 @@ def build_translation_output_origin_lookup(
     ).fetchall()
     lookup: dict[str, tuple[str, str]] = {}
     for row in rows:
-        output_path = str(row["output_path"] or "").strip()
+        if isinstance(row, sqlite3.Row):
+            output_path_value = row["output_path"]
+            agent_value = row["agent"]
+            method_version_value = row["method_version"]
+        else:
+            output_path_value = row[0] if len(row) > 0 else None
+            agent_value = row[1] if len(row) > 1 else None
+            method_version_value = row[2] if len(row) > 2 else None
+        output_path = str(output_path_value or "").strip()
         if not output_path or output_path in lookup:
             continue
-        agent = str(row["agent"] or "").strip().lower()
-        method_version = str(row["method_version"] or "").strip().lower()
+        agent = str(agent_value or "").strip().lower()
+        method_version = str(method_version_value or "").strip().lower()
         if "source-track=asr" in method_version:
             origin_detail = "translate-local-asr" if agent == "local-llm" else "generated-asr"
         elif agent == "local-llm":
@@ -5505,10 +5742,7 @@ def is_missing_artifact_error(error_message: str | None) -> bool:
 
 
 def is_source_network_cooldown_error(error_message: str | None) -> bool:
-    return (
-        is_blocked_or_forbidden_error(error_message)
-        or is_tiktok_transient_webpage_error(error_message)
-    )
+    return is_blocked_or_forbidden_error(error_message)
 
 
 def schedule_next_retry_iso(
@@ -5852,6 +6086,15 @@ def get_source_network_cooldown_state(
     blocked_until_text = str(row[0])
     blocked_until_dt = parse_iso_datetime_utc(blocked_until_text)
     last_error = str(row[1] or "").strip() or None
+    if last_error and is_tiktok_transient_webpage_error(last_error):
+        upsert_source_access_state(
+            connection=connection,
+            source_id=source_id,
+            blocked_until=None,
+            updated_at=now_value.replace(microsecond=0).isoformat(),
+        )
+        connection.commit()
+        return False, 0.0, None, last_error
     if blocked_until_dt is None or now_value >= blocked_until_dt:
         return False, 0.0, blocked_until_text, last_error
 
@@ -7295,10 +7538,16 @@ def get_media_no_audio_bootstrap_ids(
 def get_subtitle_missing_bootstrap_ids(
     connection: sqlite3.Connection,
     source_id: str,
+    existing_sub_ids: set[str] | None = None,
+    require_db_missing_subtitles: bool = True,
     limit: int = 200,
 ) -> list[str]:
-    rows = connection.execute(
-        """
+    safe_limit = max(0, int(limit))
+    if safe_limit <= 0:
+        return []
+
+    params: list[Any] = [source_id]
+    query = """
         SELECT v.video_id
         FROM videos v
         LEFT JOIN download_state d
@@ -7308,14 +7557,23 @@ def get_subtitle_missing_bootstrap_ids(
         WHERE v.source_id = ?
           AND v.has_media = 1
           AND COALESCE(v.media_path, '') != ''
-          AND COALESCE(v.has_subtitles, 0) = 0
           AND COALESCE(d.status, '') != 'error'
-        ORDER BY COALESCE(v.upload_date, '') DESC, v.video_id DESC
-        LIMIT ?
-        """,
-        (source_id, limit),
-    ).fetchall()
-    return [str(row[0]) for row in rows]
+    """
+    if require_db_missing_subtitles:
+        query += "\n          AND COALESCE(v.has_subtitles, 0) = 0"
+    query += "\n        ORDER BY COALESCE(v.upload_date, '') DESC, v.video_id DESC"
+    rows = connection.execute(query, tuple(params)).fetchall()
+
+    filtered_ids: list[str] = []
+    existing = existing_sub_ids or set()
+    for row in rows:
+        video_id = str(row[0])
+        if video_id in existing:
+            continue
+        filtered_ids.append(video_id)
+        if len(filtered_ids) >= safe_limit:
+            break
+    return filtered_ids
 
 
 def get_default_backfill_start(source: SourceConfig) -> int:
@@ -16589,6 +16847,19 @@ def parse_args() -> argparse.Namespace:
     sync_parser.add_argument("--skip-subs", action="store_true")
     sync_parser.add_argument("--skip-meta", action="store_true")
     sync_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Cap subtitle/meta targets processed in this sync run (0 = unbounded).",
+    )
+    sync_parser.add_argument(
+        "--upstream-sub-langs-override",
+        help=(
+            "Override subtitle download to fetch only matching upstream subtitle tracks "
+            "for this run. Disables subtitle archive gating for the run."
+        ),
+    )
+    sync_parser.add_argument(
         "--network-profile",
         choices=["normal", "weak", "auto"],
         default="normal",
@@ -16689,6 +16960,13 @@ def parse_args() -> argparse.Namespace:
     backfill_parser.add_argument("--skip-media", action="store_true")
     backfill_parser.add_argument("--skip-subs", action="store_true")
     backfill_parser.add_argument("--skip-meta", action="store_true")
+    backfill_parser.add_argument(
+        "--upstream-sub-langs-override",
+        help=(
+            "Override subtitle download to fetch only matching upstream subtitle tracks "
+            "for this run. Disables subtitle archive gating for the run."
+        ),
+    )
     backfill_parser.add_argument(
         "--network-profile",
         choices=["normal", "weak", "auto"],
@@ -17516,6 +17794,10 @@ def main() -> int:
     try:
         global_config, all_sources = load_config(args.config)
         sources = select_sources(all_sources, args.sources)
+        sources = apply_upstream_sub_langs_override(
+            sources,
+            getattr(args, "upstream_sub_langs_override", None),
+        )
     except (FileNotFoundError, ValueError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -17642,6 +17924,7 @@ def main() -> int:
                 metered_media_mode=metered_media_mode,
                 metered_min_archive_ids=metered_min_archive_ids,
                 metered_playlist_end=metered_playlist_end,
+                limit=max(0, int(getattr(args, "limit", 0))),
             )
         finally:
             if sync_connection is not None:

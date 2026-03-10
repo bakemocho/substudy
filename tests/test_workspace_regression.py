@@ -96,6 +96,51 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertTrue(str(by_name["review_hints.jsonl"]["open_url"]).startswith("/artifact/"))
         self.assertIn("?download=1", str(by_name["review_hints.jsonl"]["download_url"]))
 
+    def test_build_translation_output_origin_lookup_accepts_tuple_rows(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            source_path = self.workspace_root / "source.vtt"
+            output_path = self.workspace_root / "output.ja-local.vtt"
+            source_path.write_text("WEBVTT\n", encoding="utf-8")
+            output_path.write_text("WEBVTT\n", encoding="utf-8")
+            self.mod.record_translation_run(
+                connection=connection,
+                source_id="storiesofcz",
+                video_id="7619999999999999999",
+                source_path=source_path,
+                output_path=output_path,
+                cue_count=1,
+                cue_match=True,
+                agent="local-llm",
+                method="multi-stage",
+                method_version="source-track=subtitle",
+                summary="ok",
+                status="success",
+            )
+            connection.commit()
+
+            lookup = self.mod.build_translation_output_origin_lookup(
+                connection=connection,
+                source_id="storiesofcz",
+                video_id="7619999999999999999",
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            lookup,
+            {str(output_path): ("generated", "translate-local")},
+        )
+
+    def test_subtitle_language_matches_sub_langs_accepts_prefixed_labels(self):
+        self.assertTrue(
+            self.mod.subtitle_language_matches_sub_langs("NA.jpn-JP", "ja.*,ja,jp.*,jpn.*")
+        )
+        self.assertTrue(
+            self.mod.subtitle_language_matches_sub_langs("NA.eng-US", "en.*,en")
+        )
+
     def test_run_command_with_output_streams_and_returns_combined_text(self):
         stdout_capture = io.StringIO()
         stderr_capture = io.StringIO()
@@ -125,6 +170,51 @@ class WorkspaceRegressionTests(unittest.TestCase):
         self.assertIn("out-2", output_text)
         self.assertIn("err-1", output_text)
         self.assertIn("err-2", output_text)
+
+    def test_run_command_with_output_interrupt_terminates_child_process_group(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO("")
+                self.pid = 4242
+                self.returncode = None
+                self.wait_calls: list[float | None] = []
+
+            def wait(self, timeout=None):
+                self.wait_calls.append(timeout)
+                if timeout is None:
+                    raise KeyboardInterrupt()
+                self.returncode = -15
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        fake_process = FakeProcess()
+
+        def fake_killpg(_pgid, _sig):
+            fake_process.returncode = -15
+
+        with (
+            mock.patch.object(self.mod.subprocess, "Popen", return_value=fake_process) as popen_mock,
+            mock.patch.object(self.mod.os, "getpgid", return_value=fake_process.pid),
+            mock.patch.object(self.mod.os, "killpg", side_effect=fake_killpg) as killpg_mock,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.run_command_with_output(["fake-ytdlp", "--version"], dry_run=False)
+
+        self.assertTrue(fake_process.stdout.closed)
+        self.assertTrue(fake_process.stderr.closed)
+        self.assertEqual(fake_process.wait_calls, [None, 2.0])
+        self.assertEqual(killpg_mock.call_count, 1)
+        popen_kwargs = popen_mock.call_args.kwargs
+        self.assertTrue(popen_kwargs["start_new_session"])
 
     def test_import_monitor_records_latest_summary(self):
         input_path = self.workspace_root / "exports" / "llm" / "enriched_missing.jsonl"
@@ -1003,6 +1093,55 @@ enabled = true
         )
         self.assertGreaterEqual(delay_min, (30 * 60) - 5)
         self.assertLessEqual(delay_max, (30 * 60) + 5)
+
+    def test_source_network_cooldown_error_only_matches_blocked_errors(self):
+        self.assertTrue(
+            self.mod.is_source_network_cooldown_error(
+                "ERROR: [TikTok] Your IP address is blocked from accessing this post"
+            )
+        )
+        self.assertFalse(
+            self.mod.is_source_network_cooldown_error(
+                "ERROR: [TikTok] 7611111111111111111: Unable to extract universal data for rehydration"
+            )
+        )
+
+    def test_get_source_network_cooldown_state_clears_transient_webpage_cooldown(self):
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            future_block = "2026-03-12T00:00:00+00:00"
+            self.mod.upsert_source_access_state(
+                connection=connection,
+                source_id="storiesofcz",
+                blocked_until=future_block,
+                last_error=(
+                    "ERROR: [TikTok] 7611111111111111111: "
+                    "Unable to extract universal data for rehydration"
+                ),
+                updated_at="2026-03-11T00:00:00+00:00",
+            )
+            connection.commit()
+
+            active, remaining_hours, blocked_until, last_error = self.mod.get_source_network_cooldown_state(
+                connection=connection,
+                source_id="storiesofcz",
+                now_dt=dt.datetime(2026, 3, 11, 1, 0, tzinfo=dt.timezone.utc),
+            )
+
+            row = connection.execute(
+                "SELECT blocked_until FROM source_access_state WHERE source_id = ?",
+                ("storiesofcz",),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertFalse(active)
+        self.assertEqual(remaining_hours, 0.0)
+        self.assertIsNone(blocked_until)
+        self.assertIn("rehydration", str(last_error).lower())
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[0])
 
     def test_show_queue_status_report_summarizes_due_wait_dead(self):
         source_root = self.workspace_root / "storiesofcz_queue_status"
@@ -3284,6 +3423,187 @@ data_dir = "{beta_root}"
         self.assertLess(beta_chunk_1, alpha_chunk_2)
         self.assertLess(alpha_chunk_2, beta_chunk_2)
 
+    def test_run_legacy_sync_sources_applies_global_subtitle_limit(self):
+        alpha_root = self.workspace_root / "alpha_subs_limit"
+        beta_root = self.workspace_root / "beta_subs_limit"
+        alpha_root.mkdir(parents=True, exist_ok=True)
+        beta_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+data_dir = "{alpha_root}"
+
+[[sources]]
+id = "beta"
+platform = "tiktok"
+url = "https://www.tiktok.com/@beta"
+enabled = true
+data_dir = "{beta_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        alpha = by_id["alpha"]
+        beta = by_id["beta"]
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            now_iso = "2026-03-09T00:00:00+00:00"
+            for source in (alpha, beta):
+                for index in range(1, 7):
+                    video_id = f"76171111111111111{index:02d}{0 if source.id == 'alpha' else 1}"
+                    connection.execute(
+                        """
+                        INSERT INTO videos(source_id, video_id, media_path, has_media, has_subtitles, synced_at)
+                        VALUES (?, ?, ?, 1, 0, ?)
+                        """,
+                        (source.id, video_id, str(source.media_dir / f"{video_id}.mp4"), now_iso),
+                    )
+            connection.commit()
+
+            def fake_run_command(command, dry_run=False):
+                self.assertFalse(dry_run)
+                args = list(command)
+                template = str(args[args.index("-o") + 1])
+                urls_path = Path(args[args.index("-a") + 1])
+                for url in urls_path.read_text(encoding="utf-8").splitlines():
+                    video_id = url.rstrip("/").rsplit("/", 1)[-1]
+                    subtitle_path = Path(
+                        template
+                        .replace("%(id)s", video_id)
+                        .replace("%(language)s", "eng-US")
+                        .replace("%(ext)s", "vtt")
+                    )
+                    subtitle_path.parent.mkdir(parents=True, exist_ok=True)
+                    subtitle_path.write_text(
+                        "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+                        encoding="utf-8",
+                    )
+                return (0, "")
+
+            with mock.patch.object(self.mod, "run_command_with_output", side_effect=fake_run_command):
+                self.mod.run_legacy_sync_sources(
+                    sources=[alpha, beta],
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=False,
+                    skip_meta=True,
+                    connection=connection,
+                    metered_media_mode="off",
+                    metered_min_archive_ids=0,
+                    metered_playlist_end=5,
+                    limit=7,
+                )
+        finally:
+            connection.close()
+
+        alpha_subs = sorted(alpha.subs_dir.glob("*.vtt"))
+        beta_subs = sorted(beta.subs_dir.glob("*.vtt"))
+        self.assertEqual(len(alpha_subs), 6)
+        self.assertEqual(len(beta_subs), 1)
+
+    def test_run_legacy_sync_sources_applies_global_metadata_limit(self):
+        alpha_root = self.workspace_root / "alpha_meta_limit"
+        beta_root = self.workspace_root / "beta_meta_limit"
+        alpha_root.mkdir(parents=True, exist_ok=True)
+        beta_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alpha"
+enabled = true
+data_dir = "{alpha_root}"
+
+[[sources]]
+id = "beta"
+platform = "tiktok"
+url = "https://www.tiktok.com/@beta"
+enabled = true
+data_dir = "{beta_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        by_id = {source.id: source for source in sources}
+        alpha = by_id["alpha"]
+        beta = by_id["beta"]
+
+        for source in (alpha, beta):
+            source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+            source.media_archive.write_text(
+                "\n".join(
+                    f"tiktok 76172222222222222{index:02d}{0 if source.id == 'alpha' else 1}"
+                    for index in range(1, 7)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+
+            def fake_run_command(command, dry_run=False):
+                self.assertFalse(dry_run)
+                args = list(command)
+                template = str(args[args.index("-o") + 1])
+                urls_path = Path(args[args.index("-a") + 1])
+                for url in urls_path.read_text(encoding="utf-8").splitlines():
+                    video_id = url.rstrip("/").rsplit("/", 1)[-1]
+                    meta_path = Path(
+                        template
+                        .replace("%(id)s", video_id)
+                        .replace("%(ext)s", "info.json")
+                    )
+                    meta_path.parent.mkdir(parents=True, exist_ok=True)
+                    meta_path.write_text("{}", encoding="utf-8")
+                return (0, "")
+
+            with mock.patch.object(self.mod, "run_command_with_output", side_effect=fake_run_command):
+                self.mod.run_legacy_sync_sources(
+                    sources=[alpha, beta],
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                    metered_media_mode="off",
+                    metered_min_archive_ids=0,
+                    metered_playlist_end=5,
+                    limit=7,
+                )
+        finally:
+            connection.close()
+
+        alpha_meta = sorted(alpha.meta_dir.glob("*.info.json"))
+        beta_meta = sorted(beta.meta_dir.glob("*.info.json"))
+        self.assertEqual(len(alpha_meta), 6)
+        self.assertEqual(len(beta_meta), 1)
+
     def test_sync_source_skips_retry_subtitle_when_local_file_exists(self):
         source_root = self.workspace_root / "storiesofcz_subs_retry_existing"
         source_root.mkdir(parents=True, exist_ok=True)
@@ -3360,6 +3680,199 @@ data_dir = "{source_root}"
             self.assertIsNone(row[3])
         finally:
             connection.close()
+
+    def test_prepare_subtitle_download_plan_upstream_override_ignores_english_and_generated_tracks(self):
+        source_root = self.workspace_root / "storiesofcz_upstream_ja_only"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = self.mod.apply_upstream_sub_langs_override(
+            sources,
+            "ja.*,ja,jp.*,jpn.*",
+        )[0]
+        video_id = "7617444444444444444"
+        source.subs_dir.mkdir(parents=True, exist_ok=True)
+        (source.subs_dir / f"{video_id}.eng-US.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+            encoding="utf-8",
+        )
+        (source.subs_dir / f"{video_id}.ja-local.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nこんにちは\n",
+            encoding="utf-8",
+        )
+
+        plan = self.mod.prepare_subtitle_download_plan(
+            source=source,
+            dry_run=False,
+            connection=None,
+            metadata_candidate_ids=None,
+            new_media_ids=[video_id],
+            strict_candidate_scope=False,
+            active_urls_file=source.urls_file,
+            cookie_flags=[],
+            impersonate_flags=[],
+            safe_video_url=lambda candidate_video_id: self.mod.build_video_url(source, candidate_video_id),
+            source_cooldown_active=False,
+            source_cooldown_until=None,
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.target_ids, [video_id])
+        self.assertIsNotNone(plan.command_template)
+        assert plan.command_template is not None
+        self.assertNotIn("--download-archive", plan.command_template)
+        self.assertIn("--sub-langs", plan.command_template)
+        sub_langs_index = plan.command_template.index("--sub-langs") + 1
+        self.assertEqual(plan.command_template[sub_langs_index], "ja.*,ja,jp.*,jpn.*")
+
+    def test_prepare_subtitle_download_plan_upstream_override_skips_when_upstream_match_exists(self):
+        source_root = self.workspace_root / "storiesofcz_upstream_ja_existing"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = self.mod.apply_upstream_sub_langs_override(
+            sources,
+            "ja.*,ja,jp.*,jpn.*",
+        )[0]
+        video_id = "7617555555555555555"
+        source.subs_dir.mkdir(parents=True, exist_ok=True)
+        (source.subs_dir / f"{video_id}.ja-JP.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nこんにちは\n",
+            encoding="utf-8",
+        )
+
+        plan = self.mod.prepare_subtitle_download_plan(
+            source=source,
+            dry_run=False,
+            connection=None,
+            metadata_candidate_ids=None,
+            new_media_ids=[video_id],
+            strict_candidate_scope=False,
+            active_urls_file=source.urls_file,
+            cookie_flags=[],
+            impersonate_flags=[],
+            safe_video_url=lambda candidate_video_id: self.mod.build_video_url(source, candidate_video_id),
+            source_cooldown_active=False,
+            source_cooldown_until=None,
+        )
+
+        self.assertIsNone(plan)
+
+    def test_prepare_subtitle_download_plan_upstream_override_bootstraps_english_only_video(self):
+        source_root = self.workspace_root / "storiesofcz_upstream_ja_bootstrap"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = self.mod.apply_upstream_sub_langs_override(
+            sources,
+            "ja.*,ja,jp.*,jpn.*",
+        )[0]
+        video_id = "7617666666666666666"
+        source.subs_dir.mkdir(parents=True, exist_ok=True)
+        source.media_dir.mkdir(parents=True, exist_ok=True)
+        (source.subs_dir / f"{video_id}.eng-US.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nhello\n",
+            encoding="utf-8",
+        )
+        (source.subs_dir / f"{video_id}.ja-local.vtt").write_text(
+            "WEBVTT\n\n00:00.000 --> 00:01.000\nこんにちは\n",
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO videos(source_id, video_id, media_path, has_media, has_subtitles, synced_at)
+                VALUES (?, ?, ?, 1, 1, ?)
+                """,
+                (
+                    source.id,
+                    video_id,
+                    str(source.media_dir / f"{video_id}.mp4"),
+                    "2026-03-09T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+
+            plan = self.mod.prepare_subtitle_download_plan(
+                source=source,
+                dry_run=False,
+                connection=connection,
+                metadata_candidate_ids=None,
+                new_media_ids=[],
+                strict_candidate_scope=False,
+                active_urls_file=source.urls_file,
+                cookie_flags=[],
+                impersonate_flags=[],
+                safe_video_url=lambda candidate_video_id: self.mod.build_video_url(source, candidate_video_id),
+                source_cooldown_active=False,
+                source_cooldown_until=None,
+                limit=10,
+            )
+        finally:
+            connection.close()
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.target_ids, [video_id])
+        self.assertEqual(int(plan.payload.get("bootstrap_count", 0)), 1)
 
     def test_sync_source_defers_media_discovery_with_recent_attempt(self):
         source_root = self.workspace_root / "storiesofcz"
@@ -3735,7 +4248,7 @@ data_dir = "{source_root}"
                 (source.id,),
             ).fetchone()
             self.assertIsNotNone(access_row)
-            self.assertIsNotNone(access_row[0])
+            self.assertIsNone(access_row[0])
             self.assertIn("rehydration", str(access_row[1]).lower())
         finally:
             connection.close()
