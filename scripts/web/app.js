@@ -615,6 +615,65 @@ function shuffleIndices(indices) {
   return cloned;
 }
 
+function parseVideoUploadTimestamp(video) {
+  const raw = String(video?.upload_date || "").trim();
+  if (!raw) {
+    return null;
+  }
+  if (/^\d{8}$/.test(raw)) {
+    const year = Number(raw.slice(0, 4));
+    const month = Number(raw.slice(4, 6));
+    const day = Number(raw.slice(6, 8));
+    const millis = Date.UTC(year, Math.max(0, month - 1), day);
+    return Number.isFinite(millis) ? millis : null;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function computeUploadRecencyBonus(video) {
+  const uploadedAtMs = parseVideoUploadTimestamp(video);
+  if (!Number.isFinite(uploadedAtMs)) {
+    return 0;
+  }
+  const ageDays = Math.max(0, (Date.now() - uploadedAtMs) / 86400000);
+  if (ageDays <= 3) {
+    return 2.3;
+  }
+  if (ageDays <= 14) {
+    return 1.5;
+  }
+  if (ageDays <= 45) {
+    return 0.9;
+  }
+  if (ageDays <= 120) {
+    return 0.35;
+  }
+  return 0;
+}
+
+function hasSubtitleTrackForRanking(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  return tracks.some((track) => normalizedTrackKind(track) === "subtitle");
+}
+
+function hasSourceTextTrackForRanking(video) {
+  const tracks = Array.isArray(video?.tracks) ? video.tracks : [];
+  return tracks.some((track) => {
+    const kind = normalizedTrackKind(track);
+    return kind === "subtitle" || kind === "asr";
+  });
+}
+
+function hasMeaningfulVideoMetadata(video) {
+  return Boolean(
+    String(video?.title || "").trim()
+    || String(video?.description || "").trim()
+    || String(video?.upload_date || "").trim()
+    || String(video?.webpage_url || "").trim()
+  );
+}
+
 function computeVideoInterestValue(video) {
   if (!video) {
     return 0;
@@ -628,6 +687,9 @@ function computeVideoInterestValue(video) {
   );
   const duration = Math.max(20, getVideoDurationSeconds(video));
   const watchRatio = Math.min(2.5, stats.total_watch_seconds / duration);
+  const hasSubtitleTrack = hasSubtitleTrackForRanking(video);
+  const hasSourceTextTrack = hasSourceTextTrackForRanking(video);
+  const hasMetadata = hasMeaningfulVideoMetadata(video);
   let score = 0;
   if (video.is_favorite) {
     score += 4.5;
@@ -641,6 +703,13 @@ function computeVideoInterestValue(video) {
   score += Math.log1p(cueBookmarkCount) * 1.35;
   score += Math.log1p(dictionaryBookmarkCount) * 0.7;
   score += Math.log1p(dictionaryUniqueTermCount) * 0.45;
+  score += computeUploadRecencyBonus(video);
+  if (!hasSourceTextTrack) {
+    score -= 3.2;
+  }
+  if (!hasMetadata) {
+    score -= 2.6;
+  }
   score -= stats.fast_skip_count * 2.8;
   score -= stats.shallow_skip_count * 1.2;
   return score;
