@@ -126,6 +126,11 @@ Operator note:
     `yt-dlp --cookies-from-browser chrome --cookies ~/.local/share/substudy/cookies.txt "https://www.tiktok.com"`
 - `media_archive` / `subs_archive`
   - If missing, `sync` bootstraps archive IDs from existing local files to avoid repeated re-fetch attempts.
+- `sub_langs` / `upstream_sub_langs`
+  - `sub_langs` is the primary yt-dlp subtitle selector.
+  - `upstream_sub_langs` is merged into it at config load time.
+  - Default `upstream_sub_langs = "ja.*,ja,jp.*,jpn.*"` makes subtitle sync also try common upstream Japanese/TikTok-translation tags when available.
+  - Set `upstream_sub_langs = ""` to disable this and keep English-only subtitle fetch.
 - `video_format`
   - Primary media download format.
   - If the primary file has no audio stream, `sync` keeps that video, fetches an audio donor with `-f download`, and muxes audio locally via `ffmpeg` (`-shortest`) so output duration follows the primary video length.

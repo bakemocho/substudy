@@ -3079,6 +3079,9 @@ data_dir = "{source_root}"
             second_command = list(run_command_mock.call_args_list[1].args[0])
             self.assertIn("--sleep-requests", first_command)
             self.assertIn("--sleep-requests", second_command)
+            self.assertIn("--sub-langs", first_command)
+            merged_sub_langs = first_command[first_command.index("--sub-langs") + 1]
+            self.assertEqual(merged_sub_langs, "en.*,en,und,ja.*,ja,jp.*,jpn.*")
             first_sleep = first_command[first_command.index("--sleep-requests") + 1]
             second_sleep = second_command[second_command.index("--sleep-requests") + 1]
             self.assertEqual(first_sleep, "1.1")

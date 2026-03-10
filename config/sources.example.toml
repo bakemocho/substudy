@@ -12,6 +12,9 @@ cookies_from_browser = "chrome"
 # Primary video format. If this yields no audio stream, sync will try audio donor mux fallback.
 video_format = "bv*+ba/best"
 sub_langs = "en.*,en,und"
+# Extra upstream subtitle language tags merged into `sub_langs` at runtime.
+# Default below tries common TikTok Japanese-translation keys when available.
+upstream_sub_langs = "ja.*,ja,jp.*,jpn.*"
 sub_format = "vtt/ttml/best"
 sleep_interval = 2
 max_sleep_interval = 6

@@ -599,6 +599,25 @@ def parse_ext_list(raw_value: Any) -> list[str]:
     return exts or list(DEFAULT_ASR_EXTS)
 
 
+def merge_ytdlp_sub_langs(primary_raw: Any, extra_raw: Any) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw_value in (primary_raw, extra_raw):
+        text = str(raw_value or "").strip()
+        if not text:
+            continue
+        for part in text.split(","):
+            token = str(part or "").strip()
+            if not token:
+                continue
+            dedupe_key = token.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            merged.append(token)
+    return ",".join(merged)
+
+
 def resolve_managed_targets_path(config_path: Path) -> Path:
     candidate = config_path.expanduser()
     if not candidate.is_absolute():
@@ -984,6 +1003,13 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             if source_cookies_file_raw not in (None, "")
             else global_cookies_file
         )
+        merged_sub_langs = merge_ytdlp_sub_langs(
+            source_raw.get("sub_langs", global_raw.get("sub_langs", "en.*,en,und")),
+            source_raw.get(
+                "upstream_sub_langs",
+                global_raw.get("upstream_sub_langs", "ja.*,ja,jp.*,jpn.*"),
+            ),
+        ) or "en.*,en,und"
 
         source = SourceConfig(
             id=source_id,
@@ -1012,7 +1038,7 @@ def load_config(config_path: Path) -> tuple[GlobalConfig, list[SourceConfig]]:
             cookies_browser=source_cookies_browser,
             cookies_file=source_cookies_file,
             video_format=str(source_raw.get("video_format", global_raw.get("video_format", "bv*+ba/best"))),
-            sub_langs=str(source_raw.get("sub_langs", global_raw.get("sub_langs", "en.*,en,und"))),
+            sub_langs=merged_sub_langs,
             sub_format=str(source_raw.get("sub_format", global_raw.get("sub_format", "vtt/ttml/best"))),
             sleep_interval=int(source_raw.get("sleep_interval", global_raw.get("sleep_interval", 2))),
             max_sleep_interval=int(
