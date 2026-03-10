@@ -191,6 +191,43 @@ Operator note:
     - `make queue-status-unresolved`
     - `make queue-heal` (recover known failures, then show unresolved)
 
+## Local feed recommendation hints
+
+- The reel feed is now a local ranked shuffle, not a pure random shuffle.
+- Current ranking is client-side in `scripts/web/app.js` and uses feed payload from `/api/feed`.
+- Strong positive signals:
+  - `favorite`
+  - completed plays / longer watch time
+  - subtitle cue bookmarks
+  - dictionary bookmarks and unique bookmarked terms
+- Strong negative signals:
+  - `dislike`
+  - fast skip
+  - shallow skip
+- Secondary signals:
+  - source affinity
+  - tag affinity
+  - freshness / low-impression items
+  - recent source/video repetition penalties
+  - JA subtitle availability as a small study-mode bonus
+
+Practical tuning notes:
+
+- Keep `favorite` and `dislike` as the strongest explicit user signals.
+- Treat cue bookmarks as "this exact video is worth revisiting".
+- Treat dictionary bookmarks as "this source/tag has useful study density", not only as a per-video signal.
+- Compress raw bookmark counts before scoring (for example `log1p`) so long subtitle-heavy videos do not dominate only because they offer more bookmark opportunities.
+- Avoid overfitting to completion alone; short easy clips can otherwise crowd out richer study material.
+- Keep diversity pressure on `source` and `tag` so the feed does not collapse into one account after a few strong interactions.
+- For study-oriented tuning, it is usually better to optimize for "useful friction" than for pure watch-time. A video with bookmarks and moderate watch time can be better than a fully watched but passive clip.
+
+Suggested next extensions if ranking needs another pass:
+
+- Add bookmark-derived source/tag affinity normalized by impressions.
+- Add a light review boost from dictionary `review_priority` so repeated important vocabulary resurfaces.
+- Distinguish "useful difficult" videos from "bad fit" videos by combining bookmark activity with skip behavior.
+- If the feed becomes too sticky, reduce affinity weights before reducing explicit signals.
+
 ## Reverse incremental backfill
 
 - `backfill` keeps per-source cursor state in `backfill_state`.

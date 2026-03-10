@@ -13370,6 +13370,31 @@ def build_web_handler(
                             WHEN vd.video_id IS NULL THEN 0
                             ELSE 1
                         END AS is_disliked,
+                        (
+                            SELECT COUNT(DISTINCT (
+                                COALESCE(sb.track, '')
+                                || ':'
+                                || CAST(sb.start_ms AS TEXT)
+                                || ':'
+                                || CAST(sb.end_ms AS TEXT)
+                            ))
+                            FROM subtitle_bookmarks sb
+                            WHERE sb.source_id = v.source_id
+                              AND sb.video_id = v.video_id
+                        ) AS cue_bookmark_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM dictionary_bookmarks db
+                            WHERE db.source_id = v.source_id
+                              AND db.video_id = v.video_id
+                        ) AS dictionary_bookmark_count,
+                        (
+                            SELECT COUNT(DISTINCT COALESCE(db.term_norm, ''))
+                            FROM dictionary_bookmarks db
+                            WHERE db.source_id = v.source_id
+                              AND db.video_id = v.video_id
+                              AND TRIM(COALESCE(db.term_norm, '')) != ''
+                        ) AS dictionary_bookmark_unique_term_count,
                         COALESCE(vn.note, '') AS video_note,
                         v.audio_lufs,
                         v.audio_gain_db
@@ -13506,6 +13531,13 @@ def build_web_handler(
                                 ""
                                 if row["disliked_created_at"] in (None, "")
                                 else str(row["disliked_created_at"])
+                            ),
+                            "cue_bookmark_count": max(0, int(row["cue_bookmark_count"] or 0)),
+                            "dictionary_bookmark_count": max(
+                                0, int(row["dictionary_bookmark_count"] or 0)
+                            ),
+                            "dictionary_bookmark_unique_term_count": max(
+                                0, int(row["dictionary_bookmark_unique_term_count"] or 0)
                             ),
                             "playback_stats": {
                                 "impression_count": max(0, int(row["playback_impression_count"] or 0)),

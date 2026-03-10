@@ -613,6 +613,12 @@ function computeVideoInterestValue(video) {
     return 0;
   }
   const stats = normalizePlaybackStats(video.playback_stats);
+  const cueBookmarkCount = Math.max(0, Number(video?.cue_bookmark_count) || 0);
+  const dictionaryBookmarkCount = Math.max(0, Number(video?.dictionary_bookmark_count) || 0);
+  const dictionaryUniqueTermCount = Math.max(
+    0,
+    Number(video?.dictionary_bookmark_unique_term_count) || 0,
+  );
   const duration = Math.max(20, getVideoDurationSeconds(video));
   const watchRatio = Math.min(2.5, stats.total_watch_seconds / duration);
   let score = 0;
@@ -625,6 +631,9 @@ function computeVideoInterestValue(video) {
   score += stats.completed_count * 1.8;
   score += watchRatio * 1.4;
   score += Math.max(0, stats.play_count - 1) * 0.35;
+  score += Math.log1p(cueBookmarkCount) * 1.35;
+  score += Math.log1p(dictionaryBookmarkCount) * 0.7;
+  score += Math.log1p(dictionaryUniqueTermCount) * 0.45;
   score -= stats.fast_skip_count * 2.8;
   score -= stats.shallow_skip_count * 1.2;
   return score;
@@ -638,6 +647,8 @@ function buildAffinityMaps() {
     const observed = (
       video?.is_favorite
       || video?.is_disliked
+      || (Number(video?.cue_bookmark_count) || 0) > 0
+      || (Number(video?.dictionary_bookmark_count) || 0) > 0
       || stats.impression_count > 0
       || stats.play_count > 0
       || stats.completed_count > 0

@@ -3968,6 +3968,105 @@ enabled = true
                 """,
                 ("storiesofcz", "7622222222222222222", "stats", str(media_path), 1, now_iso),
             )
+            connection.execute(
+                """
+                INSERT INTO subtitle_bookmarks(
+                    source_id,
+                    video_id,
+                    track,
+                    start_ms,
+                    end_ms,
+                    text,
+                    note,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "storiesofcz",
+                    "7622222222222222222",
+                    "en",
+                    1000,
+                    2400,
+                    "cue bookmark",
+                    "",
+                    now_iso,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dictionary_bookmarks(
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    cue_text,
+                    dict_entry_id,
+                    dict_source_name,
+                    lookup_term,
+                    term,
+                    term_norm,
+                    definition,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "storiesofcz",
+                    "7622222222222222222",
+                    "en",
+                    1000,
+                    2400,
+                    "cue bookmark",
+                    1,
+                    "test-dict",
+                    "alpha",
+                    "Alpha",
+                    "alpha",
+                    "first meaning",
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO dictionary_bookmarks(
+                    source_id,
+                    video_id,
+                    track,
+                    cue_start_ms,
+                    cue_end_ms,
+                    cue_text,
+                    dict_entry_id,
+                    dict_source_name,
+                    lookup_term,
+                    term,
+                    term_norm,
+                    definition,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "storiesofcz",
+                    "7622222222222222222",
+                    "en",
+                    3000,
+                    4200,
+                    "second cue",
+                    2,
+                    "test-dict",
+                    "beta",
+                    "Beta",
+                    "beta",
+                    "second meaning",
+                    now_iso,
+                    now_iso,
+                ),
+            )
             connection.commit()
         finally:
             connection.close()
@@ -4053,6 +4152,9 @@ enabled = true
             self.assertEqual(response.status, 200)
             feed_payload = json.loads(response.read().decode("utf-8"))
         stats = feed_payload["videos"][0]["playback_stats"]
+        self.assertEqual(feed_payload["videos"][0]["cue_bookmark_count"], 1)
+        self.assertEqual(feed_payload["videos"][0]["dictionary_bookmark_count"], 2)
+        self.assertEqual(feed_payload["videos"][0]["dictionary_bookmark_unique_term_count"], 2)
         self.assertEqual(stats["impression_count"], 1)
         self.assertEqual(stats["play_count"], 1)
         self.assertAlmostEqual(stats["total_watch_seconds"], 19.75, places=3)
