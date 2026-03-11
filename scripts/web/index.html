@@ -36,6 +36,7 @@
             </select>
           </label>
           <button id="jumpOpenBtn" class="primary-btn jump-open-btn" type="button">動画ジャンプ (G)</button>
+          <button id="focusModeToggle" class="toggle-chip focus-mode-toggle" type="button">集中表示</button>
           <details class="toolbar-settings">
             <summary>再生設定</summary>
             <div class="toolbar-settings-grid">
@@ -75,128 +76,184 @@
         <section id="studyPanel" class="page-panel is-active" role="tabpanel" aria-labelledby="studyModeBtn">
           <div class="layout study-layout">
             <section class="player-column" aria-label="学習プレイヤー">
-          <div class="phone-shell" id="phoneShell">
-            <video id="videoPlayer" playsinline preload="metadata"></video>
-            <div id="videoProgressTimer" class="video-progress-timer" aria-hidden="true">
-              <div id="videoProgressTimerFill" class="video-progress-timer-fill"></div>
-            </div>
-            <div id="subtitleOverlay" class="subtitle-overlay">字幕を読み込み中...</div>
-            <div id="lyricReelOverlay" class="lyric-reel-overlay hidden" aria-hidden="true">
-              <div id="lyricReelList" class="lyric-reel-list"></div>
-            </div>
-            <div id="countdownPanel" class="countdown-panel hidden">
-              <span><strong id="countdownValue">3</strong>秒後に次の動画へ</span>
-              <button id="cancelCountdownBtn" type="button">キャンセル</button>
-            </div>
-            <div id="videoMetaDrawer" class="video-meta-drawer">
-              <button id="metaTabBtn" class="meta-tab-btn" type="button" aria-expanded="false">
-                説明
-              </button>
-              <div id="metaPanel" class="meta-panel">
-                <p id="metaPrimaryLine" class="meta-primary-line">動画を読み込み中...</p>
-                <p id="metaSecondaryLine" class="meta-secondary-line"></p>
+              <div class="phone-shell" id="phoneShell">
+                <video id="videoPlayer" playsinline preload="metadata"></video>
+                <div id="videoProgressTimer" class="video-progress-timer" aria-hidden="true">
+                  <div id="videoProgressTimerFill" class="video-progress-timer-fill"></div>
+                </div>
+                <div id="subtitleOverlay" class="subtitle-overlay">字幕を読み込み中...</div>
+                <div id="lyricReelOverlay" class="lyric-reel-overlay hidden" aria-hidden="true">
+                  <div id="lyricReelList" class="lyric-reel-list"></div>
+                </div>
+                <div id="countdownPanel" class="countdown-panel hidden">
+                  <span><strong id="countdownValue">3</strong>秒後に次の動画へ</span>
+                  <button id="cancelCountdownBtn" type="button">キャンセル</button>
+                </div>
+                <div id="videoMetaDrawer" class="video-meta-drawer">
+                  <button id="metaTabBtn" class="meta-tab-btn" type="button" aria-expanded="false">
+                    説明
+                  </button>
+                  <div id="metaPanel" class="meta-panel">
+                    <p id="metaPrimaryLine" class="meta-primary-line">動画を読み込み中...</p>
+                    <p id="metaSecondaryLine" class="meta-secondary-line"></p>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
 
-          <div class="player-actions">
-            <div class="transport-controls">
-              <button id="prevBtn" class="secondary-btn" type="button">↑ 前へ</button>
-              <button id="playPauseBtn" class="primary-btn" type="button">再生</button>
-              <button id="nextBtn" class="secondary-btn" type="button">↓ 次へ</button>
-            </div>
-            <button id="controlsToggleBtn" class="controls-toggle-btn secondary-btn" type="button" aria-expanded="false">
-              詳細操作を表示
-            </button>
-            <div id="mainControls" class="main-controls collapsed">
-              <button id="seekBackBtn" class="secondary-btn" type="button">← 5秒戻す</button>
-              <button id="favoriteBtn" class="preference-btn preference-btn-positive" type="button">☆ ファボ</button>
-              <button id="dislikeBtn" class="preference-btn preference-btn-negative" type="button">✕ 嫌い</button>
-              <button id="notInterestedBtn" class="preference-btn preference-btn-soft-negative" type="button">△ 好きじゃない</button>
-              <button id="seekForwardBtn" class="secondary-btn" type="button">5秒進む →</button>
-            </div>
-            <div class="volume-wrap">
-              <button id="muteBtn" class="secondary-btn" type="button">音量: 100%</button>
-              <input id="volumeSlider" type="range" min="0" max="1" step="0.05" value="1" />
-            </div>
-          </div>
-        </section>
-
-        <section class="study-column" aria-label="学習ツール">
-          <article class="card subtitle-reel-card">
-            <div class="subtitle-reel-head">
-              <h3>字幕リール</h3>
-              <div id="subtitleReelSourceTags" class="subtitle-reel-source-tags" aria-live="polite"></div>
-            </div>
-            <details class="bookmark-inline-tools subtitle-reel-settings">
-              <summary>表示設定</summary>
-              <div class="subtitle-reel-settings-grid">
-                <label class="field">
-                  <span>和訳バリアント</span>
-                  <select id="translationVariantSelect">
-                    <option value="auto">自動</option>
-                    <option value="upstream" selected>upstream（Upstream）</option>
-                    <option value="claude">claude（Generated）</option>
-                    <option value="local">local（ローカル和訳）</option>
-                  </select>
-                </label>
-                <label class="field">
-                  <span>再生字幕トラック</span>
-                  <select id="trackSelect"></select>
-                </label>
+              <div class="player-actions">
+                <div class="transport-controls">
+                  <button id="prevBtn" class="secondary-btn" type="button">↑ 前へ</button>
+                  <button id="playPauseBtn" class="primary-btn" type="button">再生</button>
+                  <button id="nextBtn" class="secondary-btn" type="button">↓ 次へ</button>
+                </div>
+                <button id="controlsToggleBtn" class="controls-toggle-btn secondary-btn" type="button" aria-expanded="false">
+                  詳細操作を表示
+                </button>
+                <div id="mainControls" class="main-controls collapsed">
+                  <button id="seekBackBtn" class="secondary-btn" type="button">← 5秒戻す</button>
+                  <button id="favoriteBtn" class="preference-btn preference-btn-positive" type="button">☆ ファボ</button>
+                  <button id="dislikeBtn" class="preference-btn preference-btn-negative" type="button">✕ 嫌い</button>
+                  <button id="notInterestedBtn" class="preference-btn preference-btn-soft-negative" type="button">△ 好きじゃない</button>
+                  <button id="seekForwardBtn" class="secondary-btn" type="button">5秒進む →</button>
+                </div>
+                <div class="volume-wrap">
+                  <button id="muteBtn" class="secondary-btn" type="button">音量: 100%</button>
+                  <input id="volumeSlider" type="range" min="0" max="1" step="0.05" value="1" />
+                </div>
               </div>
-            </details>
-            <div class="subtitle-panel-mode-toggle" role="group" aria-label="字幕表示モード">
-              <button id="subtitlePanelModeEnOnlyBtn" type="button">英語のみ</button>
-              <button id="subtitlePanelModeEnJaBtn" type="button">英語 + 日本語</button>
-            </div>
-            <div id="subtitlePanelReel" class="subtitle-panel-reel" aria-live="polite"></div>
-            <details class="bookmark-inline-tools">
-              <summary>手動ブックマーク操作</summary>
-              <div class="inline-actions">
-                <button id="bookmarkCueBtn" class="secondary-btn" type="button">現在字幕を保存 (B)</button>
-                <button id="rangeStartBtn" class="secondary-btn" type="button">範囲開始 (R)</button>
-                <button id="bookmarkRangeBtn" class="secondary-btn" type="button">範囲保存 (T)</button>
+            </section>
+
+            <section class="study-column" aria-label="学習ツール">
+              <article class="card subtitle-reel-card">
+                <div class="subtitle-reel-head">
+                  <h3>字幕リール</h3>
+                  <div id="subtitleReelSourceTags" class="subtitle-reel-source-tags" aria-live="polite"></div>
+                </div>
+                <details class="bookmark-inline-tools subtitle-reel-settings">
+                  <summary>表示設定</summary>
+                  <div class="subtitle-reel-settings-grid">
+                    <label class="field">
+                      <span>和訳バリアント</span>
+                      <select id="translationVariantSelect">
+                        <option value="auto">自動</option>
+                        <option value="upstream" selected>upstream（Upstream）</option>
+                        <option value="claude">claude（Generated）</option>
+                        <option value="local">local（ローカル和訳）</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>再生字幕トラック</span>
+                      <select id="trackSelect"></select>
+                    </label>
+                  </div>
+                </details>
+                <div class="subtitle-panel-mode-toggle" role="group" aria-label="字幕表示モード">
+                  <button id="subtitlePanelModeEnOnlyBtn" type="button">英語のみ</button>
+                  <button id="subtitlePanelModeEnJaBtn" type="button">英語 + 日本語</button>
+                </div>
+                <div id="subtitlePanelReel" class="subtitle-panel-reel" aria-live="polite"></div>
+                <details class="bookmark-inline-tools">
+                  <summary>手動ブックマーク操作</summary>
+                  <div class="inline-actions">
+                    <button id="bookmarkCueBtn" class="secondary-btn" type="button">現在字幕を保存 (B)</button>
+                    <button id="rangeStartBtn" class="secondary-btn" type="button">範囲開始 (R)</button>
+                    <button id="bookmarkRangeBtn" class="secondary-btn" type="button">範囲保存 (T)</button>
+                  </div>
+                  <label class="field">
+                    <span>ブックマークメモ</span>
+                    <input id="bookmarkNoteInput" type="text" placeholder="メモを追加 (任意)" />
+                  </label>
+                  <p id="rangeStatus" class="hint">範囲ブックマークは未開始です。</p>
+                </details>
+              </article>
+
+              <div class="study-tool-switcher" role="tablist" aria-label="学習サイドパネル">
+                <button
+                  id="studyToolReviewBtn"
+                  class="study-tool-btn"
+                  type="button"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="studyToolReviewPanel"
+                >
+                  復習
+                </button>
+                <button
+                  id="studyToolNotesBtn"
+                  class="study-tool-btn"
+                  type="button"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="studyToolNotesPanel"
+                >
+                  メモ
+                </button>
+                <button
+                  id="studyToolBookmarksBtn"
+                  class="study-tool-btn"
+                  type="button"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="studyToolBookmarksPanel"
+                >
+                  保存済み
+                </button>
               </div>
-              <label class="field">
-                <span>ブックマークメモ</span>
-                <input id="bookmarkNoteInput" type="text" placeholder="メモを追加 (任意)" />
-              </label>
-              <p id="rangeStatus" class="hint">範囲ブックマークは未開始です。</p>
-            </details>
-          </article>
 
-          <article class="card workspace-review-card">
-            <div class="workspace-card-head">
-              <h3>復習ワークスペース</h3>
-              <button id="workspaceRefreshBtn" class="workspace-refresh-btn secondary-btn" type="button">更新</button>
-            </div>
-            <p id="workspaceSummary" class="hint">復習データを読み込み中...</p>
+              <section
+                id="studyToolReviewPanel"
+                class="study-tool-panel is-active"
+                role="tabpanel"
+                aria-labelledby="studyToolReviewBtn"
+              >
+                <article class="card workspace-review-card">
+                  <div class="workspace-card-head">
+                    <h3>復習ワークスペース</h3>
+                    <button id="workspaceRefreshBtn" class="workspace-refresh-btn secondary-btn" type="button">更新</button>
+                  </div>
+                  <p id="workspaceSummary" class="hint">復習データを読み込み中...</p>
 
-            <div class="workspace-section">
-              <p class="workspace-section-title">復習キュー</p>
-              <div id="workspaceReviewList" class="workspace-list"></div>
-            </div>
+                  <div class="workspace-section">
+                    <p class="workspace-section-title">復習キュー</p>
+                    <div id="workspaceReviewList" class="workspace-list"></div>
+                  </div>
 
-            <div class="workspace-section">
-              <p class="workspace-section-title">未登録語レビュー</p>
-              <div id="workspaceMissingList" class="workspace-list"></div>
-            </div>
-          </article>
+                  <div class="workspace-section">
+                    <p class="workspace-section-title">未登録語レビュー</p>
+                    <div id="workspaceMissingList" class="workspace-list"></div>
+                  </div>
+                </article>
+              </section>
 
-          <article class="card">
-            <h3>動画メモ</h3>
-            <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>
-            <div class="inline-actions">
-              <button id="saveNoteBtn" class="primary-btn" type="button">動画メモ保存</button>
-            </div>
-          </article>
+              <section
+                id="studyToolNotesPanel"
+                class="study-tool-panel"
+                role="tabpanel"
+                aria-labelledby="studyToolNotesBtn"
+                hidden
+              >
+                <article class="card">
+                  <h3>動画メモ</h3>
+                  <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>
+                  <div class="inline-actions">
+                    <button id="saveNoteBtn" class="primary-btn" type="button">動画メモ保存</button>
+                  </div>
+                </article>
+              </section>
 
-          <article class="card">
-            <h3>保存済みブックマーク</h3>
-            <div id="bookmarkList" class="bookmark-list"></div>
-          </article>
-        </section>
+              <section
+                id="studyToolBookmarksPanel"
+                class="study-tool-panel"
+                role="tabpanel"
+                aria-labelledby="studyToolBookmarksBtn"
+                hidden
+              >
+                <article class="card">
+                  <h3>保存済みブックマーク</h3>
+                  <div id="bookmarkList" class="bookmark-list"></div>
+                </article>
+              </section>
+            </section>
           </div>
         </section>
 
@@ -323,7 +380,7 @@
     <div id="subtitleDictPopup" class="subtitle-dict-popup hidden" aria-hidden="true"></div>
 
     <div id="jumpModal" class="jump-modal hidden" aria-hidden="true">
-      <div class="jump-dialog" role="dialog" aria-modal="true" aria-label="動画ジャンプ">
+      <div class="jump-dialog" role="dialog" aria-modal="true" aria-label="動画ジャンプ" tabindex="-1">
         <div class="jump-header">
           <h2>動画ジャンプ</h2>
           <button id="jumpCloseBtn" type="button">閉じる (Esc)</button>
@@ -342,7 +399,7 @@
     </div>
 
     <div id="clipboardModal" class="jump-modal hidden" aria-hidden="true">
-      <div class="jump-dialog clipboard-dialog" role="dialog" aria-modal="true" aria-label="手動コピー">
+      <div class="jump-dialog clipboard-dialog" role="dialog" aria-modal="true" aria-label="手動コピー" tabindex="-1">
         <div class="jump-header">
           <h2>手動コピー</h2>
           <button id="clipboardCloseBtn" type="button">閉じる (Esc)</button>

@@ -105,9 +105,20 @@ const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source"
 const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
 const SOURCE_TARGET_FILTER_STORAGE_KEY = "substudy.source_target_filter";
 const SOURCE_TARGET_TAG_STORAGE_KEY = "substudy.source_target_tag";
+const FOCUS_MODE_STORAGE_KEY = "substudy.focus_mode";
 const WORKSPACE_PANEL_STORAGE_KEY = "substudy.workspace_panel";
+const STUDY_TOOL_PANEL_STORAGE_KEY = "substudy.study_tool_panel";
 const SOURCE_TAG_SCOPE_OPTION_PREFIX = "__tag_scope__:";
 const WORKSPACE_PANEL_MODES = new Set(["study", "ops"]);
+const STUDY_TOOL_PANELS = new Set(["review", "notes", "bookmarks"]);
+const MODAL_FOCUSABLE_SELECTOR = [
+  "button:not([disabled])",
+  "[href]",
+  "input:not([disabled]):not([type=\"hidden\"])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex=\"-1\"])",
+].join(", ");
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -231,11 +242,19 @@ const state = {
     }
     return "study";
   })(),
+  studyToolPanel: (() => {
+    const stored = String(localStorage.getItem(STUDY_TOOL_PANEL_STORAGE_KEY) || "").trim().toLowerCase();
+    if (STUDY_TOOL_PANELS.has(stored)) {
+      return stored;
+    }
+    return "review";
+  })(),
   rangeStartMs: null,
   wheelLockUntil: 0,
   touchStartY: null,
   touchStartIgnoreNavigation: false,
   metaExpanded: false,
+  focusMode: localStorage.getItem(FOCUS_MODE_STORAGE_KEY) === "on",
   controlsExpanded: localStorage.getItem("substudy.controls_expanded") === "true",
   controlsFadeTimer: null,
   statusBarIdleTimer: null,
@@ -354,14 +373,23 @@ const state = {
   sourceTargetsSelectedTags: loadSelectedSourceTargetTags(),
   workspaceLoadToken: 0,
   urlPlaybackTimeSecond: -1,
+  activeModalId: "",
+  modalRestoreFocusEl: null,
 };
 
 const elements = {
   appShell: document.querySelector(".app-shell"),
   studyModeBtn: document.getElementById("studyModeBtn"),
   opsModeBtn: document.getElementById("opsModeBtn"),
+  focusModeToggle: document.getElementById("focusModeToggle"),
   studyPanel: document.getElementById("studyPanel"),
   opsPanel: document.getElementById("opsPanel"),
+  studyToolReviewBtn: document.getElementById("studyToolReviewBtn"),
+  studyToolNotesBtn: document.getElementById("studyToolNotesBtn"),
+  studyToolBookmarksBtn: document.getElementById("studyToolBookmarksBtn"),
+  studyToolReviewPanel: document.getElementById("studyToolReviewPanel"),
+  studyToolNotesPanel: document.getElementById("studyToolNotesPanel"),
+  studyToolBookmarksPanel: document.getElementById("studyToolBookmarksPanel"),
   sourceSelect: document.getElementById("sourceSelect"),
   translationFilterSelect: document.getElementById("translationFilterSelect"),
   translationVariantSelect: document.getElementById("translationVariantSelect"),
@@ -445,10 +473,12 @@ const elements = {
   saveNoteBtn: document.getElementById("saveNoteBtn"),
   bookmarkList: document.getElementById("bookmarkList"),
   jumpModal: document.getElementById("jumpModal"),
+  jumpDialog: document.querySelector("#jumpModal .jump-dialog"),
   jumpCloseBtn: document.getElementById("jumpCloseBtn"),
   jumpInput: document.getElementById("jumpInput"),
   jumpResults: document.getElementById("jumpResults"),
   clipboardModal: document.getElementById("clipboardModal"),
+  clipboardDialog: document.querySelector("#clipboardModal .jump-dialog"),
   clipboardCloseBtn: document.getElementById("clipboardCloseBtn"),
   clipboardTextarea: document.getElementById("clipboardTextarea"),
   statusBar: document.getElementById("statusBar"),
@@ -682,6 +712,20 @@ function updateDictHoverLoopToggle() {
   applyToolbarToggleState(elements.dictHoverLoopToggle, "辞書ループ", state.dictHoverLoopEnabled);
 }
 
+function updateFocusModeToggle() {
+  if (!elements.focusModeToggle) {
+    return;
+  }
+  applyToolbarToggleState(elements.focusModeToggle, "集中表示", state.focusMode);
+}
+
+function updateFocusModeState() {
+  if (!elements.appShell) {
+    return;
+  }
+  elements.appShell.classList.toggle("focus-mode", state.focusMode);
+}
+
 function updateWorkspacePanelState() {
   const isStudy = state.workspacePanel === "study";
   if (elements.studyPanel) {
@@ -700,6 +744,33 @@ function updateWorkspacePanelState() {
   }
 }
 
+function updateStudyToolPanelState() {
+  const isReview = state.studyToolPanel === "review";
+  const isNotes = state.studyToolPanel === "notes";
+  const isBookmarks = state.studyToolPanel === "bookmarks";
+  if (elements.studyToolReviewBtn) {
+    elements.studyToolReviewBtn.setAttribute("aria-selected", isReview ? "true" : "false");
+  }
+  if (elements.studyToolNotesBtn) {
+    elements.studyToolNotesBtn.setAttribute("aria-selected", isNotes ? "true" : "false");
+  }
+  if (elements.studyToolBookmarksBtn) {
+    elements.studyToolBookmarksBtn.setAttribute("aria-selected", isBookmarks ? "true" : "false");
+  }
+  if (elements.studyToolReviewPanel) {
+    elements.studyToolReviewPanel.hidden = !isReview;
+    elements.studyToolReviewPanel.classList.toggle("is-active", isReview);
+  }
+  if (elements.studyToolNotesPanel) {
+    elements.studyToolNotesPanel.hidden = !isNotes;
+    elements.studyToolNotesPanel.classList.toggle("is-active", isNotes);
+  }
+  if (elements.studyToolBookmarksPanel) {
+    elements.studyToolBookmarksPanel.hidden = !isBookmarks;
+    elements.studyToolBookmarksPanel.classList.toggle("is-active", isBookmarks);
+  }
+}
+
 function setWorkspacePanel(panel) {
   const normalized = String(panel || "").trim().toLowerCase();
   if (!WORKSPACE_PANEL_MODES.has(normalized) || normalized === state.workspacePanel) {
@@ -713,6 +784,27 @@ function setWorkspacePanel(panel) {
     hideSubtitleDictionaryPopup();
     closeLyricReel({ resumePlayback: false });
   }
+}
+
+function setFocusMode(active) {
+  const next = active === undefined ? !state.focusMode : Boolean(active);
+  if (next === state.focusMode) {
+    return;
+  }
+  state.focusMode = next;
+  localStorage.setItem(FOCUS_MODE_STORAGE_KEY, state.focusMode ? "on" : "off");
+  updateFocusModeState();
+  updateFocusModeToggle();
+}
+
+function setStudyToolPanel(panel) {
+  const normalized = String(panel || "").trim().toLowerCase();
+  if (!STUDY_TOOL_PANELS.has(normalized) || normalized === state.studyToolPanel) {
+    return;
+  }
+  state.studyToolPanel = normalized;
+  localStorage.setItem(STUDY_TOOL_PANEL_STORAGE_KEY, normalized);
+  updateStudyToolPanelState();
 }
 
 function shuffleIndices(indices) {
@@ -2314,6 +2406,120 @@ function isClipboardModalOpen() {
   return !elements.clipboardModal.classList.contains("hidden");
 }
 
+function getActiveModalId() {
+  if (isClipboardModalOpen()) {
+    return "clipboard";
+  }
+  if (isJumpModalOpen()) {
+    return "jump";
+  }
+  return "";
+}
+
+function getModalDialogById(modalId) {
+  if (modalId === "clipboard") {
+    return elements.clipboardDialog;
+  }
+  if (modalId === "jump") {
+    return elements.jumpDialog;
+  }
+  return null;
+}
+
+function getFocusableElements(root) {
+  if (!(root instanceof HTMLElement)) {
+    return [];
+  }
+  return Array.from(root.querySelectorAll(MODAL_FOCUSABLE_SELECTOR)).filter((node) => {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+    if (node.hidden || node.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    if (node.getClientRects().length === 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(node);
+    return style.visibility !== "hidden";
+  });
+}
+
+function activateModal(modalId, initialFocusEl = null) {
+  const currentModalId = getActiveModalId();
+  if (currentModalId && currentModalId !== modalId) {
+    if (currentModalId === "jump") {
+      closeJumpModal({ restoreFocus: false });
+    } else if (currentModalId === "clipboard") {
+      closeClipboardModal({ restoreFocus: false });
+    }
+  }
+  if (state.activeModalId !== modalId) {
+    state.modalRestoreFocusEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  }
+  state.activeModalId = modalId;
+  const dialog = getModalDialogById(modalId);
+  const focusTarget = initialFocusEl instanceof HTMLElement
+    ? initialFocusEl
+    : getFocusableElements(dialog)[0] || dialog;
+  window.requestAnimationFrame(() => {
+    if (!(focusTarget instanceof HTMLElement) || !document.contains(focusTarget)) {
+      return;
+    }
+    focusTarget.focus();
+    if (typeof focusTarget.select === "function") {
+      focusTarget.select();
+    }
+  });
+}
+
+function deactivateModal(modalId, options = {}) {
+  if (state.activeModalId !== modalId) {
+    return;
+  }
+  state.activeModalId = "";
+  const restoreFocus = options.restoreFocus !== false;
+  const restoreEl = state.modalRestoreFocusEl;
+  state.modalRestoreFocusEl = null;
+  if (!restoreFocus || !(restoreEl instanceof HTMLElement) || !document.contains(restoreEl)) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    restoreEl.focus();
+  });
+}
+
+function trapModalFocus(event, modalId) {
+  if (event.key !== "Tab") {
+    return;
+  }
+  const dialog = getModalDialogById(modalId);
+  if (!(dialog instanceof HTMLElement)) {
+    return;
+  }
+  const focusable = getFocusableElements(dialog);
+  if (!focusable.length) {
+    event.preventDefault();
+    dialog.focus();
+    return;
+  }
+  const activeElement = document.activeElement;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const containsActive = activeElement instanceof HTMLElement && dialog.contains(activeElement);
+  if (event.shiftKey) {
+    if (!containsActive || activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    }
+    return;
+  }
+  if (!containsActive || activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 function normalizeSearchText(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -2577,13 +2783,13 @@ function openJumpModal() {
   elements.jumpModal.classList.remove("hidden");
   elements.jumpModal.setAttribute("aria-hidden", "false");
   refreshJumpResults();
-  elements.jumpInput.focus();
-  elements.jumpInput.select();
+  activateModal("jump", elements.jumpInput);
 }
 
-function closeJumpModal() {
+function closeJumpModal(options = {}) {
   elements.jumpModal.classList.add("hidden");
   elements.jumpModal.setAttribute("aria-hidden", "true");
+  deactivateModal("jump", options);
 }
 
 function openClipboardModal(text) {
@@ -2593,16 +2799,16 @@ function openClipboardModal(text) {
   elements.clipboardTextarea.value = String(text || "");
   elements.clipboardModal.classList.remove("hidden");
   elements.clipboardModal.setAttribute("aria-hidden", "false");
-  elements.clipboardTextarea.focus();
-  elements.clipboardTextarea.select();
+  activateModal("clipboard", elements.clipboardTextarea);
 }
 
-function closeClipboardModal() {
+function closeClipboardModal(options = {}) {
   if (!elements.clipboardModal) {
     return;
   }
   elements.clipboardModal.classList.add("hidden");
   elements.clipboardModal.setAttribute("aria-hidden", "true");
+  deactivateModal("clipboard", options);
 }
 
 function renderSourceOptions(preferredSource, preferredSourceTags = []) {
@@ -10958,6 +11164,7 @@ function handleWheel(event) {
 
 function handleKeydown(event) {
   if (isClipboardModalOpen()) {
+    trapModalFocus(event, "clipboard");
     if (event.key === "Escape") {
       event.preventDefault();
       closeClipboardModal();
@@ -10965,6 +11172,7 @@ function handleKeydown(event) {
     return;
   }
   if (isJumpModalOpen()) {
+    trapModalFocus(event, "jump");
     if (event.key === "Escape") {
       event.preventDefault();
       closeJumpModal();
@@ -11199,6 +11407,12 @@ function bindEvents() {
     noteUserActivity();
   };
 
+  if (elements.focusModeToggle) {
+    elements.focusModeToggle.addEventListener("click", () => {
+      setFocusMode();
+      resetControlsToggleFade();
+    });
+  }
   if (elements.studyModeBtn) {
     elements.studyModeBtn.addEventListener("click", () => {
       setWorkspacePanel("study");
@@ -11208,6 +11422,24 @@ function bindEvents() {
   if (elements.opsModeBtn) {
     elements.opsModeBtn.addEventListener("click", () => {
       setWorkspacePanel("ops");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.studyToolReviewBtn) {
+    elements.studyToolReviewBtn.addEventListener("click", () => {
+      setStudyToolPanel("review");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.studyToolNotesBtn) {
+    elements.studyToolNotesBtn.addEventListener("click", () => {
+      setStudyToolPanel("notes");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.studyToolBookmarksBtn) {
+    elements.studyToolBookmarksBtn.addEventListener("click", () => {
+      setStudyToolPanel("bookmarks");
       resetControlsToggleFade();
     });
   }
@@ -11857,10 +12089,13 @@ function bindEvents() {
 
 async function initialize() {
   mountDictionaryOverlayIntoAppShell();
+  updateFocusModeState();
   updateWorkspacePanelState();
+  updateStudyToolPanelState();
   updateMetaDrawerState();
   updateControlsDrawerState();
   scheduleControlsToggleIdleFade();
+  updateFocusModeToggle();
   updateAutoplayToggle();
   updateShuffleToggle();
   updateNormalizationToggle();

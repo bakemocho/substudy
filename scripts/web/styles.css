@@ -137,6 +137,11 @@ body {
   width: auto;
 }
 
+.focus-mode-toggle {
+  width: auto;
+  min-width: 124px;
+}
+
 .toolbar-settings {
   min-width: min(100%, 240px);
   border-radius: 14px;
@@ -185,6 +190,47 @@ body {
   display: grid;
   gap: 14px;
   margin-top: 18px;
+}
+
+.app-shell.focus-mode {
+  padding-top: 14px;
+}
+
+.app-shell.focus-mode .top-bar {
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 16px;
+}
+
+.app-shell.focus-mode .top-bar-copy {
+  gap: 4px;
+  max-width: 340px;
+}
+
+.app-shell.focus-mode .eyebrow,
+.app-shell.focus-mode .top-bar-summary {
+  display: none;
+}
+
+.app-shell.focus-mode .top-actions {
+  gap: 8px;
+}
+
+.app-shell.focus-mode .workspace-switcher {
+  width: min(100%, 248px);
+  padding: 4px;
+  border-radius: 14px;
+}
+
+.app-shell.focus-mode .workspace-mode-btn {
+  min-height: 36px;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+
+.app-shell.focus-mode .page-content {
+  gap: 10px;
+  margin-top: 12px;
 }
 
 .workspace-switcher {
@@ -805,6 +851,37 @@ body {
   display: grid;
   gap: 14px;
   align-content: start;
+}
+
+.study-tool-switcher {
+  display: inline-grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+  padding: 6px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(7, 15, 29, 0.78);
+  box-shadow: 0 16px 40px rgba(3, 8, 20, 0.24);
+}
+
+.study-tool-btn {
+  min-width: 0;
+  border-radius: 12px;
+}
+
+.study-tool-btn[aria-selected="true"] {
+  border-color: rgba(83, 241, 216, 0.54);
+  background: linear-gradient(135deg, rgba(18, 64, 61, 0.94), rgba(12, 31, 48, 0.94));
+  color: #e0fffa;
+}
+
+.study-tool-panel {
+  min-width: 0;
+}
+
+.study-tool-panel[hidden] {
+  display: none !important;
 }
 
 .ops-layout {
@@ -2025,7 +2102,8 @@ textarea {
   }
 
   .study-column .subtitle-reel-card,
-  .study-column .workspace-review-card {
+  .study-column .study-tool-switcher,
+  .study-column .study-tool-panel {
     grid-column: span 2;
   }
 
@@ -2093,6 +2171,10 @@ textarea {
     width: 100%;
   }
 
+  .study-tool-switcher {
+    width: 100%;
+  }
+
   .jump-header {
     flex-direction: column;
     align-items: flex-start;
@@ -2111,7 +2193,8 @@ textarea {
   }
 
   .study-column .subtitle-reel-card,
-  .study-column .workspace-review-card,
+  .study-column .study-tool-switcher,
+  .study-column .study-tool-panel,
   .ops-layout .shortcuts {
     grid-column: span 1;
   }
@@ -2184,5 +2267,13 @@ textarea {
     left: 12px;
     bottom: 12px;
     max-width: none;
+  }
+
+  .app-shell.focus-mode .top-actions {
+    gap: 8px;
+  }
+
+  .app-shell.focus-mode .workspace-switcher {
+    width: 100%;
   }
 }
