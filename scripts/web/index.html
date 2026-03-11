@@ -340,5 +340,23 @@
         <div id="jumpResults" class="jump-results"></div>
       </div>
     </div>
+
+    <div id="clipboardModal" class="jump-modal hidden" aria-hidden="true">
+      <div class="jump-dialog clipboard-dialog" role="dialog" aria-modal="true" aria-label="手動コピー">
+        <div class="jump-header">
+          <h2>手動コピー</h2>
+          <button id="clipboardCloseBtn" type="button">閉じる (Esc)</button>
+        </div>
+        <p class="jump-hint">
+          クリップボード権限が使えないため、下の JSON を選択して手動でコピーしてください。
+        </p>
+        <textarea
+          id="clipboardTextarea"
+          class="clipboard-textarea"
+          spellcheck="false"
+          readonly
+        ></textarea>
+      </div>
+    </div>
   </body>
 </html>

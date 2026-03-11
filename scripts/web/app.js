@@ -448,6 +448,9 @@ const elements = {
   jumpCloseBtn: document.getElementById("jumpCloseBtn"),
   jumpInput: document.getElementById("jumpInput"),
   jumpResults: document.getElementById("jumpResults"),
+  clipboardModal: document.getElementById("clipboardModal"),
+  clipboardCloseBtn: document.getElementById("clipboardCloseBtn"),
+  clipboardTextarea: document.getElementById("clipboardTextarea"),
   statusBar: document.getElementById("statusBar"),
 };
 
@@ -2307,6 +2310,10 @@ function isJumpModalOpen() {
   return !elements.jumpModal.classList.contains("hidden");
 }
 
+function isClipboardModalOpen() {
+  return !elements.clipboardModal.classList.contains("hidden");
+}
+
 function normalizeSearchText(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -2577,6 +2584,25 @@ function openJumpModal() {
 function closeJumpModal() {
   elements.jumpModal.classList.add("hidden");
   elements.jumpModal.setAttribute("aria-hidden", "true");
+}
+
+function openClipboardModal(text) {
+  if (!elements.clipboardModal || !elements.clipboardTextarea) {
+    return;
+  }
+  elements.clipboardTextarea.value = String(text || "");
+  elements.clipboardModal.classList.remove("hidden");
+  elements.clipboardModal.setAttribute("aria-hidden", "false");
+  elements.clipboardTextarea.focus();
+  elements.clipboardTextarea.select();
+}
+
+function closeClipboardModal() {
+  if (!elements.clipboardModal) {
+    return;
+  }
+  elements.clipboardModal.classList.add("hidden");
+  elements.clipboardModal.setAttribute("aria-hidden", "true");
 }
 
 function renderSourceOptions(preferredSource, preferredSourceTags = []) {
@@ -9718,24 +9744,48 @@ async function copyTextToClipboard(text) {
   if (!value) {
     throw new Error("コピーするテキストがありません。");
   }
+
+  const fallbackCopy = () => {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "readonly");
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "0";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (_error) {
+      copied = false;
+    }
+    textarea.remove();
+    return copied;
+  };
+
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(value);
-    return;
+    try {
+      await navigator.clipboard.writeText(value);
+      return "clipboard";
+    } catch (_error) {
+      if (fallbackCopy()) {
+        return "execCommand";
+      }
+      openClipboardModal(value);
+      return "manual";
+    }
   }
-  const textarea = document.createElement("textarea");
-  textarea.value = value;
-  textarea.setAttribute("readonly", "readonly");
-  textarea.style.position = "fixed";
-  textarea.style.opacity = "0";
-  textarea.style.pointerEvents = "none";
-  document.body.appendChild(textarea);
-  textarea.focus();
-  textarea.select();
-  const copied = document.execCommand("copy");
-  textarea.remove();
-  if (!copied) {
-    throw new Error("クリップボードへのコピーに失敗しました。");
+
+  if (fallbackCopy()) {
+    return "execCommand";
   }
+
+  openClipboardModal(value);
+  return "manual";
 }
 
 async function buildWorkspaceCopyPayload(item) {
@@ -9782,8 +9832,12 @@ function createWorkspaceCopyButton(item) {
     button.textContent = "コピー中...";
     try {
       const payload = await buildWorkspaceCopyPayload(item);
-      await copyTextToClipboard(JSON.stringify(payload, null, 2));
-      setStatus("復習 JSON をクリップボードにコピーしました。", "ok");
+      const copyResult = await copyTextToClipboard(JSON.stringify(payload, null, 2));
+      if (copyResult === "manual") {
+        setStatus("クリップボード権限が使えないため、手動コピー欄を開きました。", "info");
+      } else {
+        setStatus("復習 JSON をクリップボードにコピーしました。", "ok");
+      }
     } catch (error) {
       setStatus(error?.message || "復習 JSON のコピーに失敗しました。", "error");
     } finally {
@@ -10903,6 +10957,13 @@ function handleWheel(event) {
 }
 
 function handleKeydown(event) {
+  if (isClipboardModalOpen()) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeClipboardModal();
+    }
+    return;
+  }
   if (isJumpModalOpen()) {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -11336,6 +11397,12 @@ function bindEvents() {
   elements.jumpModal.addEventListener("click", (event) => {
     if (event.target === elements.jumpModal) {
       closeJumpModal();
+    }
+  });
+  elements.clipboardCloseBtn.addEventListener("click", () => closeClipboardModal());
+  elements.clipboardModal.addEventListener("click", (event) => {
+    if (event.target === elements.clipboardModal) {
+      closeClipboardModal();
     }
   });
   elements.jumpInput.addEventListener("input", () => refreshJumpResults());

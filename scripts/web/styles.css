@@ -1935,6 +1935,26 @@ textarea {
   padding-inline: 12px;
 }
 
+.clipboard-dialog {
+  width: min(980px, 96vw);
+}
+
+.clipboard-textarea {
+  width: 100%;
+  min-height: min(56vh, 560px);
+  resize: vertical;
+  border-radius: 14px;
+  border: 1px solid rgba(150, 173, 245, 0.32);
+  background: rgba(5, 12, 26, 0.9);
+  color: #edf4ff;
+  font: 0.78rem/1.45 "Iosevka Web", "SFMono-Regular", "Menlo", monospace;
+  padding: 12px 14px;
+}
+
+.clipboard-textarea:focus {
+  outline: 1px solid rgba(132, 159, 232, 0.7);
+}
+
 .jump-hint {
   margin: 0;
   color: var(--muted);
