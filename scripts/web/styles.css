@@ -13,14 +13,8 @@
   --accent-3: #ffcc73;
   --danger: #ff637d;
   --shadow: 0 24px 70px rgba(1, 5, 15, 0.58);
-  --player-frame-offset: 240px;
   --player-height-min: 420px;
-  --player-height-max: 760px;
-  --phone-shell-height: clamp(
-    var(--player-height-min),
-    calc(100dvh - var(--player-frame-offset)),
-    var(--player-height-max)
-  );
+  --phone-shell-height: max(var(--player-height-min), 100dvh);
   --phone-shell-width: min(calc(var(--phone-shell-height) * 9 / 16), 96vw, 500px);
 }
 
@@ -1989,9 +1983,7 @@ textarea {
 
 @media (max-width: 1200px) {
   :root {
-    --player-frame-offset: 310px;
     --player-height-min: 380px;
-    --player-height-max: 640px;
   }
 
   .top-bar {
@@ -2028,9 +2020,7 @@ textarea {
 
 @media (max-width: 760px) {
   :root {
-    --player-frame-offset: 370px;
     --player-height-min: 320px;
-    --player-height-max: 520px;
   }
 
   .top-bar {
