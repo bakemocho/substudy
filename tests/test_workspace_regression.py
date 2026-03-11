@@ -684,6 +684,94 @@ enabled = true
         by_id_after = {row["id"]: row for row in list_payload_after.get("targets", [])}
         self.assertNotIn("storiesofcz_likes", by_id_after)
 
+    def test_source_target_api_concurrent_upserts_preserve_all_updates(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        upsert_url = f"http://{host}:{port}/api/source-targets/upsert"
+        list_url = f"http://{host}:{port}/api/source-targets"
+        write_barrier = threading.Barrier(2)
+        start_barrier = threading.Barrier(2)
+        original_write = self.mod.write_managed_targets_payload
+        errors: list[BaseException] = []
+
+        def delayed_write(managed_path, payload):
+            try:
+                write_barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+            self.mod.time.sleep(0.05)
+            return original_write(managed_path, payload)
+
+        def submit_upsert(source_id: str) -> None:
+            payload = {
+                "id": source_id,
+                "watch_kind": "likes",
+                "target_handle": source_id,
+                "enabled": True,
+            }
+            request = urllib.request.Request(
+                upsert_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                start_barrier.wait(timeout=2)
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+            except BaseException as exc:  # pragma: no cover - thread coordination
+                errors.append(exc)
+
+        with mock.patch.object(self.mod, "write_managed_targets_payload", side_effect=delayed_write):
+            threads = [
+                threading.Thread(target=submit_upsert, args=("alpha_like",), daemon=True),
+                threading.Thread(target=submit_upsert, args=("beta_like",), daemon=True),
+            ]
+            for item in threads:
+                item.start()
+            for item in threads:
+                item.join(timeout=6)
+
+        self.assertEqual(errors, [])
+        with urllib.request.urlopen(list_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+        by_id = {row["id"]: row for row in payload.get("targets", [])}
+        self.assertIn("alpha_like", by_id)
+        self.assertIn("beta_like", by_id)
+
     def test_load_config_parses_sleep_requests_and_media_interval_overrides(self):
         config_dir = self.workspace_root / "config"
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -4673,6 +4761,65 @@ enabled = true
         self.assertTrue(updated_payload["videos"][0]["is_favorite"])
         self.assertFalse(updated_payload["videos"][0]["is_disliked"])
         self.assertFalse(updated_payload["videos"][0]["is_not_interested"])
+
+    def test_favorites_toggle_requires_application_json(self):
+        media_path = self.workspace_root / "storiesofcz_csrf.mp4"
+        media_path.write_bytes(b"")
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "7611111111111111888", "csrf", str(media_path), 1, now_iso),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        toggle_url = f"http://{host}:{port}/api/favorites/toggle"
+        request = urllib.request.Request(
+            toggle_url,
+            data=b'{"source_id":"storiesofcz","video_id":"7611111111111111888"}',
+            headers={"Content-Type": "text/plain"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(ctx.exception.code, 415)
+        body = json.loads(ctx.exception.read().decode("utf-8"))
+        self.assertEqual(body.get("error"), "Content-Type must be application/json.")
+        ctx.exception.close()
+
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0"
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+        self.assertFalse(payload["videos"][0]["is_favorite"])
 
     def test_media_endpoint_serves_registered_video_file(self):
         media_path = self.workspace_root / "registered.mp4"

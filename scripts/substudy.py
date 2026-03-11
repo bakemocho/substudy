@@ -334,6 +334,13 @@ class ProducerLockAcquisitionError(RuntimeError):
     pass
 
 
+class UnsupportedJsonContentTypeError(ValueError):
+    pass
+
+
+_MANAGED_TARGETS_THREAD_LOCK = threading.Lock()
+
+
 def now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -392,6 +399,27 @@ def queue_producer_lock(lock_path: Path, enabled: bool = True) -> Iterable[None]
                 pass
             print(f"[producer-lock] released {lock_path}")
         lock_file.close()
+
+
+@contextmanager
+def managed_targets_update_lock(managed_path: Path) -> Iterable[None]:
+    lock_file = None
+    _MANAGED_TARGETS_THREAD_LOCK.acquire()
+    try:
+        if fcntl is not None:
+            lock_path = managed_path.with_name(f"{managed_path.name}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = lock_path.open("a+", encoding="utf-8")
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_file.close()
+        _MANAGED_TARGETS_THREAD_LOCK.release()
 
 
 def parse_iso_datetime_utc(raw_value: Any) -> dt.datetime | None:
@@ -13497,6 +13525,16 @@ def build_web_handler(
             connection.execute("PRAGMA foreign_keys = ON")
             return connection
 
+        def _request_content_type(self) -> str:
+            raw_value = self.headers.get("Content-Type", "")
+            return str(raw_value).split(";", 1)[0].strip().lower()
+
+        def _is_json_content_type(self) -> bool:
+            content_type = self._request_content_type()
+            if content_type == "application/json":
+                return True
+            return content_type.startswith("application/") and content_type.endswith("+json")
+
         def _read_json_body(self) -> dict[str, Any]:
             raw_length = self.headers.get("Content-Length", "0")
             try:
@@ -13505,6 +13543,8 @@ def build_web_handler(
                 content_length = 0
             if content_length <= 0:
                 return {}
+            if not self._is_json_content_type():
+                raise UnsupportedJsonContentTypeError("Content-Type must be application/json.")
             raw_body = self.rfile.read(content_length)
             if not raw_body:
                 return {}
@@ -13515,6 +13555,10 @@ def build_web_handler(
             if not isinstance(parsed, dict):
                 raise ValueError("JSON body must be an object.")
             return parsed
+
+        def _handle_json_body_error(self, exc: ValueError) -> None:
+            status = 415 if isinstance(exc, UnsupportedJsonContentTypeError) else 400
+            self._send_error_json(status, str(exc))
 
         def _send_json(self, payload: Any, status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -13807,7 +13851,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
 
             source_id = normalize_source_target_id(payload.get("id"))
@@ -13855,20 +13899,22 @@ def build_web_handler(
             if video_url_template:
                 managed_entry["video_url_template"] = video_url_template
 
-            managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
-            updated = False
-            for index, row in enumerate(managed_targets):
-                if str(row.get("id", "")).strip() != source_id:
-                    continue
-                managed_targets[index] = managed_entry
-                updated = True
-                break
-            if not updated:
-                managed_targets.append(managed_entry)
-            managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
-            managed_payload["targets"] = managed_targets
             try:
-                write_managed_targets_payload(managed_path, managed_payload)
+                managed_path = resolve_managed_targets_path(web_config_path)
+                with managed_targets_update_lock(managed_path):
+                    managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
+                    updated = False
+                    for index, row in enumerate(managed_targets):
+                        if str(row.get("id", "")).strip() != source_id:
+                            continue
+                        managed_targets[index] = managed_entry
+                        updated = True
+                        break
+                    if not updated:
+                        managed_targets.append(managed_entry)
+                    managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
+                    managed_payload["targets"] = managed_targets
+                    write_managed_targets_payload(managed_path, managed_payload)
             except OSError as exc:
                 self._send_error_json(500, f"Failed to write managed targets file: {exc}")
                 return
@@ -13885,25 +13931,27 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = normalize_source_target_id(payload.get("id"))
             if not source_id:
                 self._send_error_json(400, "id is required.")
                 return
 
-            managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
-            filtered_targets = [
-                row for row in managed_targets
-                if str(row.get("id", "")).strip() != source_id
-            ]
-            if len(filtered_targets) == len(managed_targets):
-                self._send_error_json(404, f"No managed override found for source id: {source_id}")
-                return
-            managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
-            managed_payload["targets"] = filtered_targets
             try:
-                write_managed_targets_payload(managed_path, managed_payload)
+                managed_path = resolve_managed_targets_path(web_config_path)
+                with managed_targets_update_lock(managed_path):
+                    managed_path, managed_payload, managed_targets = read_managed_targets_payload(web_config_path)
+                    filtered_targets = [
+                        row for row in managed_targets
+                        if str(row.get("id", "")).strip() != source_id
+                    ]
+                    if len(filtered_targets) == len(managed_targets):
+                        self._send_error_json(404, f"No managed override found for source id: {source_id}")
+                        return
+                    managed_payload["version"] = MANAGED_TARGETS_FORMAT_VERSION
+                    managed_payload["targets"] = filtered_targets
+                    write_managed_targets_payload(managed_path, managed_payload)
             except OSError as exc:
                 self._send_error_json(500, f"Failed to write managed targets file: {exc}")
                 return
@@ -14774,7 +14822,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
 
             source_id = self._normalize_source(payload.get("source_id"))
@@ -15380,7 +15428,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15425,7 +15473,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15470,7 +15518,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15515,7 +15563,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15583,7 +15631,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15652,7 +15700,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             source_id = self._normalize_source(payload.get("source_id"))
             video_id = self._normalize_source(payload.get("video_id"))
@@ -15732,7 +15780,7 @@ def build_web_handler(
             try:
                 payload = self._read_json_body()
             except ValueError as exc:
-                self._send_error_json(400, str(exc))
+                self._handle_json_body_error(exc)
                 return
             note_value = "" if payload.get("note") in (None, "") else str(payload.get("note"))
             with self._open_connection() as connection:
