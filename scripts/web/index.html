@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Substudy Feed</title>
+    <title>Substudy 学習フィード</title>
     <link rel="stylesheet" href="/styles.css" />
     <script defer src="/vendor/d3.v7.min.js"></script>
     <script defer src="/app.js"></script>
@@ -14,13 +14,14 @@
 
     <div class="app-shell">
       <header class="top-bar">
-        <div>
+        <div class="top-bar-copy">
           <p class="eyebrow">Substudy</p>
-          <h1>TikTok-Style Study Feed</h1>
+          <h1>短尺動画学習フィード</h1>
+          <p class="top-bar-summary">動画と字幕に集中する「Study」と、運用確認に寄せた「Ops」を切り替えられます。</p>
         </div>
         <div class="top-actions">
           <label class="source-filter">
-            <span>Source</span>
+            <span>ソース</span>
             <select id="sourceSelect"></select>
           </label>
           <label class="source-filter">
@@ -34,16 +35,46 @@
               <option value="ja_missing">和訳なし</option>
             </select>
           </label>
-          <button id="jumpOpenBtn" class="ghost-btn jump-open-btn" type="button">ジャンプ (G)</button>
-          <button id="autoplayToggle" class="ghost-btn" type="button">連続再生: ON</button>
-          <button id="shuffleToggle" class="ghost-btn" type="button">シャッフル: ON</button>
-          <button id="normalizationToggle" class="ghost-btn" type="button">音量正規化: ON</button>
-          <button id="dictHoverLoopToggle" class="ghost-btn" type="button">辞書ループ: ON</button>
+          <button id="jumpOpenBtn" class="primary-btn jump-open-btn" type="button">動画ジャンプ (G)</button>
+          <details class="toolbar-settings">
+            <summary>再生設定</summary>
+            <div class="toolbar-settings-grid">
+              <button id="autoplayToggle" class="toggle-chip" type="button">連続再生</button>
+              <button id="shuffleToggle" class="toggle-chip" type="button">シャッフル</button>
+              <button id="normalizationToggle" class="toggle-chip" type="button">音量正規化</button>
+              <button id="dictHoverLoopToggle" class="toggle-chip" type="button">辞書ループ</button>
+            </div>
+          </details>
         </div>
       </header>
 
-      <main class="layout">
-        <section class="player-column" aria-label="Video Feed">
+      <main class="page-content">
+        <div class="workspace-switcher" role="tablist" aria-label="表示モード">
+          <button
+            id="studyModeBtn"
+            class="workspace-mode-btn"
+            type="button"
+            role="tab"
+            aria-selected="true"
+            aria-controls="studyPanel"
+          >
+            Study
+          </button>
+          <button
+            id="opsModeBtn"
+            class="workspace-mode-btn"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="opsPanel"
+          >
+            Ops
+          </button>
+        </div>
+
+        <section id="studyPanel" class="page-panel is-active" role="tabpanel" aria-labelledby="studyModeBtn">
+          <div class="layout study-layout">
+            <section class="player-column" aria-label="学習プレイヤー">
           <div class="phone-shell" id="phoneShell">
             <video id="videoPlayer" playsinline preload="metadata"></video>
             <div id="videoProgressTimer" class="video-progress-timer" aria-hidden="true">
@@ -59,7 +90,7 @@
             </div>
             <div id="videoMetaDrawer" class="video-meta-drawer">
               <button id="metaTabBtn" class="meta-tab-btn" type="button" aria-expanded="false">
-                description
+                説明
               </button>
               <div id="metaPanel" class="meta-panel">
                 <p id="metaPrimaryLine" class="meta-primary-line">動画を読み込み中...</p>
@@ -69,27 +100,29 @@
           </div>
 
           <div class="player-actions">
-            <button id="controlsToggleBtn" class="controls-toggle-btn" type="button" aria-expanded="false">
-              操作を表示
+            <div class="transport-controls">
+              <button id="prevBtn" class="secondary-btn" type="button">↑ 前へ</button>
+              <button id="playPauseBtn" class="primary-btn" type="button">再生</button>
+              <button id="nextBtn" class="secondary-btn" type="button">↓ 次へ</button>
+            </div>
+            <button id="controlsToggleBtn" class="controls-toggle-btn secondary-btn" type="button" aria-expanded="false">
+              詳細操作を表示
             </button>
             <div id="mainControls" class="main-controls collapsed">
-              <button id="prevBtn" type="button">↑ 前へ</button>
-              <button id="playPauseBtn" type="button">再生 / 停止</button>
-              <button id="nextBtn" type="button">↓ 次へ</button>
-              <button id="seekBackBtn" type="button">← 5秒</button>
+              <button id="seekBackBtn" class="secondary-btn" type="button">← 5秒戻す</button>
               <button id="favoriteBtn" class="preference-btn preference-btn-positive" type="button">☆ ファボ</button>
               <button id="dislikeBtn" class="preference-btn preference-btn-negative" type="button">✕ 嫌い</button>
               <button id="notInterestedBtn" class="preference-btn preference-btn-soft-negative" type="button">△ 好きじゃない</button>
-              <button id="seekForwardBtn" type="button">5秒 →</button>
+              <button id="seekForwardBtn" class="secondary-btn" type="button">5秒進む →</button>
             </div>
             <div class="volume-wrap">
-              <button id="muteBtn" type="button">音量: 100%</button>
+              <button id="muteBtn" class="secondary-btn" type="button">音量: 100%</button>
               <input id="volumeSlider" type="range" min="0" max="1" step="0.05" value="1" />
             </div>
           </div>
         </section>
 
-        <section class="study-column" aria-label="Learning Tools">
+        <section class="study-column" aria-label="学習ツール">
           <article class="card subtitle-reel-card">
             <div class="subtitle-reel-head">
               <h3>字幕リール</h3>
@@ -114,16 +147,16 @@
               </div>
             </details>
             <div class="subtitle-panel-mode-toggle" role="group" aria-label="字幕表示モード">
-              <button id="subtitlePanelModeEnOnlyBtn" type="button">EN only</button>
-              <button id="subtitlePanelModeEnJaBtn" type="button">EN + JA</button>
+              <button id="subtitlePanelModeEnOnlyBtn" type="button">英語のみ</button>
+              <button id="subtitlePanelModeEnJaBtn" type="button">英語 + 日本語</button>
             </div>
             <div id="subtitlePanelReel" class="subtitle-panel-reel" aria-live="polite"></div>
             <details class="bookmark-inline-tools">
               <summary>手動ブックマーク操作</summary>
               <div class="inline-actions">
-                <button id="bookmarkCueBtn" type="button">現在字幕を保存 (B)</button>
-                <button id="rangeStartBtn" type="button">範囲開始 (R)</button>
-                <button id="bookmarkRangeBtn" type="button">範囲保存 (T)</button>
+                <button id="bookmarkCueBtn" class="secondary-btn" type="button">現在字幕を保存 (B)</button>
+                <button id="rangeStartBtn" class="secondary-btn" type="button">範囲開始 (R)</button>
+                <button id="bookmarkRangeBtn" class="secondary-btn" type="button">範囲保存 (T)</button>
               </div>
               <label class="field">
                 <span>ブックマークメモ</span>
@@ -136,7 +169,7 @@
           <article class="card workspace-review-card">
             <div class="workspace-card-head">
               <h3>復習ワークスペース</h3>
-              <button id="workspaceRefreshBtn" class="workspace-refresh-btn" type="button">更新</button>
+              <button id="workspaceRefreshBtn" class="workspace-refresh-btn secondary-btn" type="button">更新</button>
             </div>
             <p id="workspaceSummary" class="hint">復習データを読み込み中...</p>
 
@@ -151,100 +184,11 @@
             </div>
           </article>
 
-          <article class="card workspace-monitor-card">
-            <h3>運用モニタ</h3>
-            <div class="workspace-section">
-              <p class="workspace-section-title">Source 処理サマリ</p>
-              <p id="workspaceSourceProcessingSummary" class="hint">読み込み中...</p>
-              <div id="workspaceSourceProcessingList" class="workspace-source-status-list"></div>
-            </div>
-
-            <div class="workspace-section">
-              <p class="workspace-section-title">Download 状況</p>
-              <p id="workspaceDownloadSummary" class="hint">読み込み中...</p>
-              <div id="workspaceDownloadRuns" class="workspace-list compact"></div>
-              <div id="workspacePendingFailures" class="workspace-list compact"></div>
-            </div>
-
-            <div class="workspace-section">
-              <p class="workspace-section-title">Import 結果</p>
-              <p id="workspaceImportSummary" class="hint">読み込み中...</p>
-              <div id="workspaceImportRuns" class="workspace-list compact"></div>
-            </div>
-
-            <div class="workspace-section">
-              <p class="workspace-section-title">最近の生成物</p>
-              <div id="workspaceArtifacts" class="workspace-list compact"></div>
-            </div>
-          </article>
-
-          <article class="card source-target-card">
-            <div class="workspace-card-head">
-              <h3>監視ターゲット管理</h3>
-              <button id="sourceTargetsRefreshBtn" class="workspace-refresh-btn" type="button">更新</button>
-            </div>
-            <p id="sourceTargetsSummary" class="hint">監視ターゲットを読み込み中...</p>
-            <div class="source-target-toolbar">
-              <label class="field">
-                <span>tag / source filter</span>
-                <input id="sourceTargetsFilterInput" type="text" placeholder="例: cooking, funny, tinny" />
-              </label>
-              <div id="sourceTargetsTagFilters" class="source-target-tag-filters"></div>
-            </div>
-            <div id="sourceTargetsList" class="workspace-list compact"></div>
-
-            <details id="sourceTargetEditor" class="bookmark-inline-tools source-target-editor">
-              <summary>ターゲット追加 / 編集</summary>
-              <div class="source-target-form-grid">
-                <label class="field">
-                  <span>source id</span>
-                  <input id="sourceTargetIdInput" type="text" placeholder="例: storiesofcz_likes" />
-                </label>
-                <label class="field">
-                  <span>監視種別</span>
-                  <select id="sourceTargetWatchKindSelect">
-                    <option value="posts">投稿</option>
-                    <option value="likes">いいね欄</option>
-                  </select>
-                </label>
-                <label class="field">
-                  <span>対象アカウント（@不要）</span>
-                  <input id="sourceTargetHandleInput" type="text" placeholder="例: storiesofcz" />
-                </label>
-                <label class="field">
-                  <span>カスタムURL（任意）</span>
-                  <input id="sourceTargetUrlInput" type="text" placeholder="未入力なら自動生成" />
-                </label>
-                <label class="field">
-                  <span>保存先 data_dir（任意）</span>
-                  <input id="sourceTargetDataDirInput" type="text" placeholder="未入力なら source id" />
-                </label>
-                <div class="field source-target-tags-field">
-                  <span>タグ（カンマ区切り）</span>
-                  <input id="sourceTargetTagsInput" type="text" placeholder="例: English, Funny, Cooking" />
-                  <div class="source-target-tag-suggestions-wrap">
-                    <span class="source-target-tag-suggestions-label">既存タグをクリックして追加/解除</span>
-                    <div id="sourceTargetTagSuggestions" class="source-target-tag-suggestions"></div>
-                  </div>
-                </div>
-                <label class="field source-target-enabled-field">
-                  <span>監視対象に含める</span>
-                  <input id="sourceTargetEnabledInput" type="checkbox" checked />
-                </label>
-              </div>
-              <div class="inline-actions">
-                <button id="sourceTargetSaveBtn" type="button">追加</button>
-                <button id="sourceTargetRemoveBtn" class="source-target-archive-btn" type="button" hidden>アーカイブ</button>
-              </div>
-              <p id="sourceTargetFormHint" class="hint">source id が既存なら更新、未登録なら追加します。</p>
-            </details>
-          </article>
-
           <article class="card">
             <h3>動画メモ</h3>
             <textarea id="videoNote" rows="6" placeholder="動画単位の学習メモ"></textarea>
             <div class="inline-actions">
-              <button id="saveNoteBtn" type="button">動画メモ保存</button>
+              <button id="saveNoteBtn" class="primary-btn" type="button">動画メモ保存</button>
             </div>
           </article>
 
@@ -252,31 +196,126 @@
             <h3>保存済みブックマーク</h3>
             <div id="bookmarkList" class="bookmark-list"></div>
           </article>
+        </section>
+          </div>
+        </section>
 
-          <article class="card shortcuts">
-            <h3>ショートカット</h3>
-            <ul>
-              <li>↑ / ↓: 字幕を1行移動</li>
-              <li>Shift+↑ / Shift+↓: 前/次の動画</li>
-              <li>J / K: 次/前の動画</li>
-              <li>← / →: 5秒シーク</li>
-              <li>動画上のスクロール: 歌詞リール（時間同期）</li>
-              <li>G: 動画ジャンプ</li>
-              <li>Space: 再生 / 停止</li>
-              <li>F: ファボ切替</li>
-              <li>B: 現在字幕を保存</li>
-              <li>R: 範囲開始</li>
-              <li>T: 範囲を保存</li>
-              <li>A: 連続再生ON/OFF</li>
-              <li>M: ミュート切替</li>
-              <li>Esc: ジャンプ/歌詞リールを閉じる</li>
-              <li>C: 自動遷移キャンセル</li>
-            </ul>
-          </article>
+        <section id="opsPanel" class="page-panel" role="tabpanel" aria-labelledby="opsModeBtn" hidden>
+          <div class="ops-layout">
+            <article class="card workspace-monitor-card">
+              <h3>運用モニタ</h3>
+              <div class="workspace-section">
+                <p class="workspace-section-title">ソース処理サマリ</p>
+                <p id="workspaceSourceProcessingSummary" class="hint">読み込み中...</p>
+                <div id="workspaceSourceProcessingList" class="workspace-source-status-list"></div>
+              </div>
+
+              <div class="workspace-section">
+                <p class="workspace-section-title">Download 状況</p>
+                <p id="workspaceDownloadSummary" class="hint">読み込み中...</p>
+                <div id="workspaceDownloadRuns" class="workspace-list compact"></div>
+                <div id="workspacePendingFailures" class="workspace-list compact"></div>
+              </div>
+
+              <div class="workspace-section">
+                <p class="workspace-section-title">Import 結果</p>
+                <p id="workspaceImportSummary" class="hint">読み込み中...</p>
+                <div id="workspaceImportRuns" class="workspace-list compact"></div>
+              </div>
+
+              <div class="workspace-section">
+                <p class="workspace-section-title">最近の生成物</p>
+                <div id="workspaceArtifacts" class="workspace-list compact"></div>
+              </div>
+            </article>
+
+            <article class="card source-target-card">
+              <div class="workspace-card-head">
+                <h3>監視ターゲット管理</h3>
+                <button id="sourceTargetsRefreshBtn" class="workspace-refresh-btn secondary-btn" type="button">更新</button>
+              </div>
+              <p id="sourceTargetsSummary" class="hint">監視ターゲットを読み込み中...</p>
+              <div class="source-target-toolbar">
+                <label class="field">
+                  <span>タグ / source 絞り込み</span>
+                  <input id="sourceTargetsFilterInput" type="text" placeholder="例: cooking, funny, tinny" />
+                </label>
+                <div id="sourceTargetsTagFilters" class="source-target-tag-filters"></div>
+              </div>
+              <div id="sourceTargetsList" class="workspace-list compact"></div>
+
+              <details id="sourceTargetEditor" class="bookmark-inline-tools source-target-editor">
+                <summary>ターゲット追加 / 編集</summary>
+                <div class="source-target-form-grid">
+                  <label class="field">
+                    <span>source id</span>
+                    <input id="sourceTargetIdInput" type="text" placeholder="例: storiesofcz_likes" />
+                  </label>
+                  <label class="field">
+                    <span>監視種別</span>
+                    <select id="sourceTargetWatchKindSelect">
+                      <option value="posts">投稿</option>
+                      <option value="likes">いいね欄</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>対象アカウント（@不要）</span>
+                    <input id="sourceTargetHandleInput" type="text" placeholder="例: storiesofcz" />
+                  </label>
+                  <label class="field">
+                    <span>カスタムURL（任意）</span>
+                    <input id="sourceTargetUrlInput" type="text" placeholder="未入力なら自動生成" />
+                  </label>
+                  <label class="field">
+                    <span>保存先 data_dir（任意）</span>
+                    <input id="sourceTargetDataDirInput" type="text" placeholder="未入力なら source id" />
+                  </label>
+                  <div class="field source-target-tags-field">
+                    <span>タグ（カンマ区切り）</span>
+                    <input id="sourceTargetTagsInput" type="text" placeholder="例: English, Funny, Cooking" />
+                    <div class="source-target-tag-suggestions-wrap">
+                      <span class="source-target-tag-suggestions-label">既存タグをクリックして追加/解除</span>
+                      <div id="sourceTargetTagSuggestions" class="source-target-tag-suggestions"></div>
+                    </div>
+                  </div>
+                  <label class="field source-target-enabled-field">
+                    <span>監視対象に含める</span>
+                    <input id="sourceTargetEnabledInput" type="checkbox" checked />
+                  </label>
+                </div>
+                <div class="inline-actions">
+                  <button id="sourceTargetSaveBtn" class="primary-btn" type="button">追加</button>
+                  <button id="sourceTargetRemoveBtn" class="source-target-archive-btn" type="button" hidden>アーカイブ</button>
+                </div>
+                <p id="sourceTargetFormHint" class="hint">source id が既存なら更新、未登録なら追加します。</p>
+              </details>
+            </article>
+
+            <article class="card shortcuts">
+              <h3>ショートカット</h3>
+              <ul>
+                <li>↑ / ↓: 字幕を1行移動</li>
+                <li>Shift+↑ / Shift+↓: 前/次の動画</li>
+                <li>J / K: 次/前の動画</li>
+                <li>← / →: 5秒シーク</li>
+                <li>動画上のスクロール: 歌詞リール（時間同期）</li>
+                <li>G: 動画ジャンプ</li>
+                <li>Space: 再生 / 停止</li>
+                <li>F: ファボ切替</li>
+                <li>B: 現在字幕を保存</li>
+                <li>R: 範囲開始</li>
+                <li>T: 範囲を保存</li>
+                <li>A: 連続再生ON/OFF</li>
+                <li>M: ミュート切替</li>
+                <li>Esc: ジャンプ/歌詞リールを閉じる</li>
+                <li>C: 自動遷移キャンセル</li>
+              </ul>
+            </article>
+          </div>
         </section>
       </main>
 
-      <footer id="statusBar" class="status-bar">初期化中...</footer>
+      <div id="statusBar" class="status-bar" role="status" aria-live="polite">初期化中...</div>
     </div>
 
     <svg id="subtitleDictGraphEdges" class="subtitle-dict-edges hidden" aria-hidden="true"></svg>

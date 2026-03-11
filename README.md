@@ -138,16 +138,22 @@ Notification note (macOS):
 
 ## Web study features (MVP)
 
+- `Study` / `Ops` view split:
+  - `Study`: player, subtitle reel, review queue, notes, bookmarks
+  - `Ops`: source processing monitor, download/import status, source target manager
 - 9:16 vertical feed with up/down navigation (`↑/↓`, `J/K`, wheel, swipe)
+- always-visible transport controls (`前へ / 再生 / 次へ`) + collapsible detailed actions
 - auto-advance with 3-second countdown and cancel
 - continuous playback toggle (`A`)
 - inter-video volume normalization toggle (`N`)
+- compact playback settings drawer in the top toolbar
 - subtitle overlay + selectable track
 - hover dictionary popup on English subtitle words
 - subtitle bookmarks:
   - save current subtitle (`B`)
   - save playback range (`R` start, `T` save)
 - video favorite toggle (`F`) and per-video memo
+- floating status toast for action/result feedback
 - workspace panels:
   - review queue with `review_hints` join (`one_line_hint_ja/en`)
   - EN/JA mismatch warning from `translation_qa` (`qa_result=check`)

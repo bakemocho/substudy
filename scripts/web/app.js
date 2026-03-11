@@ -104,7 +104,9 @@ const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source"
 const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
 const SOURCE_TARGET_FILTER_STORAGE_KEY = "substudy.source_target_filter";
 const SOURCE_TARGET_TAG_STORAGE_KEY = "substudy.source_target_tag";
+const WORKSPACE_PANEL_STORAGE_KEY = "substudy.workspace_panel";
 const SOURCE_TAG_SCOPE_OPTION_PREFIX = "__tag_scope__:";
+const WORKSPACE_PANEL_MODES = new Set(["study", "ops"]);
 const DICT_COLLAPSE_PARTICLE_WORDS = new Set([
   "back",
   "up",
@@ -221,6 +223,13 @@ const state = {
   countdownTimer: null,
   countdownRemaining: 0,
   autoplayContinuous: localStorage.getItem("substudy.autoplay") !== "off",
+  workspacePanel: (() => {
+    const stored = String(localStorage.getItem(WORKSPACE_PANEL_STORAGE_KEY) || "").trim().toLowerCase();
+    if (WORKSPACE_PANEL_MODES.has(stored)) {
+      return stored;
+    }
+    return "study";
+  })(),
   rangeStartMs: null,
   wheelLockUntil: 0,
   touchStartY: null,
@@ -347,6 +356,10 @@ const state = {
 
 const elements = {
   appShell: document.querySelector(".app-shell"),
+  studyModeBtn: document.getElementById("studyModeBtn"),
+  opsModeBtn: document.getElementById("opsModeBtn"),
+  studyPanel: document.getElementById("studyPanel"),
+  opsPanel: document.getElementById("opsPanel"),
   sourceSelect: document.getElementById("sourceSelect"),
   translationFilterSelect: document.getElementById("translationFilterSelect"),
   translationVariantSelect: document.getElementById("translationVariantSelect"),
@@ -600,26 +613,69 @@ function formatBytesShort(value) {
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
+function applyToolbarToggleState(button, label, active) {
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+  button.textContent = label;
+  button.dataset.stateLabel = active ? "ON" : "OFF";
+  button.setAttribute("aria-pressed", active ? "true" : "false");
+  button.setAttribute("aria-label", `${label} ${active ? "オン" : "オフ"}`);
+}
+
 function updateAutoplayToggle() {
-  elements.autoplayToggle.textContent = `連続再生: ${state.autoplayContinuous ? "ON" : "OFF"}`;
+  applyToolbarToggleState(elements.autoplayToggle, "連続再生", state.autoplayContinuous);
 }
 
 function updateShuffleToggle() {
-  elements.shuffleToggle.textContent = `シャッフル: ${state.shuffleMode ? "ON" : "OFF"}`;
+  applyToolbarToggleState(elements.shuffleToggle, "シャッフル", state.shuffleMode);
 }
 
 function updateNormalizationToggle() {
   if (!elements.normalizationToggle) {
     return;
   }
-  elements.normalizationToggle.textContent = `音量正規化: ${state.normalizationEnabled ? "ON" : "OFF"}`;
+  applyToolbarToggleState(elements.normalizationToggle, "音量正規化", state.normalizationEnabled);
 }
 
 function updateDictHoverLoopToggle() {
   if (!elements.dictHoverLoopToggle) {
     return;
   }
-  elements.dictHoverLoopToggle.textContent = `辞書ループ: ${state.dictHoverLoopEnabled ? "ON" : "OFF"}`;
+  applyToolbarToggleState(elements.dictHoverLoopToggle, "辞書ループ", state.dictHoverLoopEnabled);
+}
+
+function updateWorkspacePanelState() {
+  const isStudy = state.workspacePanel === "study";
+  if (elements.studyPanel) {
+    elements.studyPanel.hidden = !isStudy;
+    elements.studyPanel.classList.toggle("is-active", isStudy);
+  }
+  if (elements.opsPanel) {
+    elements.opsPanel.hidden = isStudy;
+    elements.opsPanel.classList.toggle("is-active", !isStudy);
+  }
+  if (elements.studyModeBtn) {
+    elements.studyModeBtn.setAttribute("aria-selected", isStudy ? "true" : "false");
+  }
+  if (elements.opsModeBtn) {
+    elements.opsModeBtn.setAttribute("aria-selected", isStudy ? "false" : "true");
+  }
+}
+
+function setWorkspacePanel(panel) {
+  const normalized = String(panel || "").trim().toLowerCase();
+  if (!WORKSPACE_PANEL_MODES.has(normalized) || normalized === state.workspacePanel) {
+    return;
+  }
+  state.workspacePanel = normalized;
+  localStorage.setItem(WORKSPACE_PANEL_STORAGE_KEY, normalized);
+  updateWorkspacePanelState();
+  releasePlayerCardSnapLock(false);
+  if (normalized !== "study") {
+    hideSubtitleDictionaryPopup();
+    closeLyricReel({ resumePlayback: false });
+  }
 }
 
 function shuffleIndices(indices) {
@@ -1609,7 +1665,7 @@ function updateMetaDrawerState() {
 function updateControlsDrawerState() {
   elements.mainControls.classList.toggle("collapsed", !state.controlsExpanded);
   elements.controlsToggleBtn.setAttribute("aria-expanded", state.controlsExpanded ? "true" : "false");
-  elements.controlsToggleBtn.textContent = state.controlsExpanded ? "操作を隠す" : "操作を表示";
+  elements.controlsToggleBtn.textContent = state.controlsExpanded ? "詳細操作を隠す" : "詳細操作を表示";
 }
 
 function toggleControlsDrawer(forceValue = null) {
@@ -1649,7 +1705,7 @@ function scheduleControlsToggleIdleFade() {
 function shortenForTab(text) {
   const value = String(text || "").trim();
   if (!value) {
-    return "description";
+    return "説明";
   }
   if (value.length <= 30) {
     return value;
@@ -1829,7 +1885,7 @@ function formatSourceScopeLabel(sourceId = "", sourceTags = []) {
   if (tags.length) {
     return tags.map((tag) => `#${tag}`).join(" + ");
   }
-  return String(sourceId || "").trim() || "All Sources";
+  return String(sourceId || "").trim() || "すべてのソース";
 }
 
 function getTranslationVariantPreferenceForSource(sourceId = "") {
@@ -10877,6 +10933,19 @@ function bindTouchNavigation() {
 function bindEvents() {
   const resetControlsToggleFade = () => scheduleControlsToggleIdleFade();
 
+  if (elements.studyModeBtn) {
+    elements.studyModeBtn.addEventListener("click", () => {
+      setWorkspacePanel("study");
+      resetControlsToggleFade();
+    });
+  }
+  if (elements.opsModeBtn) {
+    elements.opsModeBtn.addEventListener("click", () => {
+      setWorkspacePanel("ops");
+      resetControlsToggleFade();
+    });
+  }
+
   elements.phoneShell.addEventListener("click", (event) => {
     const clickedElement = event.target instanceof Element ? event.target : null;
     if (
@@ -11513,6 +11582,7 @@ function bindEvents() {
 
 async function initialize() {
   mountDictionaryOverlayIntoAppShell();
+  updateWorkspacePanelState();
   updateMetaDrawerState();
   updateControlsDrawerState();
   scheduleControlsToggleIdleFade();
