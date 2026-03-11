@@ -1600,6 +1600,144 @@ textarea {
   letter-spacing: 0.02em;
 }
 
+.workspace-source-trend-panel {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.workspace-source-trend-card {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(143, 164, 235, 0.22);
+  background:
+    radial-gradient(circle at top left, rgba(80, 132, 255, 0.14), transparent 38%),
+    rgba(8, 14, 30, 0.8);
+}
+
+.workspace-source-trend-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.workspace-source-trend-metric {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: 14px;
+  border: 1px solid rgba(143, 164, 235, 0.18);
+  background: rgba(10, 17, 34, 0.72);
+}
+
+.workspace-source-trend-metric-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-source-trend-metric-label {
+  color: #dbe6ff;
+  font-size: 0.74rem;
+}
+
+.workspace-source-trend-metric-delta {
+  color: #b8c9ff;
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.workspace-source-trend-metric-delta.up {
+  color: #7be4b1;
+}
+
+.workspace-source-trend-metric-delta.down {
+  color: #ff9a9a;
+}
+
+.workspace-source-trend-metric-value {
+  color: #f2f6ff;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1.28rem;
+  line-height: 1;
+}
+
+.workspace-source-trend-metric-note {
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.workspace-source-trend-sparkline {
+  width: 100%;
+  height: 62px;
+  overflow: visible;
+}
+
+.workspace-source-delta-section {
+  display: grid;
+  gap: 8px;
+}
+
+.workspace-source-delta-head {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.workspace-source-delta-title-wrap {
+  display: grid;
+  gap: 2px;
+}
+
+.workspace-source-delta-title {
+  color: #f2f6ff;
+  font-size: 0.82rem;
+}
+
+.workspace-source-delta-subtitle {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.workspace-source-trend-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.workspace-source-trend-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #dbe6ff;
+  font-size: 0.68rem;
+}
+
+.workspace-source-trend-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.workspace-source-delta-chart {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.workspace-source-delta-axis-label {
+  fill: rgba(219, 230, 255, 0.68);
+  font-size: 11px;
+  font-family: "IBM Plex Sans", sans-serif;
+}
+
 .workspace-source-chart-wrap {
   display: grid;
   gap: 10px;
@@ -2308,6 +2446,19 @@ textarea {
 
   .ops-layout {
     grid-template-columns: 1fr;
+  }
+
+  .workspace-source-trend-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-source-delta-head {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  .workspace-source-trend-legend {
+    justify-content: flex-start;
   }
 
   .workspace-source-status-body {

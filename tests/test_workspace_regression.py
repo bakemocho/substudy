@@ -636,6 +636,91 @@ data_dir = "{source_root}"
         self.assertEqual(beta["ja_subtitles_missing_playable"], 1)
         self.assertEqual(beta["pipeline_buckets"]["ja_pending"], 1)
 
+    def test_collect_workspace_source_processing_trend_carries_forward_snapshots(self):
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            self.mod.upsert_workspace_source_daily_metrics(
+                connection,
+                {
+                    "sources": [
+                        {
+                            "source_id": "alpha",
+                            "total_videos": 5,
+                            "media_ready": 3,
+                            "played_playable": 1,
+                            "subtitle_tracks_ready_playable": 2,
+                            "ja_subtitles_ready_playable": 1,
+                            "upstream_ja_subtitles_ready_playable": 1,
+                            "complete_count": 1,
+                        },
+                        {
+                            "source_id": "beta",
+                            "total_videos": 2,
+                            "media_ready": 1,
+                            "played_playable": 0,
+                            "subtitle_tracks_ready_playable": 0,
+                            "ja_subtitles_ready_playable": 0,
+                            "upstream_ja_subtitles_ready_playable": 0,
+                            "complete_count": 0,
+                        },
+                    ],
+                },
+                snapshot_at=dt.datetime(2026, 3, 10, 1, 0, tzinfo=dt.timezone.utc),
+            )
+            self.mod.upsert_workspace_source_daily_metrics(
+                connection,
+                {
+                    "sources": [
+                        {
+                            "source_id": "alpha",
+                            "total_videos": 6,
+                            "media_ready": 4,
+                            "played_playable": 2,
+                            "subtitle_tracks_ready_playable": 3,
+                            "ja_subtitles_ready_playable": 2,
+                            "upstream_ja_subtitles_ready_playable": 1,
+                            "complete_count": 2,
+                        },
+                        {
+                            "source_id": "beta",
+                            "total_videos": 3,
+                            "media_ready": 2,
+                            "played_playable": 1,
+                            "subtitle_tracks_ready_playable": 1,
+                            "ja_subtitles_ready_playable": 1,
+                            "upstream_ja_subtitles_ready_playable": 0,
+                            "complete_count": 1,
+                        },
+                    ],
+                },
+                snapshot_at=dt.datetime(2026, 3, 12, 1, 0, tzinfo=dt.timezone.utc),
+            )
+            connection.commit()
+
+            trend = self.mod.collect_workspace_source_processing_trend(
+                connection=connection,
+                source_ids=[],
+                window_days=7,
+                end_date=dt.date(2026, 3, 12),
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(trend["window_days"], 7)
+        self.assertEqual(trend["snapshot_days"], 2)
+        self.assertEqual(len(trend["points"]), 7)
+        points_by_date = {point["date"]: point for point in trend["points"]}
+        self.assertEqual(points_by_date["2026-03-10"]["media_ready"], 4)
+        self.assertEqual(points_by_date["2026-03-11"]["media_ready"], 4)
+        self.assertEqual(points_by_date["2026-03-11"]["delta_media_ready"], 0)
+        self.assertEqual(points_by_date["2026-03-12"]["media_ready"], 6)
+        self.assertEqual(points_by_date["2026-03-12"]["delta_media_ready"], 2)
+        self.assertEqual(points_by_date["2026-03-12"]["ja_subtitles_ready_playable"], 3)
+        self.assertEqual(points_by_date["2026-03-12"]["played_playable"], 3)
+        self.assertEqual(trend["latest"]["upstream_ja_subtitles_ready_playable"], 1)
+        self.assertEqual(trend["net_change"]["media_ready"], 2)
+
     def test_artifact_open_and_download_headers(self):
         artifact_path = self.workspace_root / "exports" / "llm" / "sample.jsonl"
         artifact_body = '{"hello":"world"}\n'
@@ -1375,6 +1460,12 @@ tags = ["English", "Funny"]
         self.assertEqual(sources[0]["manual_tags"], ["English", "Funny"])
         self.assertEqual(sources[0]["auto_tags"], ["Claude字幕50%+"])
         self.assertEqual(sources[0]["tags"], ["English", "Funny", "Claude字幕50%+"])
+        trend = payload.get("source_processing", {}).get("daily_trend", {})
+        points = trend.get("points", [])
+        self.assertEqual(trend.get("window_days"), 30)
+        self.assertTrue(points)
+        self.assertEqual(points[-1]["media_ready"], 1)
+        self.assertEqual(points[-1]["ja_subtitles_ready_playable"], 1)
 
     def test_resolve_impersonate_flags_auto_prefers_chrome(self):
         config_dir = self.workspace_root / "config"

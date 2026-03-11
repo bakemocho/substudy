@@ -4726,6 +4726,20 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS workspace_source_daily_metrics (
+            snapshot_date TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            total_videos INTEGER NOT NULL DEFAULT 0,
+            media_ready INTEGER NOT NULL DEFAULT 0,
+            played_playable INTEGER NOT NULL DEFAULT 0,
+            subtitle_tracks_ready_playable INTEGER NOT NULL DEFAULT 0,
+            ja_subtitles_ready_playable INTEGER NOT NULL DEFAULT 0,
+            upstream_ja_subtitles_ready_playable INTEGER NOT NULL DEFAULT 0,
+            complete_count INTEGER NOT NULL DEFAULT 0,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (snapshot_date, source_id)
+        );
+
         CREATE TABLE IF NOT EXISTS subtitle_bookmarks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_id TEXT NOT NULL,
@@ -4781,6 +4795,8 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_not_interested(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_playback_stats_last_played
             ON video_playback_stats(last_played_at DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_workspace_source_daily_metrics_date
+            ON workspace_source_daily_metrics(snapshot_date DESC, source_id);
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
             ON subtitle_bookmarks(source_id, video_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
@@ -13620,6 +13636,241 @@ def collect_workspace_source_processing_summary(
     }
 
 
+def upsert_workspace_source_daily_metrics(
+    connection: sqlite3.Connection,
+    source_processing: dict[str, Any],
+    snapshot_at: dt.datetime | None = None,
+) -> str:
+    snapshot_at_value = (snapshot_at or dt.datetime.now(dt.timezone.utc)).astimezone(
+        dt.timezone.utc
+    )
+    snapshot_date = snapshot_at_value.date().isoformat()
+    recorded_at = snapshot_at_value.replace(microsecond=0).isoformat()
+    source_rows = cast(list[dict[str, Any]], source_processing.get("sources") or [])
+
+    for summary in source_rows:
+        source_id = str(summary.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        connection.execute(
+            """
+            INSERT INTO workspace_source_daily_metrics (
+                snapshot_date,
+                source_id,
+                total_videos,
+                media_ready,
+                played_playable,
+                subtitle_tracks_ready_playable,
+                ja_subtitles_ready_playable,
+                upstream_ja_subtitles_ready_playable,
+                complete_count,
+                recorded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date, source_id) DO UPDATE SET
+                total_videos = excluded.total_videos,
+                media_ready = excluded.media_ready,
+                played_playable = excluded.played_playable,
+                subtitle_tracks_ready_playable = excluded.subtitle_tracks_ready_playable,
+                ja_subtitles_ready_playable = excluded.ja_subtitles_ready_playable,
+                upstream_ja_subtitles_ready_playable = excluded.upstream_ja_subtitles_ready_playable,
+                complete_count = excluded.complete_count,
+                recorded_at = excluded.recorded_at
+            """,
+            (
+                snapshot_date,
+                source_id,
+                int(summary.get("total_videos", 0) or 0),
+                int(summary.get("media_ready", 0) or 0),
+                int(summary.get("played_playable", 0) or 0),
+                int(summary.get("subtitle_tracks_ready_playable", 0) or 0),
+                int(summary.get("ja_subtitles_ready_playable", 0) or 0),
+                int(summary.get("upstream_ja_subtitles_ready_playable", 0) or 0),
+                int(summary.get("complete_count", 0) or 0),
+                recorded_at,
+            ),
+        )
+    return snapshot_date
+
+
+def collect_workspace_source_processing_trend(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    window_days: int,
+    end_date: dt.date | None = None,
+) -> dict[str, Any]:
+    safe_window_days = max(7, min(180, int(window_days or 30)))
+    end_date_value = end_date or dt.datetime.now(dt.timezone.utc).date()
+    start_date_value = end_date_value - dt.timedelta(days=safe_window_days - 1)
+    requested_source_ids = sorted(
+        {
+            str(source_id).strip()
+            for source_id in source_ids
+            if str(source_id).strip()
+        }
+    )
+
+    params: list[Any] = [end_date_value.isoformat()]
+    source_filter_sql = ""
+    if requested_source_ids:
+        placeholders = ",".join("?" for _ in requested_source_ids)
+        source_filter_sql = f"AND source_id IN ({placeholders})"
+        params.extend(requested_source_ids)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            snapshot_date,
+            source_id,
+            total_videos,
+            media_ready,
+            played_playable,
+            subtitle_tracks_ready_playable,
+            ja_subtitles_ready_playable,
+            upstream_ja_subtitles_ready_playable,
+            complete_count
+        FROM workspace_source_daily_metrics
+        WHERE snapshot_date <= ?
+          {source_filter_sql}
+        ORDER BY snapshot_date ASC, source_id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    source_ids_in_rows: set[str] = set()
+    rows_by_date: dict[str, list[sqlite3.Row]] = {}
+    snapshot_days: set[str] = set()
+    for row in rows:
+        snapshot_date = str(row["snapshot_date"] or "").strip()
+        source_id = str(row["source_id"] or "").strip()
+        if not snapshot_date or not source_id:
+            continue
+        source_ids_in_rows.add(source_id)
+        rows_by_date.setdefault(snapshot_date, []).append(row)
+        if start_date_value.isoformat() <= snapshot_date <= end_date_value.isoformat():
+            snapshot_days.add(snapshot_date)
+
+    tracked_source_ids = requested_source_ids or sorted(source_ids_in_rows)
+    if not tracked_source_ids:
+        return {
+            "window_days": safe_window_days,
+            "start_date": start_date_value.isoformat(),
+            "end_date": end_date_value.isoformat(),
+            "snapshot_days": 0,
+            "points": [],
+            "latest": {},
+            "net_change": {},
+        }
+
+    metric_keys = (
+        "total_videos",
+        "media_ready",
+        "played_playable",
+        "subtitle_tracks_ready_playable",
+        "ja_subtitles_ready_playable",
+        "upstream_ja_subtitles_ready_playable",
+        "complete_count",
+    )
+    current_by_source: dict[str, dict[str, int]] = {
+        source_id: {key: 0 for key in metric_keys}
+        for source_id in tracked_source_ids
+    }
+    observed_source_ids: set[str] = set()
+    start_date_iso = start_date_value.isoformat()
+    for row in rows:
+        snapshot_date = str(row["snapshot_date"] or "").strip()
+        if not snapshot_date or snapshot_date >= start_date_iso:
+            continue
+        source_id = str(row["source_id"] or "").strip()
+        if source_id not in current_by_source:
+            continue
+        current_by_source[source_id] = {
+            "total_videos": max(0, int(row["total_videos"] or 0)),
+            "media_ready": max(0, int(row["media_ready"] or 0)),
+            "played_playable": max(0, int(row["played_playable"] or 0)),
+            "subtitle_tracks_ready_playable": max(
+                0, int(row["subtitle_tracks_ready_playable"] or 0)
+            ),
+            "ja_subtitles_ready_playable": max(
+                0, int(row["ja_subtitles_ready_playable"] or 0)
+            ),
+            "upstream_ja_subtitles_ready_playable": max(
+                0, int(row["upstream_ja_subtitles_ready_playable"] or 0)
+            ),
+            "complete_count": max(0, int(row["complete_count"] or 0)),
+        }
+        observed_source_ids.add(source_id)
+
+    points: list[dict[str, Any]] = []
+    previous_totals: dict[str, int] | None = None
+
+    for day_offset in range(safe_window_days):
+        current_date = start_date_value + dt.timedelta(days=day_offset)
+        current_date_iso = current_date.isoformat()
+        for row in rows_by_date.get(current_date_iso, []):
+            source_id = str(row["source_id"] or "").strip()
+            if source_id not in current_by_source:
+                continue
+            current_by_source[source_id] = {
+                "total_videos": max(0, int(row["total_videos"] or 0)),
+                "media_ready": max(0, int(row["media_ready"] or 0)),
+                "played_playable": max(0, int(row["played_playable"] or 0)),
+                "subtitle_tracks_ready_playable": max(
+                    0, int(row["subtitle_tracks_ready_playable"] or 0)
+                ),
+                "ja_subtitles_ready_playable": max(
+                    0, int(row["ja_subtitles_ready_playable"] or 0)
+                ),
+                "upstream_ja_subtitles_ready_playable": max(
+                    0, int(row["upstream_ja_subtitles_ready_playable"] or 0)
+                ),
+                "complete_count": max(0, int(row["complete_count"] or 0)),
+            }
+            observed_source_ids.add(source_id)
+
+        totals = {key: 0 for key in metric_keys}
+        for counts in current_by_source.values():
+            for key in metric_keys:
+                totals[key] += int(counts.get(key, 0))
+
+        point: dict[str, Any] = {
+            "date": current_date_iso,
+            "has_snapshot": current_date_iso in snapshot_days,
+            "has_observation": bool(observed_source_ids),
+        }
+        for key in metric_keys:
+            point[key] = int(totals[key])
+            delta_key = f"delta_{key}"
+            if previous_totals is None:
+                point[delta_key] = 0
+            else:
+                point[delta_key] = int(totals[key]) - int(previous_totals.get(key, 0))
+        points.append(point)
+        previous_totals = totals
+
+    latest_point = dict(points[-1]) if points else {}
+    first_point = dict(
+        next((point for point in points if bool(point.get("has_observation"))), points[0] if points else {})
+    )
+    net_change = {
+        key: int(latest_point.get(key, 0) or 0) - int(first_point.get(key, 0) or 0)
+        for key in metric_keys
+    }
+
+    return {
+        "window_days": safe_window_days,
+        "start_date": start_date_value.isoformat(),
+        "end_date": end_date_value.isoformat(),
+        "snapshot_days": len(snapshot_days),
+        "points": points,
+        "latest": {
+            key: int(latest_point.get(key, 0) or 0)
+            for key in metric_keys
+        },
+        "net_change": net_change,
+    }
+
+
 def collect_workspace_download_monitor(
     connection: sqlite3.Connection,
     source_ids: list[str],
@@ -15115,6 +15366,12 @@ def build_web_handler(
                 minimum=1,
                 maximum=240,
             )
+            trend_days = clamp_int(
+                query.get("trend_days", [None])[0],
+                default=30,
+                minimum=7,
+                maximum=180,
+            )
 
             effective_scope = self._resolve_effective_source_scope()
             source_scope: list[str] = []
@@ -15140,6 +15397,15 @@ def build_web_handler(
                 source_processing = collect_workspace_source_processing_summary(
                     connection=connection,
                     source_ids=source_scope,
+                )
+                upsert_workspace_source_daily_metrics(
+                    connection=connection,
+                    source_processing=source_processing,
+                )
+                source_processing["daily_trend"] = collect_workspace_source_processing_trend(
+                    connection=connection,
+                    source_ids=source_scope,
+                    window_days=trend_days,
                 )
                 import_monitor = collect_workspace_import_monitor(
                     connection=connection,

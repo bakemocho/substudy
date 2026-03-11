@@ -33,6 +33,7 @@ const WORKSPACE_IMPORT_RUN_LIMIT = 6;
 const WORKSPACE_PENDING_LIMIT = 20;
 const WORKSPACE_ARTIFACT_LIMIT = 24;
 const WORKSPACE_SINCE_HOURS = 72;
+const WORKSPACE_SOURCE_TREND_DAYS = 30;
 const PLAYER_CARD_SNAP_THRESHOLD_PX = 22;
 const PLAYER_CARD_SNAP_RELEASE_DELTA = 180;
 const PLAYER_CARD_SNAP_RELEASE_COOLDOWN_MS = 520;
@@ -444,6 +445,8 @@ const elements = {
   workspaceSummary: document.getElementById("workspaceSummary"),
   workspaceReviewList: document.getElementById("workspaceReviewList"),
   workspaceMissingList: document.getElementById("workspaceMissingList"),
+  workspaceSourceTrendSummary: document.getElementById("workspaceSourceTrendSummary"),
+  workspaceSourceTrend: document.getElementById("workspaceSourceTrend"),
   workspaceSourceProcessingSummary: document.getElementById("workspaceSourceProcessingSummary"),
   workspaceSourceProcessingList: document.getElementById("workspaceSourceProcessingList"),
   workspaceDownloadSummary: document.getElementById("workspaceDownloadSummary"),
@@ -490,6 +493,43 @@ const WORKSPACE_SOURCE_PIPELINE_BUCKETS = [
   { key: "loudness_pending", label: "loudness待ち", color: "#ffd36c" },
   { key: "source_text_pending", label: "英字幕/ASR待ち", color: "#ff9a73" },
   { key: "meta_media_pending", label: "meta/media待ち", color: "#ff7e96" },
+];
+
+const WORKSPACE_SOURCE_TREND_METRICS = [
+  {
+    key: "media_ready",
+    deltaKey: "delta_media_ready",
+    label: "再生可能",
+    note: "mediaあり",
+    color: "#7da3ff",
+  },
+  {
+    key: "played_playable",
+    deltaKey: "delta_played_playable",
+    label: "再生済み",
+    note: "再生可能のうち",
+    color: "#4fd3c7",
+  },
+  {
+    key: "ja_subtitles_ready_playable",
+    deltaKey: "delta_ja_subtitles_ready_playable",
+    label: "学習可能",
+    note: "JA字幕あり",
+    color: "#69d8a7",
+  },
+  {
+    key: "upstream_ja_subtitles_ready_playable",
+    deltaKey: "delta_upstream_ja_subtitles_ready_playable",
+    label: "学習可能(upstream)",
+    note: "upstream JA",
+    color: "#f7c967",
+  },
+];
+
+const WORKSPACE_SOURCE_TREND_BAR_METRICS = [
+  WORKSPACE_SOURCE_TREND_METRICS[0],
+  WORKSPACE_SOURCE_TREND_METRICS[2],
+  WORKSPACE_SOURCE_TREND_METRICS[3],
 ];
 
 function mountDictionaryOverlayIntoAppShell() {
@@ -9597,6 +9637,255 @@ function formatWorkspaceRatio(value, total) {
   return `${Math.round(percent)}%`;
 }
 
+function formatWorkspaceTrendDate(dateString) {
+  const value = String(dateString || "").trim();
+  if (!value) {
+    return "";
+  }
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return value;
+  }
+  return `${Number(match[2])}/${Number(match[3])}`;
+}
+
+function formatWorkspaceSignedCount(value) {
+  const safeValue = Number(value || 0);
+  if (!Number.isFinite(safeValue) || safeValue === 0) {
+    return "+0";
+  }
+  const rounded = Math.round(safeValue);
+  return rounded > 0 ? `+${rounded}` : String(rounded);
+}
+
+function createSvgNode(tagName, attributes = {}) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tagName);
+  for (const [key, value] of Object.entries(attributes)) {
+    node.setAttribute(key, String(value));
+  }
+  return node;
+}
+
+function buildWorkspaceSparklineSvg(points, metricKey, color) {
+  const svg = createSvgNode("svg", {
+    viewBox: "0 0 180 62",
+    class: "workspace-source-trend-sparkline",
+    "aria-hidden": "true",
+  });
+  if (!Array.isArray(points) || points.length <= 0) {
+    return svg;
+  }
+
+  const width = 180;
+  const height = 62;
+  const insetX = 4;
+  const insetY = 6;
+  const innerWidth = width - insetX * 2;
+  const innerHeight = height - insetY * 2;
+  const values = points.map((point) => Math.max(0, Number(point?.[metricKey] || 0)));
+  const maxValue = Math.max(...values, 1);
+  const stepX = points.length > 1 ? innerWidth / (points.length - 1) : 0;
+  const coords = values.map((value, index) => {
+    const x = insetX + stepX * index;
+    const normalized = maxValue > 0 ? value / maxValue : 0;
+    const y = insetY + innerHeight - (normalized * innerHeight);
+    return [x, y];
+  });
+  const linePath = coords
+    .map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`)
+    .join(" ");
+  const areaPath = `${linePath} L ${coords[coords.length - 1][0].toFixed(2)} ${(height - insetY).toFixed(2)} L ${coords[0][0].toFixed(2)} ${(height - insetY).toFixed(2)} Z`;
+
+  svg.appendChild(
+    createSvgNode("path", {
+      d: areaPath,
+      fill: color,
+      "fill-opacity": "0.14",
+      stroke: "none",
+    })
+  );
+  svg.appendChild(
+    createSvgNode("path", {
+      d: linePath,
+      fill: "none",
+      stroke: color,
+      "stroke-width": "2.2",
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+    })
+  );
+  const [lastX, lastY] = coords[coords.length - 1];
+  svg.appendChild(
+    createSvgNode("circle", {
+      cx: lastX.toFixed(2),
+      cy: lastY.toFixed(2),
+      r: "3.2",
+      fill: color,
+    })
+  );
+  return svg;
+}
+
+function buildWorkspaceDeltaBarChartSvg(points, metricDefs) {
+  const svg = createSvgNode("svg", {
+    viewBox: "0 0 640 188",
+    class: "workspace-source-delta-chart",
+    "aria-hidden": "true",
+  });
+  if (!Array.isArray(points) || points.length <= 0 || !Array.isArray(metricDefs) || metricDefs.length <= 0) {
+    return svg;
+  }
+
+  const width = 640;
+  const height = 188;
+  const insetTop = 12;
+  const insetRight = 10;
+  const insetBottom = 24;
+  const insetLeft = 10;
+  const innerWidth = width - insetLeft - insetRight;
+  const innerHeight = height - insetTop - insetBottom;
+  const labelStep = Math.max(1, Math.floor(points.length / 5));
+  const values = [];
+  for (const point of points) {
+    for (const metric of metricDefs) {
+      values.push(Number(point?.[metric.deltaKey] || 0));
+    }
+  }
+  const maxPositive = Math.max(0, ...values);
+  const maxNegative = Math.max(0, ...values.map((value) => (value < 0 ? Math.abs(value) : 0)));
+  const totalRange = Math.max(1, maxPositive + maxNegative);
+  const zeroY = insetTop + (maxPositive <= 0 ? 0 : (maxPositive / totalRange) * innerHeight);
+  const groupWidth = points.length > 0 ? innerWidth / points.length : innerWidth;
+  const seriesCount = metricDefs.length;
+  const usableGroupWidth = Math.max(6, groupWidth - 2);
+  const barGap = 1;
+  const barWidth = Math.max(
+    1.6,
+    Math.min(7.5, (usableGroupWidth - barGap * Math.max(0, seriesCount - 1)) / seriesCount)
+  );
+  const occupiedWidth = barWidth * seriesCount + barGap * Math.max(0, seriesCount - 1);
+
+  const background = createSvgNode("rect", {
+    x: insetLeft,
+    y: insetTop,
+    width: innerWidth,
+    height: innerHeight,
+    rx: "12",
+    fill: "rgba(8, 14, 30, 0.5)",
+  });
+  svg.appendChild(background);
+  svg.appendChild(
+    createSvgNode("line", {
+      x1: insetLeft,
+      y1: zeroY.toFixed(2),
+      x2: width - insetRight,
+      y2: zeroY.toFixed(2),
+      stroke: "rgba(219, 230, 255, 0.24)",
+      "stroke-width": "1",
+    })
+  );
+
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const groupX = insetLeft + groupWidth * index + Math.max(0, (groupWidth - occupiedWidth) / 2);
+    for (let metricIndex = 0; metricIndex < metricDefs.length; metricIndex += 1) {
+      const metric = metricDefs[metricIndex];
+      const value = Number(point?.[metric.deltaKey] || 0);
+      if (!Number.isFinite(value) || value === 0) {
+        continue;
+      }
+      const heightRatio = Math.abs(value) / totalRange;
+      const barHeight = Math.max(1.5, heightRatio * innerHeight);
+      const x = groupX + metricIndex * (barWidth + barGap);
+      const y = value >= 0 ? zeroY - barHeight : zeroY;
+      svg.appendChild(
+        createSvgNode("rect", {
+          x: x.toFixed(2),
+          y: y.toFixed(2),
+          width: barWidth.toFixed(2),
+          height: barHeight.toFixed(2),
+          rx: "1.5",
+          fill: metric.color,
+          "fill-opacity": value >= 0 ? "0.88" : "0.42",
+        })
+      );
+    }
+
+    if (index === 0 || index === points.length - 1 || index % labelStep === 0) {
+      svg.appendChild(
+        createSvgNode("text", {
+          x: (insetLeft + groupWidth * index + groupWidth / 2).toFixed(2),
+          y: String(height - 7),
+          "text-anchor": "middle",
+          class: "workspace-source-delta-axis-label",
+        })
+      ).textContent = formatWorkspaceTrendDate(point?.date);
+    }
+  }
+
+  return svg;
+}
+
+function createWorkspaceTrendLegendItem(label, color) {
+  const item = document.createElement("span");
+  item.className = "workspace-source-trend-legend-item";
+
+  const swatch = document.createElement("span");
+  swatch.className = "workspace-source-trend-legend-swatch";
+  swatch.style.background = color;
+
+  const text = document.createElement("span");
+  text.textContent = label;
+
+  item.appendChild(swatch);
+  item.appendChild(text);
+  return item;
+}
+
+function buildWorkspaceTrendMetricCard(metric, trend) {
+  const points = Array.isArray(trend?.points) ? trend.points : [];
+  const latest = trend?.latest || {};
+  const netChange = trend?.net_change || {};
+  const currentValue = Math.max(0, Number(latest?.[metric.key] || 0));
+  const changeValue = Number(netChange?.[metric.key] || 0);
+
+  const card = document.createElement("article");
+  card.className = "workspace-source-trend-metric";
+
+  const head = document.createElement("div");
+  head.className = "workspace-source-trend-metric-head";
+
+  const label = document.createElement("span");
+  label.className = "workspace-source-trend-metric-label";
+  label.textContent = metric.label;
+
+  const delta = document.createElement("span");
+  delta.className = "workspace-source-trend-metric-delta";
+  if (changeValue < 0) {
+    delta.classList.add("down");
+  } else if (changeValue > 0) {
+    delta.classList.add("up");
+  }
+  delta.textContent = `${formatWorkspaceSignedCount(changeValue)} / ${Number(trend?.window_days || WORKSPACE_SOURCE_TREND_DAYS)}d`;
+
+  head.appendChild(label);
+  head.appendChild(delta);
+
+  const value = document.createElement("strong");
+  value.className = "workspace-source-trend-metric-value";
+  value.textContent = String(currentValue);
+
+  const note = document.createElement("span");
+  note.className = "workspace-source-trend-metric-note";
+  note.textContent = metric.note;
+
+  card.appendChild(head);
+  card.appendChild(value);
+  card.appendChild(note);
+  card.appendChild(buildWorkspaceSparklineSvg(points, metric.key, metric.color));
+  return card;
+}
+
 function createWorkspaceSourceChartPill(label, value) {
   const pill = document.createElement("span");
   pill.className = "workspace-source-chart-pill";
@@ -9844,6 +10133,80 @@ function buildWorkspaceSourceSummaryCard(summary) {
   }
   card.appendChild(body);
   return card;
+}
+
+function renderWorkspaceSourceTrend() {
+  if (elements.workspaceSourceTrend) {
+    elements.workspaceSourceTrend.textContent = "";
+  }
+
+  const trend = state.workspaceSourceProcessing?.daily_trend || null;
+  const points = Array.isArray(trend?.points) ? trend.points : [];
+  const summaryNode = elements.workspaceSourceTrendSummary;
+  const panelNode = elements.workspaceSourceTrend;
+  if (!summaryNode || !panelNode) {
+    return;
+  }
+
+  if (points.length <= 0) {
+    summaryNode.textContent = "日次スナップショットがまだありません。";
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "Ops を開いた日から 1 日 1 回の推移を記録します。";
+    panelNode.appendChild(empty);
+    return;
+  }
+
+  const latest = trend?.latest || {};
+  const netChange = trend?.net_change || {};
+  const snapshotDays = Math.max(0, Number(trend?.snapshot_days || 0));
+  const windowDays = Math.max(1, Number(trend?.window_days || points.length || WORKSPACE_SOURCE_TREND_DAYS));
+  const endDate = String(trend?.end_date || points[points.length - 1]?.date || "");
+  summaryNode.textContent = `${windowDays}日推移 • 記録済み ${snapshotDays}/${windowDays} 日 • 再生可能 ${formatWorkspaceSignedCount(netChange?.media_ready)} • 学習可能 ${formatWorkspaceSignedCount(netChange?.ja_subtitles_ready_playable)} • upstream JA ${formatWorkspaceSignedCount(netChange?.upstream_ja_subtitles_ready_playable)} • 再生済み ${formatWorkspaceSignedCount(netChange?.played_playable)} • 最新 ${formatWorkspaceTrendDate(endDate)}`;
+
+  const panel = document.createElement("div");
+  panel.className = "workspace-source-trend-card";
+
+  const metricsGrid = document.createElement("div");
+  metricsGrid.className = "workspace-source-trend-metrics";
+  for (const metric of WORKSPACE_SOURCE_TREND_METRICS) {
+    metricsGrid.appendChild(buildWorkspaceTrendMetricCard(metric, trend));
+  }
+
+  const deltaSection = document.createElement("div");
+  deltaSection.className = "workspace-source-delta-section";
+
+  const deltaHead = document.createElement("div");
+  deltaHead.className = "workspace-source-delta-head";
+
+  const deltaTitleWrap = document.createElement("div");
+  deltaTitleWrap.className = "workspace-source-delta-title-wrap";
+
+  const deltaTitle = document.createElement("strong");
+  deltaTitle.className = "workspace-source-delta-title";
+  deltaTitle.textContent = "日次純増";
+
+  const deltaSubtitle = document.createElement("span");
+  deltaSubtitle.className = "workspace-source-delta-subtitle";
+  deltaSubtitle.textContent = `終点: 再生可能 ${Math.max(0, Number(latest?.media_ready || 0))} / 学習可能 ${Math.max(0, Number(latest?.ja_subtitles_ready_playable || 0))} / upstream JA ${Math.max(0, Number(latest?.upstream_ja_subtitles_ready_playable || 0))}`;
+
+  deltaTitleWrap.appendChild(deltaTitle);
+  deltaTitleWrap.appendChild(deltaSubtitle);
+
+  const legend = document.createElement("div");
+  legend.className = "workspace-source-trend-legend";
+  for (const metric of WORKSPACE_SOURCE_TREND_BAR_METRICS) {
+    legend.appendChild(createWorkspaceTrendLegendItem(metric.label, metric.color));
+  }
+
+  deltaHead.appendChild(deltaTitleWrap);
+  deltaHead.appendChild(legend);
+  deltaSection.appendChild(deltaHead);
+  deltaSection.appendChild(buildWorkspaceDeltaBarChartSvg(points, WORKSPACE_SOURCE_TREND_BAR_METRICS));
+
+  panel.appendChild(metricsGrid);
+  panel.appendChild(deltaSection);
+  panelNode.appendChild(panel);
 }
 
 function renderWorkspaceSourceProcessing() {
@@ -10519,6 +10882,7 @@ function renderWorkspacePanels() {
     (item) => renderWorkspaceMissingItem(item),
     "未登録語はありません。"
   );
+  renderWorkspaceSourceTrend();
   renderWorkspaceSourceProcessing();
   renderWorkspaceDownloadRuns();
   renderWorkspacePendingFailures();
@@ -10547,6 +10911,7 @@ async function loadWorkspaceData(options = {}) {
     pending_limit: String(WORKSPACE_PENDING_LIMIT),
     artifact_limit: String(WORKSPACE_ARTIFACT_LIMIT),
     since_hours: String(WORKSPACE_SINCE_HOURS),
+    trend_days: String(WORKSPACE_SOURCE_TREND_DAYS),
   });
   const sourceId = state.feedSourceId;
   if (sourceId) {
