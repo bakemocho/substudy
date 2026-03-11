@@ -486,7 +486,7 @@ const elements = {
 
 const WORKSPACE_SOURCE_PIPELINE_BUCKETS = [
   { key: "complete", label: "完了", color: "#69d8a7" },
-  { key: "ja_pending", label: "JA/Claude待ち", color: "#83aaff" },
+  { key: "ja_pending", label: "JA字幕待ち", color: "#83aaff" },
   { key: "loudness_pending", label: "loudness待ち", color: "#ffd36c" },
   { key: "source_text_pending", label: "英字幕/ASR待ち", color: "#ff9a73" },
   { key: "meta_media_pending", label: "meta/media待ち", color: "#ff7e96" },
@@ -9584,6 +9584,76 @@ function buildWorkspaceSourceChartBackground(segments) {
   return `conic-gradient(${stops.join(", ")})`;
 }
 
+function formatWorkspaceRatio(value, total) {
+  const safeValue = Math.max(0, Number(value || 0));
+  const safeTotal = Math.max(0, Number(total || 0));
+  if (safeTotal <= 0) {
+    return "0%";
+  }
+  const percent = Math.max(0, Math.min(100, (safeValue / safeTotal) * 100));
+  if (percent > 0 && percent < 10) {
+    return `${percent.toFixed(1)}%`;
+  }
+  return `${Math.round(percent)}%`;
+}
+
+function createWorkspaceSourceChartPill(label, value) {
+  const pill = document.createElement("span");
+  pill.className = "workspace-source-chart-pill";
+
+  const pillLabel = document.createElement("span");
+  pillLabel.className = "workspace-source-chart-pill-label";
+  pillLabel.textContent = label;
+
+  const pillValue = document.createElement("strong");
+  pillValue.className = "workspace-source-chart-pill-value";
+  pillValue.textContent = String(value ?? "0");
+
+  pill.appendChild(pillLabel);
+  pill.appendChild(pillValue);
+  return pill;
+}
+
+function createWorkspaceSourceCoverageRow(label, count, total, accentClass = "") {
+  const row = document.createElement("div");
+  row.className = "workspace-source-coverage-row";
+  if (accentClass) {
+    row.classList.add(accentClass);
+  }
+
+  const head = document.createElement("div");
+  head.className = "workspace-source-coverage-head";
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "workspace-source-coverage-label";
+  labelNode.textContent = label;
+
+  const valueNode = document.createElement("span");
+  valueNode.className = "workspace-source-coverage-value";
+  valueNode.textContent = `${formatWorkspaceRatio(count, total)} • ${Math.max(0, Number(count || 0))}/${Math.max(0, Number(total || 0))}`;
+
+  head.appendChild(labelNode);
+  head.appendChild(valueNode);
+
+  const track = document.createElement("div");
+  track.className = "workspace-source-coverage-track";
+
+  const fill = document.createElement("span");
+  fill.className = "workspace-source-coverage-fill";
+  if (accentClass) {
+    fill.classList.add(accentClass);
+  }
+  const safeTotal = Math.max(0, Number(total || 0));
+  const safeCount = Math.max(0, Number(count || 0));
+  const width = safeTotal > 0 ? Math.max(0, Math.min(100, (safeCount / safeTotal) * 100)) : 0;
+  fill.style.width = `${width}%`;
+
+  track.appendChild(fill);
+  row.appendChild(head);
+  row.appendChild(track);
+  return row;
+}
+
 function createWorkspaceSourceMetric(label, value, accentClass = "") {
   const metric = document.createElement("div");
   metric.className = "workspace-source-metric";
@@ -9614,9 +9684,13 @@ function buildWorkspaceSourceSummaryCard(summary) {
   card.className = "workspace-source-status-card";
   const trackedTotal = Number(summary?.total_videos || 0);
   const playableTotal = Number(summary?.media_ready || 0);
+  const playedPlayable = Number(summary?.played_playable || 0);
+  const subtitlePlayableReady = Number(summary?.subtitle_tracks_ready_playable || 0);
+  const completionBase = playableTotal > 0 ? playableTotal : trackedTotal;
   const completeCount = Number(summary?.complete_count || 0);
   const pendingTotal = Number(summary?.pending_total || 0);
-  const claudePlayableReady = Number(summary?.ja_subtitles_ready_playable || 0);
+  const jaPlayableReady = Number(summary?.ja_subtitles_ready_playable || 0);
+  const upstreamJaPlayableReady = Number(summary?.upstream_ja_subtitles_ready_playable || 0);
   const englishMissing = Number(summary?.english_subtitles_missing || 0);
   const loudnessPending = Number(summary?.loudness_pending || 0);
   const metaMissing = Number(summary?.meta_missing || 0);
@@ -9632,9 +9706,7 @@ function buildWorkspaceSourceSummaryCard(summary) {
 
   const badge = document.createElement("span");
   badge.className = "workspace-badge";
-  badge.textContent = playableTotal > 0
-    ? `完了 ${completeCount}/${playableTotal} playable`
-    : `完了 ${completeCount}/${trackedTotal}`;
+  badge.textContent = `完了 ${formatWorkspaceRatio(completeCount, completionBase)}`;
 
   head.appendChild(title);
   head.appendChild(badge);
@@ -9657,7 +9729,7 @@ function buildWorkspaceSourceSummaryCard(summary) {
   chart.setAttribute(
     "aria-label",
     segments
-      .map((segment) => `${segment.label}:${segment.value}`)
+      .map((segment) => `${segment.label}:${segment.value} (${formatWorkspaceRatio(segment.value, trackedTotal)})`)
       .join(" / ")
   );
 
@@ -9666,24 +9738,50 @@ function buildWorkspaceSourceSummaryCard(summary) {
 
   const chartValue = document.createElement("span");
   chartValue.className = "workspace-source-chart-value";
-  chartValue.textContent = String(trackedTotal);
+  chartValue.textContent = formatWorkspaceRatio(completeCount, completionBase);
+
+  const chartSecondary = document.createElement("span");
+  chartSecondary.className = "workspace-source-chart-secondary";
+  chartSecondary.textContent = `${completeCount}/${completionBase}`;
 
   const chartLabel = document.createElement("span");
   chartLabel.className = "workspace-source-chart-label";
-  chartLabel.textContent = "tracked";
+  chartLabel.textContent = "complete";
 
   chartHole.appendChild(chartValue);
+  chartHole.appendChild(chartSecondary);
   chartHole.appendChild(chartLabel);
   chart.appendChild(chartHole);
 
-  const chartMeta = document.createElement("p");
-  chartMeta.className = "workspace-item-meta";
-  chartMeta.textContent = playableTotal > 0
-    ? `playable:${playableTotal} • Claude:${claudePlayableReady}/${playableTotal} • 未完了(tracked):${pendingTotal}`
-    : `未完了(tracked):${pendingTotal} • tracked:${trackedTotal}`;
+  const chartMeta = document.createElement("div");
+  chartMeta.className = "workspace-source-chart-meta";
+  chartMeta.appendChild(createWorkspaceSourceChartPill("収録", trackedTotal));
+  chartMeta.appendChild(createWorkspaceSourceChartPill("再生可能", playableTotal));
+  chartMeta.appendChild(createWorkspaceSourceChartPill("再生済み", playedPlayable));
+  chartMeta.appendChild(createWorkspaceSourceChartPill("字幕付き", subtitlePlayableReady));
+  chartMeta.appendChild(createWorkspaceSourceChartPill("未整備", pendingTotal));
+
+  const coverageList = document.createElement("div");
+  coverageList.className = "workspace-source-coverage-list";
+  coverageList.appendChild(
+    createWorkspaceSourceCoverageRow("完了(playable)", completeCount, playableTotal, "ok")
+  );
+  coverageList.appendChild(
+    createWorkspaceSourceCoverageRow("再生済み", playedPlayable, playableTotal, "info")
+  );
+  coverageList.appendChild(
+    createWorkspaceSourceCoverageRow("字幕付き", subtitlePlayableReady, playableTotal, "info")
+  );
+  coverageList.appendChild(
+    createWorkspaceSourceCoverageRow("学習可能", jaPlayableReady, playableTotal, "ok")
+  );
+  coverageList.appendChild(
+    createWorkspaceSourceCoverageRow("学習可能(upstream)", upstreamJaPlayableReady, playableTotal, "accent")
+  );
 
   chartWrap.appendChild(chart);
   chartWrap.appendChild(chartMeta);
+  chartWrap.appendChild(coverageList);
 
   const detail = document.createElement("div");
   detail.className = "workspace-source-status-detail";
@@ -9698,33 +9796,40 @@ function buildWorkspaceSourceSummaryCard(summary) {
     swatch.className = "workspace-source-legend-swatch";
     swatch.style.background = String(segment.color || "#7da3ff");
 
+    const copy = document.createElement("div");
+    copy.className = "workspace-source-legend-copy";
+
     const text = document.createElement("span");
-    text.textContent = `${segment.label} ${Number(segment.value || 0)}`;
+    text.className = "workspace-source-legend-text";
+    text.textContent = segment.label;
+
+    const meta = document.createElement("span");
+    meta.className = "workspace-source-legend-meta";
+    meta.textContent = `${Number(segment.value || 0)} • ${formatWorkspaceRatio(segment.value, trackedTotal)}`;
 
     item.appendChild(swatch);
-    item.appendChild(text);
+    copy.appendChild(text);
+    copy.appendChild(meta);
+    item.appendChild(copy);
     legend.appendChild(item);
   }
 
   const metrics = document.createElement("div");
   metrics.className = "workspace-source-metrics";
   metrics.appendChild(
-    createWorkspaceSourceMetric("英字幕未DL", `${englishMissing}/${trackedTotal}`, "warn")
+    createWorkspaceSourceMetric(`英字幕未DL (${formatWorkspaceRatio(englishMissing, trackedTotal)})`, englishMissing, "warn")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("JA/Claude字幕", `${claudePlayableReady}/${playableTotal}`, "ok")
+    createWorkspaceSourceMetric(`字幕/ASR不足 (${formatWorkspaceRatio(sourceTextMissing, trackedTotal)})`, sourceTextMissing, "warn")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("loudness未処理", `${loudnessPending}/${playableTotal}`, "warn")
+    createWorkspaceSourceMetric(`loudness未処理 (${formatWorkspaceRatio(loudnessPending, playableTotal)})`, loudnessPending, "warn")
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("meta未取得", `${metaMissing}/${trackedTotal}`)
+    createWorkspaceSourceMetric(`meta未取得 (${formatWorkspaceRatio(metaMissing, trackedTotal)})`, metaMissing)
   );
   metrics.appendChild(
-    createWorkspaceSourceMetric("media未取得", `${mediaMissing}/${trackedTotal}`)
-  );
-  metrics.appendChild(
-    createWorkspaceSourceMetric("字幕/ASR不足", `${sourceTextMissing}/${trackedTotal}`)
+    createWorkspaceSourceMetric(`media未取得 (${formatWorkspaceRatio(mediaMissing, trackedTotal)})`, mediaMissing)
   );
 
   detail.appendChild(legend);
@@ -9752,17 +9857,20 @@ function renderWorkspaceSourceProcessing() {
   const sourceCount = Number(totals?.source_count || sources.length || 0);
   const totalVideos = Number(totals?.total_videos || 0);
   const playableTotal = Number(totals?.media_ready || 0);
+  const playedPlayable = Number(totals?.played_playable || 0);
+  const subtitlePlayableReady = Number(totals?.subtitle_tracks_ready_playable || 0);
   const completeCount = Number(totals?.complete_count || 0);
   const pendingTotal = Number(totals?.pending_total || 0);
-  const claudePlayableReady = Number(totals?.ja_subtitles_ready_playable || 0);
+  const jaPlayableReady = Number(totals?.ja_subtitles_ready_playable || 0);
+  const upstreamJaPlayableReady = Number(totals?.upstream_ja_subtitles_ready_playable || 0);
 
   if (elements.workspaceSourceProcessingSummary) {
     if (sourceCount <= 0 || totalVideos <= 0) {
       elements.workspaceSourceProcessingSummary.textContent = "source集計対象の動画がまだありません。";
     } else {
       elements.workspaceSourceProcessingSummary.textContent = playableTotal > 0
-        ? `${sourceCount} source • tracked=${totalVideos} • playable=${playableTotal} • complete=${completeCount}/${playableTotal} • Claude=${claudePlayableReady}/${playableTotal} • 未完了(tracked)=${pendingTotal}`
-        : `${sourceCount} source • tracked=${totalVideos} • complete=${completeCount} • 未完了(tracked)=${pendingTotal}`;
+        ? `${sourceCount} source • 収録=${totalVideos} • 再生可能=${playableTotal} • 再生済み=${formatWorkspaceRatio(playedPlayable, playableTotal)} (${playedPlayable}/${playableTotal}) • 字幕付き=${formatWorkspaceRatio(subtitlePlayableReady, playableTotal)} (${subtitlePlayableReady}/${playableTotal}) • 学習可能=${formatWorkspaceRatio(jaPlayableReady, playableTotal)} (${jaPlayableReady}/${playableTotal}) • 学習可能(upstream)=${formatWorkspaceRatio(upstreamJaPlayableReady, playableTotal)} (${upstreamJaPlayableReady}/${playableTotal}) • 完了=${formatWorkspaceRatio(completeCount, playableTotal)} (${completeCount}/${playableTotal}) • 未整備=${pendingTotal}`
+        : `${sourceCount} source • 収録=${totalVideos} • 完了=${completeCount} • 未整備=${pendingTotal}`;
     }
   }
 
@@ -10282,7 +10390,7 @@ function renderWorkspacePendingFailures() {
       row.appendChild(meta);
       return row;
     },
-    "保留中の失敗はありません。"
+    "未解消エラーはありません。"
   );
 }
 
@@ -10388,7 +10496,7 @@ function renderWorkspacePanels() {
     const recentRuns = Array.isArray(state.workspaceDownloadMonitor?.recent_runs)
       ? state.workspaceDownloadMonitor.recent_runs.length
       : 0;
-    elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} / pending=${pendingCount}`;
+    elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} / 未解消エラー=${pendingCount}`;
   }
   if (elements.workspaceImportSummary) {
     const latest = state.workspaceImportMonitor?.latest || null;

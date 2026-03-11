@@ -123,6 +123,10 @@ AUTO_TAG_METRIC_KEYS = frozenset(
         "ja_subtitles_missing",
         "ja_subtitles_ready_playable",
         "ja_subtitles_missing_playable",
+        "upstream_ja_subtitles_ready",
+        "upstream_ja_subtitles_missing",
+        "upstream_ja_subtitles_ready_playable",
+        "upstream_ja_subtitles_missing_playable",
         "claude_subtitles_ready",
         "claude_subtitles_missing",
         "claude_subtitles_ready_playable",
@@ -145,6 +149,10 @@ AUTO_TAG_METRIC_KEYS = frozenset(
         "ja_subtitles_missing_ratio",
         "ja_subtitles_ready_playable_ratio",
         "ja_subtitles_missing_playable_ratio",
+        "upstream_ja_subtitles_ready_ratio",
+        "upstream_ja_subtitles_missing_ratio",
+        "upstream_ja_subtitles_ready_playable_ratio",
+        "upstream_ja_subtitles_missing_playable_ratio",
         "claude_subtitles_ready_ratio",
         "claude_subtitles_missing_ratio",
         "claude_subtitles_ready_playable_ratio",
@@ -13079,8 +13087,20 @@ def collect_workspace_review_and_missing_rows(
     return (review_cards, missing_cards)
 
 
-def is_workspace_ja_subtitle(language: str | None, subtitle_path: str | None) -> bool:
-    return bool(classify_ja_subtitle_variant(language, subtitle_path))
+def is_workspace_ja_subtitle(
+    language: str | None,
+    subtitle_path: str | None,
+    origin_kind: str | None = None,
+    origin_detail: str | None = None,
+) -> bool:
+    return bool(
+        classify_ja_subtitle_variant(
+            language,
+            subtitle_path,
+            origin_kind=origin_kind,
+            origin_detail=origin_detail,
+        )
+    )
 
 
 def is_workspace_english_subtitle(language: str | None, subtitle_path: str | None) -> bool:
@@ -13105,12 +13125,24 @@ def build_workspace_source_processing_summary(source_id: str = "") -> dict[str, 
         "pending_total": 0,
         "english_subtitles_ready": 0,
         "english_subtitles_missing": 0,
+        "played_videos": 0,
+        "unplayed_videos": 0,
+        "played_playable": 0,
+        "unplayed_playable": 0,
+        "subtitle_tracks_ready": 0,
+        "subtitle_tracks_missing": 0,
+        "subtitle_tracks_ready_playable": 0,
+        "subtitle_tracks_missing_playable": 0,
         "source_text_ready": 0,
         "source_text_missing": 0,
         "ja_subtitles_ready": 0,
         "ja_subtitles_missing": 0,
         "ja_subtitles_ready_playable": 0,
         "ja_subtitles_missing_playable": 0,
+        "upstream_ja_subtitles_ready": 0,
+        "upstream_ja_subtitles_missing": 0,
+        "upstream_ja_subtitles_ready_playable": 0,
+        "upstream_ja_subtitles_missing_playable": 0,
         "meta_ready": 0,
         "meta_missing": 0,
         "media_ready": 0,
@@ -13155,6 +13187,18 @@ def build_source_auto_tag_metrics(summary: dict[str, Any]) -> dict[str, float]:
         "ja_subtitles_missing": float(int(summary.get("ja_subtitles_missing", 0) or 0)),
         "ja_subtitles_ready_playable": float(int(summary.get("ja_subtitles_ready_playable", 0) or 0)),
         "ja_subtitles_missing_playable": float(int(summary.get("ja_subtitles_missing_playable", 0) or 0)),
+        "upstream_ja_subtitles_ready": float(
+            int(summary.get("upstream_ja_subtitles_ready", 0) or 0)
+        ),
+        "upstream_ja_subtitles_missing": float(
+            int(summary.get("upstream_ja_subtitles_missing", 0) or 0)
+        ),
+        "upstream_ja_subtitles_ready_playable": float(
+            int(summary.get("upstream_ja_subtitles_ready_playable", 0) or 0)
+        ),
+        "upstream_ja_subtitles_missing_playable": float(
+            int(summary.get("upstream_ja_subtitles_missing_playable", 0) or 0)
+        ),
         "meta_ready": float(int(summary.get("meta_ready", 0) or 0)),
         "meta_missing": float(int(summary.get("meta_missing", 0) or 0)),
         "media_ready": float(media_ready),
@@ -13179,6 +13223,18 @@ def build_source_auto_tag_metrics(summary: dict[str, Any]) -> dict[str, float]:
     metrics["ja_subtitles_missing_ratio"] = total_ratio(summary.get("ja_subtitles_missing", 0))
     metrics["ja_subtitles_ready_playable_ratio"] = media_ratio(summary.get("ja_subtitles_ready_playable", 0))
     metrics["ja_subtitles_missing_playable_ratio"] = media_ratio(summary.get("ja_subtitles_missing_playable", 0))
+    metrics["upstream_ja_subtitles_ready_ratio"] = total_ratio(
+        summary.get("upstream_ja_subtitles_ready", 0)
+    )
+    metrics["upstream_ja_subtitles_missing_ratio"] = total_ratio(
+        summary.get("upstream_ja_subtitles_missing", 0)
+    )
+    metrics["upstream_ja_subtitles_ready_playable_ratio"] = media_ratio(
+        summary.get("upstream_ja_subtitles_ready_playable", 0)
+    )
+    metrics["upstream_ja_subtitles_missing_playable_ratio"] = media_ratio(
+        summary.get("upstream_ja_subtitles_missing_playable", 0)
+    )
     metrics["claude_subtitles_ready_ratio"] = metrics["ja_subtitles_ready_ratio"]
     metrics["claude_subtitles_missing_ratio"] = metrics["ja_subtitles_missing_ratio"]
     metrics["claude_subtitles_ready_playable_ratio"] = metrics["ja_subtitles_ready_playable_ratio"]
@@ -13251,12 +13307,24 @@ def accumulate_workspace_source_processing_summary(
         "pending_total",
         "english_subtitles_ready",
         "english_subtitles_missing",
+        "played_videos",
+        "unplayed_videos",
+        "played_playable",
+        "unplayed_playable",
+        "subtitle_tracks_ready",
+        "subtitle_tracks_missing",
+        "subtitle_tracks_ready_playable",
+        "subtitle_tracks_missing_playable",
         "source_text_ready",
         "source_text_missing",
         "ja_subtitles_ready",
         "ja_subtitles_missing",
         "ja_subtitles_ready_playable",
         "ja_subtitles_missing_playable",
+        "upstream_ja_subtitles_ready",
+        "upstream_ja_subtitles_missing",
+        "upstream_ja_subtitles_ready_playable",
+        "upstream_ja_subtitles_missing_playable",
         "meta_ready",
         "meta_missing",
         "media_ready",
@@ -13322,7 +13390,9 @@ def collect_workspace_source_processing_summary(
             source_id,
             video_id,
             COALESCE(language, '') AS language,
-            COALESCE(subtitle_path, '') AS subtitle_path
+            COALESCE(subtitle_path, '') AS subtitle_path,
+            COALESCE(origin_kind, '') AS origin_kind,
+            COALESCE(origin_detail, '') AS origin_detail
         FROM subtitles
         {source_filter_sql}
         ORDER BY source_id ASC, video_id ASC, subtitle_path ASC
@@ -13338,6 +13408,21 @@ def collect_workspace_source_processing_summary(
         FROM asr_runs
         WHERE LOWER(COALESCE(status, '')) = 'success'
           {"AND source_id IN (" + ",".join("?" for _ in requested_source_ids) + ")" if requested_source_ids else ""}
+        ORDER BY source_id ASC, video_id ASC
+        """,
+        source_params,
+    ).fetchall()
+
+    playback_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            video_id,
+            COALESCE(play_count, 0) AS play_count,
+            COALESCE(total_watch_seconds, 0) AS total_watch_seconds,
+            COALESCE(completed_count, 0) AS completed_count
+        FROM video_playback_stats
+        {"WHERE source_id IN (" + ",".join("?" for _ in requested_source_ids) + ")" if requested_source_ids else ""}
         ORDER BY source_id ASC, video_id ASC
         """,
         source_params,
@@ -13364,7 +13449,10 @@ def collect_workspace_source_processing_summary(
             "loudness_ready": bool(str(row["audio_loudness_analyzed_at"] or "").strip()),
             "has_english_subtitle": False,
             "has_ja_subtitle": False,
+            "has_subtitle_track": False,
+            "has_upstream_ja_subtitle": False,
             "has_asr": False,
+            "has_playback": False,
         }
 
     for row in subtitle_rows:
@@ -13375,11 +13463,23 @@ def collect_workspace_source_processing_summary(
             continue
         language = str(row["language"] or "")
         subtitle_path = str(row["subtitle_path"] or "")
-        if is_workspace_ja_subtitle(language, subtitle_path):
+        origin_kind = str(row["origin_kind"] or "")
+        origin_detail = str(row["origin_detail"] or "")
+        ja_variant = classify_ja_subtitle_variant(
+            language,
+            subtitle_path,
+            origin_kind=origin_kind,
+            origin_detail=origin_detail,
+        )
+        if ja_variant:
             flags["has_ja_subtitle"] = True
+            flags["has_subtitle_track"] = True
+            if ja_variant == "upstream":
+                flags["has_upstream_ja_subtitle"] = True
             continue
         if is_workspace_english_subtitle(language, subtitle_path):
             flags["has_english_subtitle"] = True
+            flags["has_subtitle_track"] = True
 
     for row in asr_rows:
         source_id = str(row["source_id"] or "").strip()
@@ -13389,6 +13489,19 @@ def collect_workspace_source_processing_summary(
             continue
         flags["has_asr"] = True
 
+    for row in playback_rows:
+        source_id = str(row["source_id"] or "").strip()
+        video_id = str(row["video_id"] or "").strip()
+        flags = video_flags_by_key.get((source_id, video_id))
+        if flags is None:
+            continue
+        play_count = max(0, int(row["play_count"] or 0))
+        total_watch_seconds = max(0.0, float(row["total_watch_seconds"] or 0.0))
+        completed_count = max(0, int(row["completed_count"] or 0))
+        flags["has_playback"] = bool(
+            play_count > 0 or total_watch_seconds > 0.0 or completed_count > 0
+        )
+
     for (source_id, _video_id), flags in video_flags_by_key.items():
         summary = summaries_by_source.setdefault(
             source_id,
@@ -13397,8 +13510,11 @@ def collect_workspace_source_processing_summary(
         meta_ready = bool(flags["meta_ready"])
         media_ready = bool(flags["media_ready"])
         english_ready = bool(flags["has_english_subtitle"])
+        subtitle_track_ready = bool(flags["has_subtitle_track"])
         ja_ready = bool(flags["has_ja_subtitle"])
+        upstream_ja_ready = bool(flags["has_upstream_ja_subtitle"])
         asr_ready = bool(flags["has_asr"])
+        playback_ready = bool(flags["has_playback"])
         source_text_ready = bool(english_ready or asr_ready)
         loudness_ready = bool(flags["loudness_ready"]) if media_ready else False
 
@@ -13413,19 +13529,47 @@ def collect_workspace_source_processing_summary(
         summary["english_subtitles_missing"] = int(
             summary["english_subtitles_missing"]
         ) + int(not english_ready)
+        summary["played_videos"] = int(summary["played_videos"]) + int(playback_ready)
+        summary["unplayed_videos"] = int(summary["unplayed_videos"]) + int(not playback_ready)
+        summary["subtitle_tracks_ready"] = int(summary["subtitle_tracks_ready"]) + int(
+            subtitle_track_ready
+        )
+        summary["subtitle_tracks_missing"] = int(summary["subtitle_tracks_missing"]) + int(
+            not subtitle_track_ready
+        )
         summary["source_text_ready"] = int(summary["source_text_ready"]) + int(source_text_ready)
         summary["source_text_missing"] = int(summary["source_text_missing"]) + int(
             not source_text_ready
         )
         summary["ja_subtitles_ready"] = int(summary["ja_subtitles_ready"]) + int(ja_ready)
         summary["ja_subtitles_missing"] = int(summary["ja_subtitles_missing"]) + int(not ja_ready)
+        summary["upstream_ja_subtitles_ready"] = int(summary["upstream_ja_subtitles_ready"]) + int(
+            upstream_ja_ready
+        )
+        summary["upstream_ja_subtitles_missing"] = int(
+            summary["upstream_ja_subtitles_missing"]
+        ) + int(not upstream_ja_ready)
         if media_ready:
+            summary["played_playable"] = int(summary["played_playable"]) + int(playback_ready)
+            summary["unplayed_playable"] = int(summary["unplayed_playable"]) + int(not playback_ready)
+            summary["subtitle_tracks_ready_playable"] = int(
+                summary["subtitle_tracks_ready_playable"]
+            ) + int(subtitle_track_ready)
+            summary["subtitle_tracks_missing_playable"] = int(
+                summary["subtitle_tracks_missing_playable"]
+            ) + int(not subtitle_track_ready)
             summary["ja_subtitles_ready_playable"] = int(summary["ja_subtitles_ready_playable"]) + int(
                 ja_ready
             )
             summary["ja_subtitles_missing_playable"] = int(
                 summary["ja_subtitles_missing_playable"]
             ) + int(not ja_ready)
+            summary["upstream_ja_subtitles_ready_playable"] = int(
+                summary["upstream_ja_subtitles_ready_playable"]
+            ) + int(upstream_ja_ready)
+            summary["upstream_ja_subtitles_missing_playable"] = int(
+                summary["upstream_ja_subtitles_missing_playable"]
+            ) + int(not upstream_ja_ready)
 
         if media_ready:
             summary["asr_ready"] = int(summary["asr_ready"]) + int(asr_ready)

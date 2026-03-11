@@ -521,15 +521,31 @@ data_dir = "{source_root}"
             )
             connection.executemany(
                 """
-                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO subtitles(
+                    source_id,
+                    video_id,
+                    language,
+                    subtitle_path,
+                    origin_kind,
+                    origin_detail,
+                    ext
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    ("alpha", "complete", "eng-US", "/tmp/complete.eng-US.vtt", "vtt"),
-                    ("alpha", "complete", "ja", "/tmp/complete.ja.vtt", "vtt"),
-                    ("alpha", "ja-missing", "en", "/tmp/ja-missing.en.vtt", "vtt"),
-                    ("alpha", "loudness-pending", "en", "/tmp/loudness.en.vtt", "vtt"),
-                    ("alpha", "loudness-pending", "ja", "/tmp/loudness.ja.vtt", "vtt"),
+                    ("alpha", "complete", "eng-US", "/tmp/complete.eng-US.vtt", "upstream", "", "vtt"),
+                    ("alpha", "complete", "ja", "/tmp/complete.ja.vtt", "upstream", "", "vtt"),
+                    ("alpha", "ja-missing", "en", "/tmp/ja-missing.en.vtt", "upstream", "", "vtt"),
+                    ("alpha", "loudness-pending", "en", "/tmp/loudness.en.vtt", "upstream", "", "vtt"),
+                    (
+                        "alpha",
+                        "loudness-pending",
+                        "ja",
+                        "/tmp/loudness.ja.vtt",
+                        "generated",
+                        "generated:claude",
+                        "vtt",
+                    ),
                 ],
             )
             connection.execute(
@@ -538,6 +554,27 @@ data_dir = "{source_root}"
                 VALUES (?, ?, 'success', ?)
                 """,
                 ("beta", "asr-only", now_iso),
+            )
+            connection.executemany(
+                """
+                INSERT INTO video_playback_stats(
+                    source_id,
+                    video_id,
+                    impression_count,
+                    play_count,
+                    total_watch_seconds,
+                    completed_count,
+                    fast_skip_count,
+                    shallow_skip_count,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                """,
+                [
+                    ("alpha", "complete", 1, 1, 12.5, 0, now_iso, now_iso),
+                    ("beta", "asr-only", 1, 1, 7.0, 0, now_iso, now_iso),
+                ],
             )
             connection.commit()
 
@@ -551,13 +588,27 @@ data_dir = "{source_root}"
         self.assertEqual(summary["totals"]["source_count"], 2)
         self.assertEqual(summary["totals"]["total_videos"], 6)
         self.assertEqual(summary["totals"]["complete_count"], 1)
+        self.assertEqual(summary["totals"]["played_videos"], 2)
+        self.assertEqual(summary["totals"]["played_playable"], 2)
+        self.assertEqual(summary["totals"]["subtitle_tracks_ready"], 3)
+        self.assertEqual(summary["totals"]["subtitle_tracks_ready_playable"], 3)
+        self.assertEqual(summary["totals"]["upstream_ja_subtitles_ready"], 1)
+        self.assertEqual(summary["totals"]["upstream_ja_subtitles_ready_playable"], 1)
 
         by_source = {row["source_id"]: row for row in summary["sources"]}
         alpha = by_source["alpha"]
         self.assertEqual(alpha["total_videos"], 5)
         self.assertEqual(alpha["english_subtitles_missing"], 2)
+        self.assertEqual(alpha["played_videos"], 1)
+        self.assertEqual(alpha["played_playable"], 1)
+        self.assertEqual(alpha["subtitle_tracks_ready"], 3)
+        self.assertEqual(alpha["subtitle_tracks_ready_playable"], 3)
+        self.assertEqual(alpha["subtitle_tracks_missing_playable"], 1)
         self.assertEqual(alpha["ja_subtitles_ready"], 2)
         self.assertEqual(alpha["ja_subtitles_ready_playable"], 2)
+        self.assertEqual(alpha["upstream_ja_subtitles_ready"], 1)
+        self.assertEqual(alpha["upstream_ja_subtitles_ready_playable"], 1)
+        self.assertEqual(alpha["upstream_ja_subtitles_missing_playable"], 3)
         self.assertEqual(alpha["ja_subtitles_missing_playable"], 2)
         self.assertEqual(alpha["loudness_pending"], 3)
         self.assertEqual(alpha["meta_missing"], 1)
@@ -574,8 +625,14 @@ data_dir = "{source_root}"
         self.assertEqual(beta["english_subtitles_missing"], 1)
         self.assertEqual(beta["source_text_ready"], 1)
         self.assertEqual(beta["asr_ready"], 1)
+        self.assertEqual(beta["played_videos"], 1)
+        self.assertEqual(beta["played_playable"], 1)
+        self.assertEqual(beta["subtitle_tracks_ready"], 0)
+        self.assertEqual(beta["subtitle_tracks_ready_playable"], 0)
         self.assertEqual(beta["ja_subtitles_ready"], 0)
+        self.assertEqual(beta["upstream_ja_subtitles_ready"], 0)
         self.assertEqual(beta["ja_subtitles_ready_playable"], 0)
+        self.assertEqual(beta["upstream_ja_subtitles_ready_playable"], 0)
         self.assertEqual(beta["ja_subtitles_missing_playable"], 1)
         self.assertEqual(beta["pipeline_buckets"]["ja_pending"], 1)
 

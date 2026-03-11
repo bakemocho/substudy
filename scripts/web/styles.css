@@ -1602,8 +1602,8 @@ textarea {
 
 .workspace-source-chart-wrap {
   display: grid;
-  gap: 8px;
-  justify-items: center;
+  gap: 10px;
+  justify-items: stretch;
 }
 
 .workspace-source-chart {
@@ -1625,7 +1625,7 @@ textarea {
   display: grid;
   place-items: center;
   align-content: center;
-  gap: 1px;
+  gap: 3px;
   background: rgba(8, 14, 30, 0.92);
   border: 1px solid rgba(143, 164, 235, 0.2);
   text-align: center;
@@ -1638,11 +1638,103 @@ textarea {
   line-height: 1;
 }
 
+.workspace-source-chart-secondary {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 0.66rem;
+  color: #dbe6ff;
+  line-height: 1;
+}
+
 .workspace-source-chart-label {
   font-size: 0.62rem;
   color: var(--muted);
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.workspace-source-chart-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.workspace-source-chart-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(143, 164, 235, 0.2);
+  background: rgba(8, 14, 30, 0.62);
+  color: #dbe6ff;
+  font-size: 0.68rem;
+}
+
+.workspace-source-chart-pill-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.workspace-source-chart-pill-value {
+  color: #f2f6ff;
+  font-family: "Space Grotesk", sans-serif;
+  font-weight: 600;
+}
+
+.workspace-source-coverage-list {
+  display: grid;
+  gap: 8px;
+}
+
+.workspace-source-coverage-row {
+  display: grid;
+  gap: 5px;
+}
+
+.workspace-source-coverage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.72rem;
+}
+
+.workspace-source-coverage-label {
+  color: #dbe6ff;
+}
+
+.workspace-source-coverage-value {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.workspace-source-coverage-track {
+  position: relative;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(143, 164, 235, 0.12);
+}
+
+.workspace-source-coverage-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #7da3ff, #9fb8ff);
+}
+
+.workspace-source-coverage-fill.ok {
+  background: linear-gradient(90deg, #59cb94, #88e4b7);
+}
+
+.workspace-source-coverage-fill.info {
+  background: linear-gradient(90deg, #79a6ff, #a8beff);
+}
+
+.workspace-source-coverage-fill.accent {
+  background: linear-gradient(90deg, #42c7c2, #8ce3d7);
 }
 
 .workspace-source-status-detail {
@@ -1675,6 +1767,21 @@ textarea {
   height: 10px;
   border-radius: 999px;
   flex: 0 0 auto;
+}
+
+.workspace-source-legend-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.workspace-source-legend-text {
+  color: #dbe6ff;
+}
+
+.workspace-source-legend-meta {
+  color: var(--muted);
+  font-size: 0.66rem;
 }
 
 .workspace-source-metrics {
