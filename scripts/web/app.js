@@ -1505,7 +1505,7 @@ function updateVideoProgressTimer() {
 }
 
 function isPlayerCardSnapEnabled() {
-  return window.innerWidth >= PLAYER_CARD_SNAP_MIN_VIEWPORT_WIDTH && !isJumpModalOpen();
+  return false;
 }
 
 function clearPlayerCardSnapCheckTimer() {

@@ -1879,13 +1879,6 @@ textarea {
   color: #cbfff5;
 }
 
-@media (min-width: 1201px) {
-  .player-column {
-    position: sticky;
-    top: 118px;
-  }
-}
-
 .jump-modal {
   position: fixed;
   inset: 0;
