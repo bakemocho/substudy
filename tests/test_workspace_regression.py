@@ -144,19 +144,35 @@ class WorkspaceRegressionTests(unittest.TestCase):
     def test_classify_ja_subtitle_variant_accepts_upstream_japanese_codes(self):
         self.assertEqual(
             self.mod.classify_ja_subtitle_variant("NA.jpn-JP"),
-            "ja",
+            "upstream",
         )
         self.assertEqual(
             self.mod.classify_ja_subtitle_variant("JP.ja-JP"),
-            "ja",
+            "upstream",
         )
         self.assertEqual(
             self.mod.classify_ja_subtitle_variant("ja-local"),
-            "ja-local",
+            "local",
         )
         self.assertEqual(
             self.mod.classify_ja_subtitle_variant("ja-asr-local"),
-            "ja-asr-local",
+            "local",
+        )
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant(
+                "ja",
+                origin_kind="generated",
+                origin_detail="generated:claude-opus-4-6",
+            ),
+            "claude",
+        )
+        self.assertEqual(
+            self.mod.classify_ja_subtitle_variant(
+                "ja",
+                origin_kind="generated",
+                origin_detail="translate-local",
+            ),
+            "local",
         )
 
     def test_run_command_with_output_streams_and_returns_combined_text(self):
@@ -5111,16 +5127,14 @@ enabled = true
 
     def test_feed_translation_filter_supports_variants(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
-        video_specs = [
-            ("storiesofcz", "video-ja", "NA.jpn-JP", "video-ja.mp4", "video-ja.NA.jpn-JP.vtt"),
-            ("storiesofcz", "video-ja-local", "ja-local", "video-ja-local.mp4", "video-ja-local.ja-local.vtt"),
-            ("storiesofcz", "video-ja-asr-local", "ja-asr-local", "video-ja-asr-local.mp4", "video-ja-asr-local.ja-asr-local.vtt"),
-            ("storiesofcz", "video-no-ja", "", "video-no-ja.mp4", ""),
-        ]
+        upstream_video_id = "video-upstream"
+        claude_video_id = "video-claude"
+        local_video_id = "video-local"
+        no_ja_video_id = "video-no-ja"
 
         connection = sqlite3.connect(str(self.db_path))
         try:
-            for source_id, video_id, language, media_name, subtitle_name in video_specs:
+            def insert_video(video_id: str, media_name: str) -> Path:
                 media_path = self.workspace_root / media_name
                 media_path.write_bytes(b"")
                 connection.execute(
@@ -5135,26 +5149,113 @@ enabled = true
                     )
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (source_id, video_id, video_id, str(media_path), 1, now_iso),
+                    ("storiesofcz", video_id, video_id, str(media_path), 1, now_iso),
                 )
-                if subtitle_name:
-                    subtitle_path = self.workspace_root / subtitle_name
-                    subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
-                    connection.execute(
-                        """
-                        INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
-                        VALUES (?, ?, ?, ?, ?)
-                        """,
-                        (source_id, video_id, language, str(subtitle_path), "vtt"),
-                    )
+                return media_path
+
+            insert_video(upstream_video_id, "video-upstream.mp4")
+            upstream_subtitle_path = self.workspace_root / "video-upstream.NA.jpn-JP.vtt"
+            upstream_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", upstream_video_id, "NA.jpn-JP", str(upstream_subtitle_path), "vtt"),
+            )
+
+            insert_video(claude_video_id, "video-claude.mp4")
+            claude_source_path = self.workspace_root / "video-claude.en.vtt"
+            claude_source_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            claude_subtitle_path = self.workspace_root / "video-claude.ja.vtt"
+            claude_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", claude_video_id, "ja", str(claude_subtitle_path), "vtt"),
+            )
+            self.mod.record_translation_run(
+                connection=connection,
+                source_id="storiesofcz",
+                video_id=claude_video_id,
+                source_path=claude_source_path,
+                output_path=claude_subtitle_path,
+                cue_count=2,
+                cue_match=True,
+                agent="claude-opus-4-6",
+                method="manual-import",
+                method_version="manual-import-v1",
+                summary="claude generated ja subtitle",
+                source_lang="en",
+                target_lang="ja",
+                status="active",
+                started_at=now_iso,
+                finished_at=now_iso,
+            )
+
+            insert_video(local_video_id, "video-local.mp4")
+            local_source_path = self.workspace_root / "video-local.en.vtt"
+            local_source_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            local_subtitle_path = self.workspace_root / "video-local.ja.vtt"
+            local_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", local_video_id, "ja", str(local_subtitle_path), "vtt"),
+            )
+            self.mod.record_translation_run(
+                connection=connection,
+                source_id="storiesofcz",
+                video_id=local_video_id,
+                source_path=local_source_path,
+                output_path=local_subtitle_path,
+                cue_count=2,
+                cue_match=True,
+                agent="local-llm",
+                method="multi-stage",
+                method_version="local-v1",
+                summary="local generated ja subtitle",
+                source_lang="en",
+                target_lang="ja",
+                status="active",
+                started_at=now_iso,
+                finished_at=now_iso,
+            )
+
+            insert_video(no_ja_video_id, "video-no-ja.mp4")
+            self.mod.ensure_subtitles_origin_columns(connection)
             connection.commit()
         finally:
             connection.close()
+
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://example.com/@storiesofcz"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
 
         handler_class = self.mod.build_web_handler(
             db_path=self.db_path,
             static_dir=self.mod.WEB_STATIC_DIR,
             allowed_source_ids=set(),
+            config_path=config_path,
             restrict_to_source_ids=False,
         )
         server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
@@ -5166,35 +5267,51 @@ enabled = true
 
         host, port = server.server_address
 
-        def fetch_video_ids(filter_value: str) -> tuple[str, list[str]]:
+        def fetch_feed_payload(filter_value: str) -> dict[str, Any]:
             url = f"http://{host}:{port}/api/feed?limit=20&offset=0&translation_filter={urllib.parse.quote(filter_value)}"
             with urllib.request.urlopen(url, timeout=5) as response:
                 self.assertEqual(response.status, 200)
-                payload = json.loads(response.read().decode("utf-8"))
-            return (
-                str(payload.get("translation_filter") or ""),
-                [str(video.get("video_id") or "") for video in payload.get("videos", [])],
-            )
+                return json.loads(response.read().decode("utf-8"))
 
-        echoed_filter, video_ids = fetch_video_ids("ja_only")
-        self.assertEqual(echoed_filter, "ja_only")
-        self.assertEqual(set(video_ids), {"video-ja", "video-ja-local", "video-ja-asr-local"})
+        payload = fetch_feed_payload("ja_only")
+        self.assertEqual(str(payload.get("translation_filter") or ""), "ja_only")
+        self.assertEqual(
+            {str(video.get("video_id") or "") for video in payload.get("videos", [])},
+            {upstream_video_id, claude_video_id, local_video_id},
+        )
+        self.assertEqual(payload.get("sources"), ["storiesofcz"])
 
-        echoed_filter, video_ids = fetch_video_ids("ja")
-        self.assertEqual(echoed_filter, "ja")
-        self.assertEqual(video_ids, ["video-ja"])
+        payload = fetch_feed_payload("upstream")
+        self.assertEqual(str(payload.get("translation_filter") or ""), "upstream")
+        self.assertEqual(
+            [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            [upstream_video_id],
+        )
+        self.assertEqual(payload.get("sources"), ["storiesofcz"])
 
-        echoed_filter, video_ids = fetch_video_ids("ja-local")
-        self.assertEqual(echoed_filter, "ja-local")
-        self.assertEqual(video_ids, ["video-ja-local"])
+        payload = fetch_feed_payload("claude")
+        self.assertEqual(str(payload.get("translation_filter") or ""), "claude")
+        self.assertEqual(
+            [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            [claude_video_id],
+        )
+        self.assertEqual(payload.get("sources"), ["storiesofcz"])
 
-        echoed_filter, video_ids = fetch_video_ids("ja-asr-local")
-        self.assertEqual(echoed_filter, "ja-asr-local")
-        self.assertEqual(video_ids, ["video-ja-asr-local"])
+        payload = fetch_feed_payload("local")
+        self.assertEqual(str(payload.get("translation_filter") or ""), "local")
+        self.assertEqual(
+            [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            [local_video_id],
+        )
+        self.assertEqual(payload.get("sources"), ["storiesofcz"])
 
-        echoed_filter, video_ids = fetch_video_ids("ja_missing")
-        self.assertEqual(echoed_filter, "ja_missing")
-        self.assertEqual(video_ids, ["video-no-ja"])
+        payload = fetch_feed_payload("ja_missing")
+        self.assertEqual(str(payload.get("translation_filter") or ""), "ja_missing")
+        self.assertEqual(
+            [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            [no_ja_video_id],
+        )
+        self.assertEqual(payload.get("sources"), ["storiesofcz"])
 
     def test_feed_source_filter_limits_reported_sources(self):
         config_dir = self.workspace_root / "config"

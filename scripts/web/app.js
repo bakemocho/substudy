@@ -58,18 +58,28 @@ const RANKED_SOURCE_FATIGUE_WINDOW = 10;
 const TRANSLATION_FILTER_VALUES = new Set([
   "all",
   "ja_only",
-  "ja",
-  "ja-local",
-  "ja-asr-local",
+  "upstream",
+  "claude",
+  "local",
   "ja_missing",
 ]);
-const TRANSLATION_VARIANT_VALUES = new Set(["auto", "ja", "ja-local", "ja-asr-local"]);
-const TRANSLATION_VARIANT_ORDER = ["ja", "ja-local", "ja-asr-local"];
+const TRANSLATION_FILTER_ALIASES = Object.freeze({
+  ja: "upstream",
+  "ja-local": "local",
+  "ja-asr-local": "local",
+});
+const TRANSLATION_VARIANT_VALUES = new Set(["auto", "upstream", "claude", "local"]);
+const TRANSLATION_VARIANT_ALIASES = Object.freeze({
+  ja: "upstream",
+  "ja-local": "local",
+  "ja-asr-local": "local",
+});
+const TRANSLATION_VARIANT_ORDER = ["upstream", "claude", "local"];
 const TRANSLATION_VARIANT_LABELS = Object.freeze({
   auto: "自動",
-  ja: "ja（Upstream）",
-  "ja-local": "ja-local（Generated）",
-  "ja-asr-local": "ja-asr-local（Generated/ASR）",
+  upstream: "upstream（Upstream）",
+  claude: "claude（Generated）",
+  local: "local（ローカル和訳）",
 });
 const SUBTITLE_PANEL_MODES = new Set(["en_only", "en_ja"]);
 const SUBTITLE_WORD_PATTERN = /[A-Za-z]+(?:['’][A-Za-z]+)*/g;
@@ -80,11 +90,16 @@ const PLAYBACK_TRACK_PREF_VALUES = new Set([
   "non-ja-subtitle",
   "asr",
   "subtitle",
-  "ja",
-  "ja-local",
-  "ja-asr-local",
+  "upstream",
+  "claude",
+  "local",
   "any",
 ]);
+const PLAYBACK_TRACK_PREF_ALIASES = Object.freeze({
+  ja: "upstream",
+  "ja-local": "local",
+  "ja-asr-local": "local",
+});
 const PLAYBACK_TRACK_PREF_STORAGE_KEY = "substudy.playback_track_pref_by_source";
 const PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY = "substudy.playback_track_pref_default";
 const SOURCE_TARGET_FILTER_STORAGE_KEY = "substudy.source_target_filter";
@@ -260,18 +275,10 @@ const state = {
   playerSnapReleaseCooldownUntil: 0,
   playerSnapCheckTimer: null,
   translationFilter: (() => {
-    const stored = String(localStorage.getItem("substudy.translation_filter") || "").trim();
-    if (TRANSLATION_FILTER_VALUES.has(stored)) {
-      return stored;
-    }
-    return "all";
+    return normalizeTranslationFilter(localStorage.getItem("substudy.translation_filter"), "all");
   })(),
   translationVariant: (() => {
-    const stored = String(localStorage.getItem(TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY) || "").trim().toLowerCase();
-    if (TRANSLATION_VARIANT_VALUES.has(stored)) {
-      return stored;
-    }
-    return "ja";
+    return normalizeTranslationVariant(localStorage.getItem(TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY), "upstream");
   })(),
   translationVariantBySource: (() => {
     const raw = localStorage.getItem(TRANSLATION_VARIANT_STORAGE_KEY);
@@ -286,8 +293,8 @@ const state = {
       const sanitized = {};
       for (const [sourceId, variant] of Object.entries(parsed)) {
         const safeSourceId = String(sourceId || "").trim();
-        const safeVariant = String(variant || "").trim().toLowerCase();
-        if (!safeSourceId || !TRANSLATION_VARIANT_VALUES.has(safeVariant)) {
+        const safeVariant = normalizeTranslationVariant(variant, "upstream");
+        if (!safeSourceId) {
           continue;
         }
         sanitized[safeSourceId] = safeVariant;
@@ -298,11 +305,7 @@ const state = {
     }
   })(),
   playbackTrackPreference: (() => {
-    const stored = String(localStorage.getItem(PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY) || "").trim().toLowerCase();
-    if (PLAYBACK_TRACK_PREF_VALUES.has(stored)) {
-      return stored;
-    }
-    return "en-subtitle";
+    return normalizePlaybackTrackPreference(localStorage.getItem(PLAYBACK_TRACK_PREF_DEFAULT_STORAGE_KEY), "en-subtitle");
   })(),
   playbackTrackPreferenceBySource: (() => {
     const raw = localStorage.getItem(PLAYBACK_TRACK_PREF_STORAGE_KEY);
@@ -317,8 +320,8 @@ const state = {
       const sanitized = {};
       for (const [sourceId, preference] of Object.entries(parsed)) {
         const safeSourceId = String(sourceId || "").trim();
-        const safePreference = String(preference || "").trim().toLowerCase();
-        if (!safeSourceId || !PLAYBACK_TRACK_PREF_VALUES.has(safePreference)) {
+        const safePreference = normalizePlaybackTrackPreference(preference, "en-subtitle");
+        if (!safeSourceId) {
           continue;
         }
         sanitized[safeSourceId] = safePreference;
@@ -1736,31 +1739,40 @@ function loadVolumeSettings() {
 
 function normalizeTranslationFilter(value, fallback = "all") {
   const normalized = String(value || "").trim().toLowerCase();
-  if (TRANSLATION_FILTER_VALUES.has(normalized)) {
-    return normalized;
+  const canonical = TRANSLATION_FILTER_ALIASES[normalized] || normalized;
+  if (TRANSLATION_FILTER_VALUES.has(canonical)) {
+    return canonical;
   }
-  return TRANSLATION_FILTER_VALUES.has(String(fallback || "").trim().toLowerCase())
-    ? String(fallback).trim().toLowerCase()
+  const fallbackCanonical = TRANSLATION_FILTER_ALIASES[String(fallback || "").trim().toLowerCase()]
+    || String(fallback || "").trim().toLowerCase();
+  return TRANSLATION_FILTER_VALUES.has(fallbackCanonical)
+    ? fallbackCanonical
     : "all";
 }
 
 function normalizeTranslationVariant(value, fallback = "auto") {
   const normalized = String(value || "").trim().toLowerCase();
-  if (TRANSLATION_VARIANT_VALUES.has(normalized)) {
-    return normalized;
+  const canonical = TRANSLATION_VARIANT_ALIASES[normalized] || normalized;
+  if (TRANSLATION_VARIANT_VALUES.has(canonical)) {
+    return canonical;
   }
-  return TRANSLATION_VARIANT_VALUES.has(String(fallback || "").trim().toLowerCase())
-    ? String(fallback).trim().toLowerCase()
+  const fallbackCanonical = TRANSLATION_VARIANT_ALIASES[String(fallback || "").trim().toLowerCase()]
+    || String(fallback || "").trim().toLowerCase();
+  return TRANSLATION_VARIANT_VALUES.has(fallbackCanonical)
+    ? fallbackCanonical
     : "auto";
 }
 
 function normalizePlaybackTrackPreference(value, fallback = "en-subtitle") {
   const normalized = String(value || "").trim().toLowerCase();
-  if (PLAYBACK_TRACK_PREF_VALUES.has(normalized)) {
-    return normalized;
+  const canonical = PLAYBACK_TRACK_PREF_ALIASES[normalized] || normalized;
+  if (PLAYBACK_TRACK_PREF_VALUES.has(canonical)) {
+    return canonical;
   }
-  return PLAYBACK_TRACK_PREF_VALUES.has(String(fallback || "").trim().toLowerCase())
-    ? String(fallback).trim().toLowerCase()
+  const fallbackCanonical = PLAYBACK_TRACK_PREF_ALIASES[String(fallback || "").trim().toLowerCase()]
+    || String(fallback || "").trim().toLowerCase();
+  return PLAYBACK_TRACK_PREF_VALUES.has(fallbackCanonical)
+    ? fallbackCanonical
     : "en-subtitle";
 }
 
@@ -1825,7 +1837,7 @@ function getTranslationVariantPreferenceForSource(sourceId = "") {
   if (safeSourceId) {
     return normalizeTranslationVariant(state.translationVariantBySource[safeSourceId], state.translationVariant);
   }
-  return normalizeTranslationVariant(state.translationVariant, "ja");
+  return normalizeTranslationVariant(state.translationVariant, "upstream");
 }
 
 function getPlaybackTrackPreferenceForSource(sourceId = "") {
@@ -1842,7 +1854,7 @@ function getPlaybackTrackPreferenceForSource(sourceId = "") {
 function persistTranslationVariantPreferences() {
   localStorage.setItem(
     TRANSLATION_VARIANT_DEFAULT_STORAGE_KEY,
-    normalizeTranslationVariant(state.translationVariant, "ja")
+    normalizeTranslationVariant(state.translationVariant, "upstream")
   );
   try {
     localStorage.setItem(
@@ -2771,16 +2783,25 @@ function getJaTrackVariant(track) {
   if (!label) {
     return "";
   }
-  if (label === "ja-asr-local" || label.startsWith("ja-asr-local-")) {
-    return "ja-asr-local";
+  const originKind = String(track?.origin_kind || "").trim().toLowerCase();
+  const originDetail = String(track?.origin_detail || "").trim().toLowerCase();
+  const isJapanese = isJapaneseTrackLabel(label);
+  if (
+    originDetail.startsWith("translate-local")
+    || label === "ja-local"
+    || label.startsWith("ja-local-")
+    || label === "ja-asr-local"
+    || label.startsWith("ja-asr-local-")
+  ) {
+    return "local";
   }
-  if (label === "ja-local" || label.startsWith("ja-local-")) {
-    return "ja-local";
+  if (!isJapanese) {
+    return "";
   }
-  if (isJapaneseTrackLabel(label)) {
-    return "ja";
+  if (originKind === "generated") {
+    return "claude";
   }
-  return "";
+  return "upstream";
 }
 
 function findTrackIdByJaVariant(video, variant) {
@@ -2798,16 +2819,10 @@ function findTrackIdByJaVariant(video, variant) {
 
 function resolveTranslationVariantFallbackOrder(variant) {
   const safeVariant = normalizeTranslationVariant(variant, "auto");
-  if (safeVariant === "ja-local") {
-    return ["ja-local", "ja", "ja-asr-local"];
+  if (safeVariant === "auto") {
+    return [...TRANSLATION_VARIANT_ORDER];
   }
-  if (safeVariant === "ja-asr-local") {
-    return ["ja-asr-local", "ja-local", "ja"];
-  }
-  if (safeVariant === "ja") {
-    return ["ja", "ja-local", "ja-asr-local"];
-  }
-  return [];
+  return [safeVariant, ...TRANSLATION_VARIANT_ORDER.filter((candidate) => candidate !== safeVariant)];
 }
 
 function resolveTrackIdFromTranslationVariant(video, variant) {
@@ -2941,7 +2956,7 @@ function findTrackIdByPlaybackTrackPreference(video, preference) {
     return null;
   }
   const safePreference = normalizePlaybackTrackPreference(preference, "en-subtitle");
-  if (safePreference === "ja" || safePreference === "ja-local" || safePreference === "ja-asr-local") {
+  if (safePreference === "upstream" || safePreference === "claude" || safePreference === "local") {
     return findTrackIdByJaVariant(video, safePreference);
   }
   if (safePreference === "en-subtitle") {
@@ -2975,27 +2990,27 @@ function findTrackIdByPlaybackTrackPreference(video, preference) {
 function resolvePlaybackTrackFallbackOrder(preference) {
   const safePreference = normalizePlaybackTrackPreference(preference, "en-subtitle");
   if (safePreference === "any") {
-    return ["any", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local"];
+    return ["any", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "upstream", "claude", "local"];
   }
-  if (safePreference === "ja") {
-    return ["ja", "ja-local", "ja-asr-local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  if (safePreference === "upstream") {
+    return ["upstream", "claude", "local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
   }
-  if (safePreference === "ja-local") {
-    return ["ja-local", "ja", "ja-asr-local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  if (safePreference === "claude") {
+    return ["claude", "upstream", "local", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
   }
-  if (safePreference === "ja-asr-local") {
-    return ["ja-asr-local", "ja-local", "ja", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
+  if (safePreference === "local") {
+    return ["local", "upstream", "claude", "en-subtitle", "non-ja-subtitle", "asr", "subtitle", "any"];
   }
   if (safePreference === "asr") {
-    return ["asr", "en-subtitle", "non-ja-subtitle", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+    return ["asr", "en-subtitle", "non-ja-subtitle", "subtitle", "upstream", "claude", "local", "any"];
   }
   if (safePreference === "subtitle") {
-    return ["subtitle", "en-subtitle", "non-ja-subtitle", "asr", "ja", "ja-local", "ja-asr-local", "any"];
+    return ["subtitle", "en-subtitle", "non-ja-subtitle", "asr", "upstream", "claude", "local", "any"];
   }
   if (safePreference === "non-ja-subtitle") {
-    return ["non-ja-subtitle", "en-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+    return ["non-ja-subtitle", "en-subtitle", "asr", "subtitle", "upstream", "claude", "local", "any"];
   }
-  return ["en-subtitle", "non-ja-subtitle", "asr", "subtitle", "ja", "ja-local", "ja-asr-local", "any"];
+  return ["en-subtitle", "non-ja-subtitle", "asr", "subtitle", "upstream", "claude", "local", "any"];
 }
 
 function findFallbackTrackIdForMissingCues(video, currentTrackId, attemptedTrackIds = null) {
@@ -11118,7 +11133,7 @@ function bindEvents() {
   if (elements.translationVariantSelect) {
     elements.translationVariantSelect.addEventListener("change", () => {
       const sourceId = getSourceIdForTranslationVariantPreference(elements.sourceSelect.value);
-      const selectedVariant = normalizeTranslationVariant(elements.translationVariantSelect.value, "ja");
+      const selectedVariant = normalizeTranslationVariant(elements.translationVariantSelect.value, "upstream");
       setTranslationVariantPreference(selectedVariant, sourceId, { persist: true, updateSelect: true });
 
       const video = currentVideo();

@@ -725,23 +725,41 @@ def is_japanese_subtitle_label(language: str | None, subtitle_path: str | None =
     return bool(path_tokens & {"ja", "jp", "jpn", "japanese"})
 
 
-def classify_ja_subtitle_variant(language: str | None, subtitle_path: str | None = None) -> str:
+def classify_ja_subtitle_variant(
+    language: str | None,
+    subtitle_path: str | None = None,
+    origin_kind: str | None = None,
+    origin_detail: str | None = None,
+) -> str:
     normalized = str(language or "").strip().lower()
     path_hints = subtitle_path_label_hints(subtitle_path)
+    normalized_origin_kind = str(origin_kind or "").strip().lower()
+    normalized_origin_detail = str(origin_detail or "").strip().lower()
+    is_local_generated = normalized_origin_detail.startswith("translate-local")
+    is_japanese = is_japanese_subtitle_label(language, subtitle_path)
+
+    if normalized_origin_kind == "generated":
+        if is_local_generated:
+            return "local"
+        if is_japanese:
+            return "claude"
+        return ""
+    if normalized_origin_kind == "upstream":
+        return "upstream" if is_japanese else ""
     if (
         normalized == "ja-asr-local"
         or normalized.startswith("ja-asr-local-")
         or any(hint == "ja-asr-local" or hint.startswith("ja-asr-local-") for hint in path_hints)
     ):
-        return "ja-asr-local"
+        return "local"
     if (
         normalized == "ja-local"
         or normalized.startswith("ja-local-")
         or any(hint == "ja-local" or hint.startswith("ja-local-") for hint in path_hints)
     ):
-        return "ja-local"
-    if is_japanese_subtitle_label(language, subtitle_path):
-        return "ja"
+        return "local"
+    if is_japanese:
+        return "upstream"
     return ""
 
 
@@ -14038,20 +14056,30 @@ def build_web_handler(
             ).fetchone()
 
         def _handle_api_feed(self, query: dict[str, list[str]]) -> None:
+            def normalize_translation_filter_value(raw_value: Any) -> str:
+                normalized_value = str(raw_value or "all").strip().lower()
+                alias_map = {
+                    "ja": "upstream",
+                    "ja-local": "local",
+                    "ja-asr-local": "local",
+                }
+                normalized_value = alias_map.get(normalized_value, normalized_value)
+                if normalized_value in {
+                    "all",
+                    "ja_only",
+                    "upstream",
+                    "claude",
+                    "local",
+                    "ja_missing",
+                }:
+                    return normalized_value
+                return "all"
+
             source_filter = self._normalize_source(query.get("source_id", [None])[0])
             if source_filter and not self._is_source_allowed(source_filter):
                 self._send_error_json(403, "Source is not allowed.")
                 return
-            translation_filter = str(query.get("translation_filter", ["all"])[0] or "all").strip().lower()
-            if translation_filter not in {
-                "all",
-                "ja_only",
-                "ja",
-                "ja-local",
-                "ja-asr-local",
-                "ja_missing",
-            }:
-                translation_filter = "all"
+            translation_filter = normalize_translation_filter_value(query.get("translation_filter", ["all"])[0])
 
             limit = clamp_int(query.get("limit", [None])[0], default=180, minimum=1, maximum=1000)
             offset = clamp_int(query.get("offset", [None])[0], default=0, minimum=0, maximum=20000)
@@ -14095,20 +14123,6 @@ def build_web_handler(
                 )
                 """
 
-            def generated_japanese_subtitle_exclusion_sql(subtitle_alias: str) -> str:
-                language_expr = f"LOWER(COALESCE({subtitle_alias}.language, ''))"
-                path_expr = f"LOWER(COALESCE({subtitle_alias}.subtitle_path, ''))"
-                return f"""
-                (
-                    {language_expr} NOT LIKE 'ja-local%'
-                    AND {language_expr} NOT LIKE 'ja-asr-local%'
-                    AND {path_expr} NOT LIKE '%.ja-local.%'
-                    AND {path_expr} NOT LIKE '%.ja-local-%'
-                    AND {path_expr} NOT LIKE '%.ja-asr-local.%'
-                    AND {path_expr} NOT LIKE '%.ja-asr-local-%'
-                )
-                """
-
             def ja_subtitle_exists_clause(video_alias: str) -> str:
                 return f"""
                 EXISTS (
@@ -14126,46 +14140,24 @@ def build_web_handler(
                     return ja_subtitle_exists_clause(video_alias)
                 if normalized_variant == "ja_missing":
                     return f"NOT ({ja_subtitle_exists_clause(video_alias)})"
-                if normalized_variant == "ja-asr-local":
-                    return f"""
-                    EXISTS (
-                        SELECT 1
-                        FROM subtitles sja
-                        WHERE sja.source_id = {video_alias}.source_id
-                          AND sja.video_id = {video_alias}.video_id
-                          AND (
-                            LOWER(COALESCE(sja.language, '')) = 'ja-asr-local'
-                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-asr-local-%'
-                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja-asr-local.%'
-                          )
-                    )
-                    """
-                if normalized_variant == "ja-local":
-                    return f"""
-                    EXISTS (
-                        SELECT 1
-                        FROM subtitles sja
-                        WHERE sja.source_id = {video_alias}.source_id
-                          AND sja.video_id = {video_alias}.video_id
-                          AND (
-                            LOWER(COALESCE(sja.language, '')) = 'ja-local'
-                            OR LOWER(COALESCE(sja.language, '')) LIKE 'ja-local-%'
-                            OR LOWER(COALESCE(sja.subtitle_path, '')) LIKE '%.ja-local.%'
-                          )
-                    )
-                    """
-                if normalized_variant == "ja":
-                    return f"""
-                    EXISTS (
-                        SELECT 1
-                        FROM subtitles sja
-                        WHERE sja.source_id = {video_alias}.source_id
-                          AND sja.video_id = {video_alias}.video_id
-                          AND {any_japanese_subtitle_sql('sja')}
-                          AND {generated_japanese_subtitle_exclusion_sql('sja')}
-                    )
-                    """
+                if normalized_variant in {"upstream", "claude", "local"}:
+                    return ja_subtitle_exists_clause(video_alias)
                 return ""
+
+            def build_public_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return [
+                    {
+                        "track_id": track["track_id"],
+                        "kind": track["kind"],
+                        "label": track["label"],
+                        "language": track.get("language", track["label"]),
+                        "origin_kind": track.get("origin_kind", "upstream"),
+                        "origin_detail": track.get("origin_detail", ""),
+                        "origin_label": track.get("origin_label", ""),
+                        "display_label": track.get("display_label", track["label"]),
+                    }
+                    for track in tracks
+                ]
 
             def public_tracks_match_translation_filter(
                 public_tracks: list[dict[str, Any]],
@@ -14178,10 +14170,12 @@ def build_web_handler(
                 for track in public_tracks:
                     if str(track.get("kind") or "").strip().lower() != "subtitle":
                         continue
-                    label = str(track.get("label") or "").strip().lower()
-                    if not label:
-                        continue
-                    variant = classify_ja_subtitle_variant(label, label)
+                    variant = classify_ja_subtitle_variant(
+                        str(track.get("language") or track.get("label") or ""),
+                        None,
+                        str(track.get("origin_kind") or ""),
+                        str(track.get("origin_detail") or ""),
+                    )
                     if variant:
                         variants.add(variant)
                 if normalized_filter == "ja_only":
@@ -14316,7 +14310,7 @@ def build_web_handler(
                     source_where_clauses.append(source_translation_filter_clause)
                 source_rows = connection.execute(
                     f"""
-                    SELECT source_id, media_path
+                    SELECT source_id, video_id, media_path
                     FROM videos
                     WHERE {" AND ".join(source_where_clauses)}
                     ORDER BY source_id ASC
@@ -14337,6 +14331,15 @@ def build_web_handler(
                     media_path = Path(str(media_path_value))
                     if not media_path.exists() or not media_path.is_file():
                         continue
+                    if translation_filter in {"upstream", "claude", "local"}:
+                        video_id_value = str(row["video_id"] or "").strip()
+                        if not video_id_value:
+                            continue
+                        candidate_tracks = build_public_tracks(
+                            collect_video_tracks(connection, source_id_value, video_id_value)
+                        )
+                        if not public_tracks_match_translation_filter(candidate_tracks, translation_filter):
+                            continue
                     source_seen.add(source_id_value)
                     source_ids.append(source_id_value)
                 if source_scope_ids is not None:
@@ -14369,19 +14372,7 @@ def build_web_handler(
                         source_id = str(row["source_id"])
                         video_id = str(row["video_id"])
                         tracks = collect_video_tracks(connection, source_id, video_id)
-                        public_tracks = [
-                            {
-                                "track_id": track["track_id"],
-                                "kind": track["kind"],
-                                "label": track["label"],
-                                "language": track.get("language", track["label"]),
-                                "origin_kind": track.get("origin_kind", "upstream"),
-                                "origin_detail": track.get("origin_detail", ""),
-                                "origin_label": track.get("origin_label", ""),
-                                "display_label": track.get("display_label", track["label"]),
-                            }
-                            for track in tracks
-                        ]
+                        public_tracks = build_public_tracks(tracks)
                         if not public_tracks_match_translation_filter(public_tracks, translation_filter):
                             continue
                         if valid_offset < offset:
