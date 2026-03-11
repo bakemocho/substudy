@@ -321,6 +321,139 @@ data_dir = "{source_root}"
         self.assertEqual(plan.chunk_index, 1)
         self.assertIsNone(plan.error)
 
+    def test_extract_requested_subtitles_unavailable_video_ids_tracks_current_video(self):
+        candidate_ids = [
+            "7579312035477916958",
+            "7579105528832396574",
+        ]
+        output_text = """
+[TikTok] Extracting URL: https://www.tiktok.com/@alexisanddean/video/7579312035477916958
+[TikTok] 7579312035477916958: Downloading webpage
+[info] 7579312035477916958: Downloading 1 format(s): bytevc1_1080p_846241-1
+[info] There are no subtitles for the requested languages
+[TikTok] Extracting URL: https://www.tiktok.com/@alexisanddean/video/7579105528832396574
+[TikTok] 7579105528832396574: Downloading webpage
+[info] 7579105528832396574: Downloading 1 format(s): bytevc1_1080p_891343-1
+[info] There are no subtitles for the requested languages
+[info] There are no subtitles for the requested languages
+        """.strip()
+
+        self.assertEqual(
+            self.mod.extract_requested_subtitles_unavailable_video_ids(
+                output_text,
+                candidate_ids,
+            ),
+            candidate_ids,
+        )
+
+    def test_finalize_subtitle_download_plan_records_requested_subtitles_unavailable(self):
+        source_root = self.workspace_root / "requested_subtitles_unavailable_source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "alexisanddean"
+platform = "tiktok"
+url = "https://www.tiktok.com/@alexisanddean"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        active_urls_file = source.media_archive.parent / "tmp" / "requested_subtitles_unavailable.txt"
+        active_urls_file.parent.mkdir(parents=True, exist_ok=True)
+        video_id = "7579312035477916958"
+        video_url = self.mod.build_video_url(source, video_id)
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO videos(source_id, video_id, media_path, has_media, has_subtitles, synced_at)
+                VALUES (?, ?, ?, 1, 0, ?)
+                """,
+                (
+                    source.id,
+                    video_id,
+                    str(source.media_dir / f"{video_id}.mp4"),
+                    "2026-03-10T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+
+            plan = self.mod.ChunkedYtdlpStagePlan(
+                source=source,
+                stage="subs",
+                active_urls_file=active_urls_file,
+                build_command=lambda: ["fake-ytdlp"],
+                command_template=["fake-ytdlp"],
+                url_chunks=[[(video_id, video_url)]],
+                target_ids=[video_id],
+                resolved_target_ids=[video_id],
+                unresolved_target_ids=[],
+                started_at="2026-03-10T00:00:00+00:00",
+                run_id=None,
+            )
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                return_value=(
+                    0,
+                    "\n".join(
+                        [
+                            f"[TikTok] Extracting URL: {video_url}",
+                            f"[TikTok] {video_id}: Downloading webpage",
+                            f"[info] {video_id}: Downloading 1 format(s): bytevc1_1080p_846241-1",
+                            "[info] There are no subtitles for the requested languages",
+                        ]
+                    ),
+                ),
+            ):
+                self.mod.run_interleaved_chunked_ytdlp_stage_plans([plan], dry_run=False)
+
+            self.assertEqual(
+                plan.payload.get("requested_subtitles_unavailable_ids"),
+                [video_id],
+            )
+
+            self.mod.finalize_subtitle_download_plan(
+                plan,
+                dry_run=False,
+                connection=connection,
+                safe_video_url=lambda current_video_id: self.mod.build_video_url(source, current_video_id),
+            )
+
+            row = connection.execute(
+                """
+                SELECT status, retry_count, last_error, next_retry_at
+                FROM download_state
+                WHERE source_id = ? AND stage = 'subs' AND video_id = ?
+                """,
+                (source.id, video_id),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "error")
+            self.assertEqual(int(row[1]), 1)
+            self.assertEqual(
+                str(row[2]),
+                "There are no subtitles for the requested languages",
+            )
+            self.assertTrue(str(row[3] or "").strip())
+        finally:
+            connection.close()
+
     def test_import_monitor_records_latest_summary(self):
         input_path = self.workspace_root / "exports" / "llm" / "enriched_missing.jsonl"
         input_path.write_text("", encoding="utf-8")
@@ -1324,6 +1457,20 @@ enabled = true
         delay_max = (retry_at - after).total_seconds()
         self.assertGreaterEqual(delay_min, (30 * 60) - 5)
         self.assertLessEqual(delay_max, (30 * 60) + 5)
+
+    def test_schedule_next_retry_iso_uses_long_backoff_for_requested_subtitles_unavailable(self):
+        before = dt.datetime.now(dt.timezone.utc)
+        retry_at = dt.datetime.fromisoformat(
+            self.mod.schedule_next_retry_iso(
+                1,
+                error_message="There are no subtitles for the requested languages",
+            )
+        )
+        after = dt.datetime.now(dt.timezone.utc)
+        delay_min = (retry_at - before).total_seconds()
+        delay_max = (retry_at - after).total_seconds()
+        self.assertGreaterEqual(delay_min, (14 * 86400) - 5)
+        self.assertLessEqual(delay_max, (14 * 86400) + 5)
 
     def test_schedule_next_retry_iso_uses_transient_tiktok_webpage_backoff(self):
         before = dt.datetime.now(dt.timezone.utc)

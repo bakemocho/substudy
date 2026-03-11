@@ -175,6 +175,10 @@ RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT = re.compile(
     r"unexpected response from webpage request)",
     re.IGNORECASE,
 )
+RE_RETRY_REQUESTED_SUBTITLES_UNAVAILABLE = re.compile(
+    r"there are no subtitles for the requested languages",
+    re.IGNORECASE,
+)
 RE_RETRY_MISSING_ARTIFACT = re.compile(
     r"(subtitle file missing after download attempt|did not write a terminal download_state row)",
     re.IGNORECASE,
@@ -2044,6 +2048,65 @@ def extract_tiktok_error_video_ids(
     return error_ids
 
 
+def extract_requested_subtitles_unavailable_video_ids(
+    output_text: str | None,
+    candidate_video_ids: Iterable[str],
+) -> list[str]:
+    candidates = [
+        str(video_id or "").strip()
+        for video_id in candidate_video_ids
+        if str(video_id or "").strip()
+    ]
+    if not candidates:
+        return []
+
+    missing_ids: list[str] = []
+    seen_ids: set[str] = set()
+    current_video_id: str | None = None
+    for raw_line in str(output_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for video_id in candidates:
+            if video_id in line:
+                current_video_id = video_id
+                break
+        if RE_RETRY_REQUESTED_SUBTITLES_UNAVAILABLE.search(line) is None:
+            continue
+        if not current_video_id or current_video_id in seen_ids:
+            continue
+        seen_ids.add(current_video_id)
+        missing_ids.append(current_video_id)
+    return missing_ids
+
+
+def extend_payload_unique_video_ids(
+    payload: dict[str, Any],
+    payload_key: str,
+    video_ids: Iterable[str],
+) -> None:
+    normalized_ids = [
+        str(video_id or "").strip()
+        for video_id in video_ids
+        if str(video_id or "").strip()
+    ]
+    if not normalized_ids:
+        return
+
+    recorded_ids = [
+        str(video_id)
+        for video_id in cast(list[Any], payload.get(payload_key) or [])
+        if str(video_id).strip()
+    ]
+    recorded_id_set = set(recorded_ids)
+    for video_id in normalized_ids:
+        if video_id in recorded_id_set:
+            continue
+        recorded_ids.append(video_id)
+        recorded_id_set.add(video_id)
+    payload[payload_key] = recorded_ids
+
+
 def run_interleaved_chunked_ytdlp_stage_plans(
     plans: list[ChunkedYtdlpStagePlan],
     dry_run: bool,
@@ -2076,6 +2139,17 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                     command,
                     dry_run=dry_run,
                 )
+                requested_subtitles_unavailable_ids = (
+                    extract_requested_subtitles_unavailable_video_ids(
+                        output_text,
+                        [video_id for video_id, _url in chunk_pairs],
+                    )
+                )
+                extend_payload_unique_video_ids(
+                    plan.payload,
+                    "requested_subtitles_unavailable_ids",
+                    requested_subtitles_unavailable_ids,
+                )
                 transient_retry_ids = extract_tiktok_transient_retry_video_ids(
                     output_text,
                     [video_id for video_id, _url in chunk_pairs],
@@ -2104,6 +2178,17 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                         retry_exit_code, retry_output_text = run_command_with_output(
                             retry_command,
                             dry_run=dry_run,
+                        )
+                        retry_requested_subtitles_unavailable_ids = (
+                            extract_requested_subtitles_unavailable_video_ids(
+                                retry_output_text,
+                                [video_id for video_id, _url in retry_pairs],
+                            )
+                        )
+                        extend_payload_unique_video_ids(
+                            plan.payload,
+                            "requested_subtitles_unavailable_ids",
+                            retry_requested_subtitles_unavailable_ids,
                         )
                         if retry_exit_code == 0:
                             if plan.exit_code != 0 and original_error_ids.issubset(retry_id_set):
@@ -2426,6 +2511,14 @@ def finalize_subtitle_download_plan(
         str(video_id)
         for video_id in cast(list[Any], plan.payload.get("existing_retry_ids") or [])
     ]
+    requested_subtitles_unavailable_ids = {
+        str(video_id).strip()
+        for video_id in cast(
+            list[Any],
+            plan.payload.get("requested_subtitles_unavailable_ids") or [],
+        )
+        if str(video_id).strip()
+    }
     if connection is not None:
         for video_id in success_sub_ids:
             upsert_download_state(
@@ -2468,6 +2561,8 @@ def finalize_subtitle_download_plan(
             next_retry_count = (int(current[0]) if current else 0) + 1
             if video_id in plan.unresolved_target_ids:
                 failure_reason = "cannot build video URL for subtitle download target"
+            elif video_id in requested_subtitles_unavailable_ids:
+                failure_reason = "There are no subtitles for the requested languages"
             else:
                 failure_reason = plan.error or (
                     f"command exit code {plan.exit_code}"
@@ -5961,6 +6056,13 @@ def is_tiktok_transient_webpage_error(error_message: str | None) -> bool:
     )
 
 
+def is_requested_subtitles_unavailable_error(error_message: str | None) -> bool:
+    text = str(error_message or "").strip()
+    if not text:
+        return False
+    return RE_RETRY_REQUESTED_SUBTITLES_UNAVAILABLE.search(text) is not None
+
+
 def is_missing_artifact_error(error_message: str | None) -> bool:
     text = str(error_message or "").strip()
     if not text:
@@ -5986,6 +6088,17 @@ def schedule_next_retry_iso(
         transient_backoff_seconds = (1800, 3600, 7200, 14400, 21600)
         index = min(max(0, retry_count - 1), len(transient_backoff_seconds) - 1)
         delay_seconds = transient_backoff_seconds[index]
+    elif is_requested_subtitles_unavailable_error(error_message):
+        # Requested subtitle tracks are unlikely to appear quickly; avoid rechecking every run.
+        no_requested_subtitles_backoff_seconds = (
+            14 * 86400,
+            30 * 86400,
+            60 * 86400,
+            90 * 86400,
+            120 * 86400,
+        )
+        index = min(max(0, retry_count - 1), len(no_requested_subtitles_backoff_seconds) - 1)
+        delay_seconds = no_requested_subtitles_backoff_seconds[index]
     elif is_missing_artifact_error(error_message):
         # Structural misses (missing subtitle/meta artifacts) should not spin quickly.
         missing_artifact_backoff_seconds = (1800, 7200, 21600, 43200, 86400)
