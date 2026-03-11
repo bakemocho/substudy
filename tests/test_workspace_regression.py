@@ -4980,6 +4980,79 @@ enabled = true
         self.assertEqual(echoed_filter, "ja_missing")
         self.assertEqual(video_ids, ["video-no-ja"])
 
+    def test_feed_source_filter_limits_reported_sources(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+
+[[sources]]
+id = "beta"
+platform = "tiktok"
+url = "https://example.com/@beta"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            for source_id, video_id in (("alpha", "video-alpha"), ("beta", "video-beta")):
+                media_path = self.workspace_root / f"{video_id}.mp4"
+                media_path.write_bytes(b"")
+                connection.execute(
+                    """
+                    INSERT INTO videos(
+                        source_id,
+                        video_id,
+                        title,
+                        media_path,
+                        has_media,
+                        synced_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (source_id, video_id, video_id, str(media_path), 1, now_iso),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = f"http://{host}:{port}/api/feed?limit=20&offset=0&source_id=alpha"
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual([video["source_id"] for video in payload.get("videos", [])], ["alpha"])
+        self.assertEqual(payload.get("sources"), ["alpha"])
+
     def test_feed_tracks_expose_upstream_vs_generated_origins(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
         media_path = self.workspace_root / "video-origin.mp4"

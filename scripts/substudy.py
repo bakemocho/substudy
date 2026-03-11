@@ -14221,16 +14221,22 @@ def build_web_handler(
                     (*params, limit, offset),
                 ).fetchall()
 
+                source_scope_ids: list[str] | None = None
+                if source_filter:
+                    source_scope_ids = [source_filter]
+                elif effective_scope is not None:
+                    source_scope_ids = sorted(effective_scope)
+
                 source_where_clauses = [
                     "has_media = 1",
                     "media_path IS NOT NULL",
                     "media_path <> ''",
                 ]
                 source_params: list[Any] = []
-                if effective_scope is not None:
-                    placeholders = ",".join("?" for _ in sorted(effective_scope))
+                if source_scope_ids is not None:
+                    placeholders = ",".join("?" for _ in source_scope_ids)
                     source_where_clauses.append(f"source_id IN ({placeholders})")
-                    source_params.extend(sorted(effective_scope))
+                    source_params.extend(source_scope_ids)
                 source_translation_filter_clause = ja_variant_exists_clause("videos", translation_filter)
                 if source_translation_filter_clause:
                     source_where_clauses.append(source_translation_filter_clause)
@@ -14259,8 +14265,8 @@ def build_web_handler(
                         continue
                     source_seen.add(source_id_value)
                     source_ids.append(source_id_value)
-                if effective_scope is not None:
-                    for source_id_value in sorted(effective_scope):
+                if source_scope_ids is not None:
+                    for source_id_value in source_scope_ids:
                         if source_id_value in source_seen:
                             continue
                         source_seen.add(source_id_value)
