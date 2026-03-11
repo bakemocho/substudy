@@ -19,9 +19,9 @@ sub_format = "vtt/ttml/best"
 sleep_interval = 2
 max_sleep_interval = 6
 retry_sleep = 5
-# Baseline per-request delay. substudy jitters this per command and occasionally
-# injects a slightly longer pause to avoid a perfectly fixed cadence.
-sleep_requests = 5.0
+# Baseline per-request delay. substudy jitters around this value, but never
+# below 5 seconds, and occasionally injects a slightly longer pause.
+sleep_requests = 8.0
 playlist_end = 200
 break_on_existing = false
 break_per_input = false

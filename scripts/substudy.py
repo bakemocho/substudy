@@ -104,6 +104,7 @@ DEFAULT_QUEUE_POLL_SEC = 3.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 8
 DEFAULT_QUEUE_STAGES = ("media", "subs", "meta", "asr", "loudness", "translate")
 DEFAULT_YTDLP_URL_BATCH_SIZE = 5
+DEFAULT_SLEEP_REQUESTS_MIN_SEC = 5.0
 DEFAULT_SLEEP_REQUESTS_JITTER_RATIO = 0.35
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_CHANCE = 0.18
 DEFAULT_SLEEP_REQUESTS_LONG_PAUSE_MIN_SEC = 1.0
@@ -1861,7 +1862,10 @@ def compute_effective_sleep_requests_seconds(source: SourceConfig) -> float:
     if base_seconds <= 0:
         return 0.0
 
-    lower_bound = max(0.1, base_seconds * (1.0 - DEFAULT_SLEEP_REQUESTS_JITTER_RATIO))
+    lower_bound = max(
+        DEFAULT_SLEEP_REQUESTS_MIN_SEC,
+        base_seconds * (1.0 - DEFAULT_SLEEP_REQUESTS_JITTER_RATIO),
+    )
     upper_bound = max(lower_bound, base_seconds * (1.0 + DEFAULT_SLEEP_REQUESTS_JITTER_RATIO))
     effective_seconds = random.uniform(lower_bound, upper_bound)
 
