@@ -5122,6 +5122,75 @@ enabled = true
         self.assertEqual([video["source_id"] for video in payload.get("videos", [])], ["alpha"])
         self.assertEqual(payload.get("sources"), ["alpha"])
 
+    def test_feed_pagination_skips_rows_with_missing_media_files(self):
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        missing_media_path = self.workspace_root / "missing.mp4"
+        valid_media_path = self.workspace_root / "valid.mp4"
+        valid_media_path.write_bytes(b"ok")
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at,
+                    upload_date
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "video-missing", "missing", str(missing_media_path), 1, now_iso, "20260311"),
+            )
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at,
+                    upload_date
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "video-valid", "valid", str(valid_media_path), 1, now_iso, "20260310"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        first_page_url = f"http://{host}:{port}/api/feed?limit=1&offset=0"
+        second_page_url = f"http://{host}:{port}/api/feed?limit=1&offset=1"
+
+        with urllib.request.urlopen(first_page_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            first_page = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(second_page_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            second_page = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual([video["video_id"] for video in first_page.get("videos", [])], ["video-valid"])
+        self.assertEqual(second_page.get("videos"), [])
+
     def test_feed_tracks_expose_upstream_vs_generated_origins(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
         media_path = self.workspace_root / "video-origin.mp4"

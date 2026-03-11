@@ -14159,8 +14159,7 @@ def build_web_handler(
                 where_clauses.append(translation_filter_clause)
 
             with self._open_connection() as connection:
-                rows = connection.execute(
-                    f"""
+                raw_feed_query = f"""
                     SELECT
                         v.source_id,
                         v.video_id,
@@ -14246,9 +14245,7 @@ def build_web_handler(
                         v.video_id DESC
                     LIMIT ?
                     OFFSET ?
-                    """,
-                    (*params, limit, offset),
-                ).fetchall()
+                    """
 
                 source_scope_ids: list[str] | None = None
                 if source_filter:
@@ -14302,111 +14299,129 @@ def build_web_handler(
                         source_ids.append(source_id_value)
 
                 videos: list[dict[str, Any]] = []
-                for row in rows:
-                    media_path_value = row["media_path"]
-                    if media_path_value in (None, ""):
-                        continue
-                    media_path = Path(str(media_path_value))
-                    if not media_path.exists() or not media_path.is_file():
-                        continue
+                valid_offset = 0
+                raw_offset = 0
+                raw_batch_size = max(100, limit * 3)
+                while len(videos) < limit:
+                    rows = connection.execute(
+                        raw_feed_query,
+                        (*params, raw_batch_size, raw_offset),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    raw_offset += len(rows)
+                    for row in rows:
+                        media_path_value = row["media_path"]
+                        if media_path_value in (None, ""):
+                            continue
+                        media_path = Path(str(media_path_value))
+                        if not media_path.exists() or not media_path.is_file():
+                            continue
 
-                    source_id = str(row["source_id"])
-                    video_id = str(row["video_id"])
-                    tracks = collect_video_tracks(connection, source_id, video_id)
-                    public_tracks = [
-                        {
-                            "track_id": track["track_id"],
-                            "kind": track["kind"],
-                            "label": track["label"],
-                            "language": track.get("language", track["label"]),
-                            "origin_kind": track.get("origin_kind", "upstream"),
-                            "origin_detail": track.get("origin_detail", ""),
-                            "origin_label": track.get("origin_label", ""),
-                            "display_label": track.get("display_label", track["label"]),
-                        }
-                        for track in tracks
-                    ]
-                    if not public_tracks_match_translation_filter(public_tracks, translation_filter):
-                        continue
-                    videos.append(
-                        {
-                            "source_id": source_id,
-                            "video_id": video_id,
-                            "title": "" if row["title"] in (None, "") else str(row["title"]),
-                            "description": (
-                                ""
-                                if row["description"] in (None, "")
-                                else str(row["description"])
-                            ),
-                            "uploader": "" if row["uploader"] in (None, "") else str(row["uploader"]),
-                            "upload_date": "" if row["upload_date"] in (None, "") else str(row["upload_date"]),
-                            "duration": safe_float(row["duration"]),
-                            "webpage_url": (
-                                ""
-                                if row["webpage_url"] in (None, "")
-                                else str(row["webpage_url"])
-                            ),
-                            "media_url": f"/media/{encode_path_token(media_path)}",
-                            "is_favorite": bool(row["is_favorite"]),
-                            "favorite_created_at": (
-                                ""
-                                if row["favorite_created_at"] in (None, "")
-                                else str(row["favorite_created_at"])
-                            ),
-                            "is_disliked": bool(row["is_disliked"]),
-                            "disliked_created_at": (
-                                ""
-                                if row["disliked_created_at"] in (None, "")
-                                else str(row["disliked_created_at"])
-                            ),
-                            "is_not_interested": bool(row["is_not_interested"]),
-                            "not_interested_created_at": (
-                                ""
-                                if row["not_interested_created_at"] in (None, "")
-                                else str(row["not_interested_created_at"])
-                            ),
-                            "cue_bookmark_count": max(0, int(row["cue_bookmark_count"] or 0)),
-                            "dictionary_bookmark_count": max(
-                                0, int(row["dictionary_bookmark_count"] or 0)
-                            ),
-                            "dictionary_bookmark_unique_term_count": max(
-                                0, int(row["dictionary_bookmark_unique_term_count"] or 0)
-                            ),
-                            "playback_stats": {
-                                "impression_count": max(0, int(row["playback_impression_count"] or 0)),
-                                "play_count": max(0, int(row["playback_play_count"] or 0)),
-                                "total_watch_seconds": (
-                                    0.0
-                                    if row["playback_total_watch_seconds"] in (None, "")
-                                    else max(0.0, float(row["playback_total_watch_seconds"]))
-                                ),
-                                "completed_count": max(0, int(row["playback_completed_count"] or 0)),
-                                "fast_skip_count": max(0, int(row["playback_fast_skip_count"] or 0)),
-                                "shallow_skip_count": max(0, int(row["playback_shallow_skip_count"] or 0)),
-                                "last_served_at": (
+                        source_id = str(row["source_id"])
+                        video_id = str(row["video_id"])
+                        tracks = collect_video_tracks(connection, source_id, video_id)
+                        public_tracks = [
+                            {
+                                "track_id": track["track_id"],
+                                "kind": track["kind"],
+                                "label": track["label"],
+                                "language": track.get("language", track["label"]),
+                                "origin_kind": track.get("origin_kind", "upstream"),
+                                "origin_detail": track.get("origin_detail", ""),
+                                "origin_label": track.get("origin_label", ""),
+                                "display_label": track.get("display_label", track["label"]),
+                            }
+                            for track in tracks
+                        ]
+                        if not public_tracks_match_translation_filter(public_tracks, translation_filter):
+                            continue
+                        if valid_offset < offset:
+                            valid_offset += 1
+                            continue
+                        videos.append(
+                            {
+                                "source_id": source_id,
+                                "video_id": video_id,
+                                "title": "" if row["title"] in (None, "") else str(row["title"]),
+                                "description": (
                                     ""
-                                    if row["playback_last_served_at"] in (None, "")
-                                    else str(row["playback_last_served_at"])
+                                    if row["description"] in (None, "")
+                                    else str(row["description"])
                                 ),
-                                "last_played_at": (
+                                "uploader": "" if row["uploader"] in (None, "") else str(row["uploader"]),
+                                "upload_date": "" if row["upload_date"] in (None, "") else str(row["upload_date"]),
+                                "duration": safe_float(row["duration"]),
+                                "webpage_url": (
                                     ""
-                                    if row["playback_last_played_at"] in (None, "")
-                                    else str(row["playback_last_played_at"])
+                                    if row["webpage_url"] in (None, "")
+                                    else str(row["webpage_url"])
                                 ),
-                                "last_completed_at": (
+                                "media_url": f"/media/{encode_path_token(media_path)}",
+                                "is_favorite": bool(row["is_favorite"]),
+                                "favorite_created_at": (
                                     ""
-                                    if row["playback_last_completed_at"] in (None, "")
-                                    else str(row["playback_last_completed_at"])
+                                    if row["favorite_created_at"] in (None, "")
+                                    else str(row["favorite_created_at"])
                                 ),
-                                "last_position_seconds": safe_float(row["playback_last_position_seconds"]),
-                            },
-                            "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
-                            "audio_lufs": safe_float(row["audio_lufs"]),
-                            "audio_gain_db": safe_float(row["audio_gain_db"]),
-                            "tracks": public_tracks,
-                            "default_track": public_tracks[0]["track_id"] if public_tracks else None,
-                        }
-                    )
+                                "is_disliked": bool(row["is_disliked"]),
+                                "disliked_created_at": (
+                                    ""
+                                    if row["disliked_created_at"] in (None, "")
+                                    else str(row["disliked_created_at"])
+                                ),
+                                "is_not_interested": bool(row["is_not_interested"]),
+                                "not_interested_created_at": (
+                                    ""
+                                    if row["not_interested_created_at"] in (None, "")
+                                    else str(row["not_interested_created_at"])
+                                ),
+                                "cue_bookmark_count": max(0, int(row["cue_bookmark_count"] or 0)),
+                                "dictionary_bookmark_count": max(
+                                    0, int(row["dictionary_bookmark_count"] or 0)
+                                ),
+                                "dictionary_bookmark_unique_term_count": max(
+                                    0, int(row["dictionary_bookmark_unique_term_count"] or 0)
+                                ),
+                                "playback_stats": {
+                                    "impression_count": max(0, int(row["playback_impression_count"] or 0)),
+                                    "play_count": max(0, int(row["playback_play_count"] or 0)),
+                                    "total_watch_seconds": (
+                                        0.0
+                                        if row["playback_total_watch_seconds"] in (None, "")
+                                        else max(0.0, float(row["playback_total_watch_seconds"]))
+                                    ),
+                                    "completed_count": max(0, int(row["playback_completed_count"] or 0)),
+                                    "fast_skip_count": max(0, int(row["playback_fast_skip_count"] or 0)),
+                                    "shallow_skip_count": max(0, int(row["playback_shallow_skip_count"] or 0)),
+                                    "last_served_at": (
+                                        ""
+                                        if row["playback_last_served_at"] in (None, "")
+                                        else str(row["playback_last_served_at"])
+                                    ),
+                                    "last_played_at": (
+                                        ""
+                                        if row["playback_last_played_at"] in (None, "")
+                                        else str(row["playback_last_played_at"])
+                                    ),
+                                    "last_completed_at": (
+                                        ""
+                                        if row["playback_last_completed_at"] in (None, "")
+                                        else str(row["playback_last_completed_at"])
+                                    ),
+                                    "last_position_seconds": safe_float(row["playback_last_position_seconds"]),
+                                },
+                                "note": "" if row["video_note"] in (None, "") else str(row["video_note"]),
+                                "audio_lufs": safe_float(row["audio_lufs"]),
+                                "audio_gain_db": safe_float(row["audio_gain_db"]),
+                                "tracks": public_tracks,
+                                "default_track": public_tracks[0]["track_id"] if public_tracks else None,
+                            }
+                        )
+                        if len(videos) >= limit:
+                            break
+                    if len(rows) < raw_batch_size:
+                        break
 
             self._send_json(
                 {
