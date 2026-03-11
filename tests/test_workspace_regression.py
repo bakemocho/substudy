@@ -5386,6 +5386,195 @@ enabled = true
         self.assertEqual([video["source_id"] for video in payload.get("videos", [])], ["alpha"])
         self.assertEqual(payload.get("sources"), ["alpha"])
 
+    def test_feed_translation_filters_ignore_stale_subtitle_rows(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        media_path = self.workspace_root / "video-stale.mp4"
+        media_path.write_bytes(b"")
+        stale_subtitle_path = self.workspace_root / "video-stale.ja.vtt"
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("alpha", "video-stale", "video-stale", str(media_path), 1, now_iso),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("alpha", "video-stale", "ja", str(stale_subtitle_path), "vtt"),
+            )
+            self.mod.ensure_subtitles_origin_columns(connection)
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+
+        def fetch_payload(filter_value: str) -> dict[str, Any]:
+            url = (
+                f"http://{host}:{port}/api/feed?limit=20&offset=0"
+                f"&translation_filter={urllib.parse.quote(filter_value)}"
+            )
+            with urllib.request.urlopen(url, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                return json.loads(response.read().decode("utf-8"))
+
+        payload = fetch_payload("ja_missing")
+        self.assertEqual(
+            [str(video.get("video_id") or "") for video in payload.get("videos", [])],
+            ["video-stale"],
+        )
+        self.assertEqual(payload.get("sources"), ["alpha"])
+
+        payload = fetch_payload("ja_only")
+        self.assertEqual(payload.get("videos"), [])
+        self.assertEqual(payload.get("sources"), [])
+
+    def test_feed_source_filter_omits_sources_when_translation_filter_matches_nothing(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+        media_path = self.workspace_root / "video-local-only.mp4"
+        media_path.write_bytes(b"")
+        source_subtitle_path = self.workspace_root / "video-local-only.en.vtt"
+        source_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+        local_subtitle_path = self.workspace_root / "video-local-only.ja.vtt"
+        local_subtitle_path.write_text("WEBVTT\n\n", encoding="utf-8")
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("alpha", "video-local-only", "video-local-only", str(media_path), 1, now_iso),
+            )
+            connection.execute(
+                """
+                INSERT INTO subtitles(source_id, video_id, language, subtitle_path, ext)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("alpha", "video-local-only", "ja", str(local_subtitle_path), "vtt"),
+            )
+            self.mod.record_translation_run(
+                connection=connection,
+                source_id="alpha",
+                video_id="video-local-only",
+                source_path=source_subtitle_path,
+                output_path=local_subtitle_path,
+                cue_count=1,
+                cue_match=True,
+                agent="local-llm",
+                method="multi-stage",
+                method_version="local-v1",
+                summary="local subtitle only",
+                source_lang="en",
+                target_lang="ja",
+                status="active",
+                started_at=now_iso,
+                finished_at=now_iso,
+            )
+            self.mod.ensure_subtitles_origin_columns(connection)
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            config_path=config_path,
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        feed_url = (
+            f"http://{host}:{port}/api/feed?limit=20&offset=0"
+            f"&source_id=alpha&translation_filter=upstream"
+        )
+        with urllib.request.urlopen(feed_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(payload.get("videos"), [])
+        self.assertEqual(payload.get("sources"), [])
+
     def test_feed_pagination_skips_rows_with_missing_media_files(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
         missing_media_path = self.workspace_root / "missing.mp4"

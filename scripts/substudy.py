@@ -14144,6 +14144,12 @@ def build_web_handler(
                     return ja_subtitle_exists_clause(video_alias)
                 return ""
 
+            def translation_filter_sql_prefilter_clause(video_alias: str, filter_value: str) -> str:
+                normalized_filter = str(filter_value or "all").strip().lower()
+                if normalized_filter in {"ja_only", "upstream", "claude", "local"}:
+                    return ja_variant_exists_clause(video_alias, normalized_filter)
+                return ""
+
             def build_public_tracks(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 return [
                     {
@@ -14196,7 +14202,7 @@ def build_web_handler(
             if source_filter:
                 where_clauses.append("v.source_id = ?")
                 params.append(source_filter)
-            translation_filter_clause = ja_variant_exists_clause("v", translation_filter)
+            translation_filter_clause = translation_filter_sql_prefilter_clause("v", translation_filter)
             if translation_filter_clause:
                 where_clauses.append(translation_filter_clause)
 
@@ -14305,7 +14311,10 @@ def build_web_handler(
                     placeholders = ",".join("?" for _ in source_scope_ids)
                     source_where_clauses.append(f"source_id IN ({placeholders})")
                     source_params.extend(source_scope_ids)
-                source_translation_filter_clause = ja_variant_exists_clause("videos", translation_filter)
+                source_translation_filter_clause = translation_filter_sql_prefilter_clause(
+                    "videos",
+                    translation_filter,
+                )
                 if source_translation_filter_clause:
                     source_where_clauses.append(source_translation_filter_clause)
                 source_rows = connection.execute(
@@ -14331,7 +14340,7 @@ def build_web_handler(
                     media_path = Path(str(media_path_value))
                     if not media_path.exists() or not media_path.is_file():
                         continue
-                    if translation_filter in {"upstream", "claude", "local"}:
+                    if translation_filter != "all":
                         video_id_value = str(row["video_id"] or "").strip()
                         if not video_id_value:
                             continue
@@ -14342,7 +14351,7 @@ def build_web_handler(
                             continue
                     source_seen.add(source_id_value)
                     source_ids.append(source_id_value)
-                if source_scope_ids is not None:
+                if source_scope_ids is not None and translation_filter == "all":
                     for source_id_value in source_scope_ids:
                         if source_id_value in source_seen:
                             continue
