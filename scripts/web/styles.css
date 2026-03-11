@@ -13,8 +13,15 @@
   --accent-3: #ffcc73;
   --danger: #ff637d;
   --shadow: 0 24px 70px rgba(1, 5, 15, 0.58);
-  --phone-shell-width: min(96vw, 68vh, 500px);
-  --phone-shell-height: calc(var(--phone-shell-width) * 16 / 9);
+  --player-frame-offset: 240px;
+  --player-height-min: 420px;
+  --player-height-max: 760px;
+  --phone-shell-height: clamp(
+    var(--player-height-min),
+    calc(100dvh - var(--player-frame-offset)),
+    var(--player-height-max)
+  );
+  --phone-shell-width: min(calc(var(--phone-shell-height) * 9 / 16), 96vw, 500px);
 }
 
 * {
@@ -234,7 +241,7 @@ body {
 .phone-shell {
   position: relative;
   width: var(--phone-shell-width);
-  aspect-ratio: 9 / 16;
+  height: var(--phone-shell-height);
   border-radius: 26px;
   overflow: hidden;
   overscroll-behavior: contain;
@@ -974,8 +981,8 @@ textarea {
   display: flex;
   flex-direction: column;
   position: relative;
-  height: min(760px, var(--phone-shell-height));
-  min-height: 420px;
+  height: var(--phone-shell-height);
+  min-height: var(--player-height-min);
   overflow: hidden;
 }
 
@@ -1867,6 +1874,14 @@ textarea {
   line-height: 1.4;
   color: #d1ddff;
   pointer-events: none;
+  opacity: 0.94;
+  transform: translateY(0);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+
+.status-bar.idle-transparent {
+  opacity: 0.12;
+  transform: translateY(4px);
 }
 
 .status-bar.error {
@@ -1973,6 +1988,12 @@ textarea {
 }
 
 @media (max-width: 1200px) {
+  :root {
+    --player-frame-offset: 310px;
+    --player-height-min: 380px;
+    --player-height-max: 640px;
+  }
+
   .top-bar {
     flex-direction: column;
     align-items: stretch;
@@ -2001,12 +2022,17 @@ textarea {
   }
 
   .subtitle-reel-card {
-    height: min(72vh, 620px);
-    min-height: 400px;
+    min-height: var(--player-height-min);
   }
 }
 
 @media (max-width: 760px) {
+  :root {
+    --player-frame-offset: 370px;
+    --player-height-min: 320px;
+    --player-height-max: 520px;
+  }
+
   .top-bar {
     flex-direction: column;
     align-items: stretch;
@@ -2109,8 +2135,7 @@ textarea {
   }
 
   .subtitle-reel-card {
-    height: min(64vh, 520px);
-    min-height: 340px;
+    min-height: var(--player-height-min);
   }
 
   .transport-controls {

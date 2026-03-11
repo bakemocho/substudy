@@ -1,5 +1,6 @@
 const SEEK_SECONDS = 5;
 const CONTROL_TOGGLE_IDLE_MS = 2600;
+const STATUS_BAR_IDLE_MS = 2200;
 const LYRIC_WHEEL_STEP_DELTA = 52;
 const LYRIC_REEL_AUTO_CLOSE_MS = 620;
 const LYRIC_REEL_INERTIA_FACTOR = 0.04;
@@ -237,6 +238,7 @@ const state = {
   metaExpanded: false,
   controlsExpanded: localStorage.getItem("substudy.controls_expanded") === "true",
   controlsFadeTimer: null,
+  statusBarIdleTimer: null,
   jumpResults: [],
   jumpSelectedIndex: 0,
   normalizationEnabled: localStorage.getItem("substudy.volume_normalization") !== "off",
@@ -486,6 +488,38 @@ function setStatus(message, tone = "info") {
   if (tone === "error") {
     elements.statusBar.classList.add("error");
   }
+  showStatusBar();
+  scheduleStatusBarIdleFade();
+}
+
+function clearStatusBarIdleFadeTimer() {
+  if (state.statusBarIdleTimer !== null) {
+    window.clearTimeout(state.statusBarIdleTimer);
+    state.statusBarIdleTimer = null;
+  }
+}
+
+function showStatusBar() {
+  if (!elements.statusBar) {
+    return;
+  }
+  elements.statusBar.classList.remove("idle-transparent");
+}
+
+function scheduleStatusBarIdleFade(delay = STATUS_BAR_IDLE_MS) {
+  if (!elements.statusBar) {
+    return;
+  }
+  clearStatusBarIdleFadeTimer();
+  state.statusBarIdleTimer = window.setTimeout(() => {
+    elements.statusBar.classList.add("idle-transparent");
+    state.statusBarIdleTimer = null;
+  }, delay);
+}
+
+function noteUserActivity() {
+  showStatusBar();
+  scheduleStatusBarIdleFade();
 }
 
 function currentVideo() {
@@ -10931,7 +10965,10 @@ function bindTouchNavigation() {
 }
 
 function bindEvents() {
-  const resetControlsToggleFade = () => scheduleControlsToggleIdleFade();
+  const resetControlsToggleFade = () => {
+    scheduleControlsToggleIdleFade();
+    noteUserActivity();
+  };
 
   if (elements.studyModeBtn) {
     elements.studyModeBtn.addEventListener("click", () => {
@@ -11559,6 +11596,9 @@ function bindEvents() {
   }, true);
   document.addEventListener("keydown", handleKeydown);
   document.addEventListener("keydown", resetControlsToggleFade);
+  document.addEventListener("pointermove", noteUserActivity, { passive: true });
+  document.addEventListener("pointerdown", noteUserActivity, { passive: true });
+  window.addEventListener("wheel", noteUserActivity, { passive: true });
   window.addEventListener("scroll", () => {
     repositionActiveDictionaryPopup();
     schedulePhoneShellSnapCheck();
@@ -11596,6 +11636,7 @@ async function initialize() {
   loadVolumeSettings();
   updateVideoProgressTimer();
   updatePlayPauseButton();
+  scheduleStatusBarIdleFade();
   resetWorkspaceState();
   renderWorkspacePanels();
   setSourceTargetFormFromItem(null);
