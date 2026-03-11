@@ -11,6 +11,17 @@ QUEUE_STATUS_ARGS ?=
 UPSTREAM_JA_SUB_LANGS ?= ja.*,ja,jp.*,jpn.*
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 SYNC_LIMIT_ARG := $(if $(strip $(LIMIT)),--limit $(LIMIT),)
+SYNC_BASE_CMD = $(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG)
+SYNC_META_ARGS = --skip-media --skip-subs
+SYNC_SUBS_ARGS = --skip-media --skip-meta
+SYNC_SUBS_JA_ARGS = $(SYNC_SUBS_ARGS) --upstream-sub-langs-override "$(UPSTREAM_JA_SUB_LANGS)"
+
+define require-source
+	@if [ -z "$(SOURCE)" ]; then \
+		echo "error: SOURCE is required (usage: make $(1) SOURCE=<source_id> [LIMIT=<n>])" >&2; \
+		exit 1; \
+	fi
+endef
 
 .PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
 
@@ -24,36 +35,27 @@ sync-dry:
 	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) --dry-run
 
 sync-meta-only:
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --skip-media --skip-subs
+	$(SYNC_BASE_CMD) $(SYNC_META_ARGS)
 
 sync-meta-missing: sync-meta-only
 
 sync-meta-source:
-	@if [ -z "$(SOURCE)" ]; then \
-		echo "error: SOURCE is required (usage: make sync-meta-source SOURCE=<source_id> [LIMIT=<n>])" >&2; \
-		exit 1; \
-	fi
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --source "$(SOURCE)" --skip-media --skip-subs
+	$(call require-source,sync-meta-source)
+	$(SYNC_BASE_CMD) --source "$(SOURCE)" $(SYNC_META_ARGS)
 
 sync-subs-missing:
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --skip-media --skip-meta
+	$(SYNC_BASE_CMD) $(SYNC_SUBS_ARGS)
 
 sync-subs-ja-missing:
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --skip-media --skip-meta --upstream-sub-langs-override "$(UPSTREAM_JA_SUB_LANGS)"
+	$(SYNC_BASE_CMD) $(SYNC_SUBS_JA_ARGS)
 
 sync-subs-source:
-	@if [ -z "$(SOURCE)" ]; then \
-		echo "error: SOURCE is required (usage: make sync-subs-source SOURCE=<source_id> [LIMIT=<n>])" >&2; \
-		exit 1; \
-	fi
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --source "$(SOURCE)" --skip-media --skip-meta
+	$(call require-source,sync-subs-source)
+	$(SYNC_BASE_CMD) --source "$(SOURCE)" $(SYNC_SUBS_ARGS)
 
 sync-subs-ja-source:
-	@if [ -z "$(SOURCE)" ]; then \
-		echo "error: SOURCE is required (usage: make sync-subs-ja-source SOURCE=<source_id> [LIMIT=<n>])" >&2; \
-		exit 1; \
-	fi
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) --source "$(SOURCE)" --skip-media --skip-meta --upstream-sub-langs-override "$(UPSTREAM_JA_SUB_LANGS)"
+	$(call require-source,sync-subs-ja-source)
+	$(SYNC_BASE_CMD) --source "$(SOURCE)" $(SYNC_SUBS_JA_ARGS)
 
 ledger:
 	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) $(LEDGER_DB_ARG)
