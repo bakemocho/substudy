@@ -4674,6 +4674,75 @@ enabled = true
         self.assertFalse(updated_payload["videos"][0]["is_disliked"])
         self.assertFalse(updated_payload["videos"][0]["is_not_interested"])
 
+    def test_media_endpoint_serves_registered_video_file(self):
+        media_path = self.workspace_root / "registered.mp4"
+        media_bytes = b"registered-media"
+        media_path.write_bytes(media_bytes)
+        now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            connection.execute(
+                """
+                INSERT INTO videos(
+                    source_id,
+                    video_id,
+                    title,
+                    media_path,
+                    has_media,
+                    synced_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("storiesofcz", "7611111111111111999", "registered", str(media_path), 1, now_iso),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        media_url = f"http://{host}:{port}/media/{self.mod.encode_path_token(media_path)}"
+        with urllib.request.urlopen(media_url, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.read(), media_bytes)
+
+    def test_media_endpoint_rejects_unregistered_local_file(self):
+        rogue_path = self.workspace_root / "rogue.txt"
+        rogue_path.write_text("secret", encoding="utf-8")
+
+        handler_class = self.mod.build_web_handler(
+            db_path=self.db_path,
+            static_dir=self.mod.WEB_STATIC_DIR,
+            allowed_source_ids=set(),
+            restrict_to_source_ids=False,
+        )
+        server = self.mod.ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: thread.join(timeout=3))
+
+        host, port = server.server_address
+        media_url = f"http://{host}:{port}/media/{self.mod.encode_path_token(rogue_path)}"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(media_url, timeout=5)
+        self.assertEqual(ctx.exception.code, 404)
+        ctx.exception.close()
+
     def test_playback_stats_record_and_feed(self):
         media_path = self.workspace_root / "storiesofcz_stats.mp4"
         media_path.write_bytes(b"")

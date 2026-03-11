@@ -13553,9 +13553,38 @@ def build_web_handler(
             self.end_headers()
             self.wfile.write(payload)
 
+        def _resolve_allowed_media_path(self, requested_path: Path) -> Path | None:
+            requested_path_value = str(requested_path)
+            if not requested_path_value:
+                return None
+            with self._open_connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT source_id, media_path
+                    FROM videos
+                    WHERE has_media = 1
+                      AND media_path = ?
+                    LIMIT 8
+                    """,
+                    (requested_path_value,),
+                ).fetchall()
+            for row in rows:
+                source_id = str(row["source_id"] or "").strip()
+                if not source_id or not self._is_source_allowed(source_id):
+                    continue
+                media_path_value = row["media_path"]
+                if media_path_value in (None, ""):
+                    continue
+                media_path = Path(str(media_path_value))
+                if not media_path.exists() or not media_path.is_file():
+                    continue
+                return media_path
+            return None
+
         def _serve_media_file(self, token: str) -> None:
-            media_path = decode_path_token(token)
-            if media_path is None or not media_path.exists() or not media_path.is_file():
+            decoded_path = decode_path_token(token)
+            media_path = None if decoded_path is None else self._resolve_allowed_media_path(decoded_path)
+            if media_path is None:
                 self._send_error_json(404, "Media file not found.")
                 return
 
