@@ -12198,40 +12198,61 @@ def append_source_track_to_method_version(method_version: str, source_track_kind
     return f"{safe_method_version}|{marker}"
 
 
-def find_best_subtitle_text_for_range(
+def find_best_subtitle_context_for_range(
     cues: list[dict[str, Any]],
     start_ms: int,
     end_ms: int,
-) -> str:
+) -> dict[str, str]:
+    empty = {
+        "previous_text": "",
+        "current_text": "",
+        "next_text": "",
+    }
     if not cues:
-        return ""
+        return empty
+
     safe_start_ms = max(0, int(start_ms))
     safe_end_ms = max(safe_start_ms, int(end_ms))
 
+    best_index = -1
     best_overlap = 0
-    best_text = ""
-    for cue in cues:
+    for index, cue in enumerate(cues):
         cue_start = max(0, int(cue.get("start_ms") or 0))
         cue_end = max(cue_start, int(cue.get("end_ms") or cue_start))
         overlap = min(safe_end_ms, cue_end) - max(safe_start_ms, cue_start)
         if overlap > best_overlap:
             best_overlap = overlap
-            best_text = str(cue.get("text") or "")
-    if best_text:
-        return best_text
+            best_index = index
 
-    target_ms = safe_start_ms
-    nearest_text = ""
-    nearest_distance = None
-    for cue in cues:
-        cue_start = max(0, int(cue.get("start_ms") or 0))
-        distance = abs(cue_start - target_ms)
-        if nearest_distance is None or distance < nearest_distance:
-            nearest_distance = distance
-            nearest_text = str(cue.get("text") or "")
-    if nearest_distance is not None and nearest_distance <= 1500:
-        return nearest_text
-    return ""
+    if best_index < 0:
+        target_ms = safe_start_ms
+        nearest_distance: int | None = None
+        for index, cue in enumerate(cues):
+            cue_start = max(0, int(cue.get("start_ms") or 0))
+            distance = abs(cue_start - target_ms)
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                best_index = index
+        if nearest_distance is None or nearest_distance > 1500:
+            return empty
+
+    current_text = str(cues[best_index].get("text") or "")
+    previous_text = str(cues[best_index - 1].get("text") or "") if best_index > 0 else ""
+    next_text = str(cues[best_index + 1].get("text") or "") if best_index + 1 < len(cues) else ""
+    return {
+        "previous_text": previous_text,
+        "current_text": current_text,
+        "next_text": next_text,
+    }
+
+
+def find_best_subtitle_text_for_range(
+    cues: list[dict[str, Any]],
+    start_ms: int,
+    end_ms: int,
+) -> str:
+    context = find_best_subtitle_context_for_range(cues, start_ms, end_ms)
+    return str(context.get("current_text") or "")
 
 
 def format_ms_to_clock(total_ms: int) -> str:
@@ -12387,6 +12408,55 @@ def resolve_ja_subtitle_path(
     if not path.exists() or not path.is_file():
         return None
     return path
+
+
+def resolve_workspace_context_track_path(
+    connection: sqlite3.Connection,
+    source_id: str,
+    video_id: str,
+    preferred_track_id: str = "",
+) -> Path | None:
+    preferred_track_id = str(preferred_track_id or "").strip()
+    if preferred_track_id:
+        preferred_track = get_track_for_video(connection, source_id, video_id, preferred_track_id)
+        if preferred_track is not None:
+            preferred_kind = str(preferred_track.get("kind") or "")
+            preferred_path_text = str(preferred_track.get("path") or "")
+            preferred_path = Path(preferred_path_text) if preferred_path_text else None
+            if (
+                preferred_path is not None
+                and preferred_path.exists()
+                and preferred_path.is_file()
+                and (
+                    preferred_kind == "asr"
+                    or (
+                        preferred_kind == "subtitle"
+                        and is_workspace_english_subtitle(
+                            preferred_track.get("language"),
+                            preferred_path_text,
+                        )
+                    )
+                )
+            ):
+                return preferred_path
+
+    asr_fallback: Path | None = None
+    for track in collect_video_tracks(connection, source_id, video_id):
+        track_path_text = str(track.get("path") or "")
+        if not track_path_text:
+            continue
+        track_path = Path(track_path_text)
+        if not track_path.exists() or not track_path.is_file():
+            continue
+        track_kind = str(track.get("kind") or "")
+        if track_kind == "subtitle" and is_workspace_english_subtitle(
+            track.get("language"),
+            track_path_text,
+        ):
+            return track_path
+        if asr_fallback is None and track_kind == "asr":
+            asr_fallback = track_path
+    return asr_fallback
 
 
 def serialize_bookmark_row(row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
@@ -12784,6 +12854,7 @@ def collect_workspace_review_and_missing_rows(
             break
 
     ja_cues_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    en_cues_cache: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 
     def resolve_ja_cues_for_workspace(source_id: str, video_id: str) -> list[dict[str, Any]]:
         key = (source_id, video_id)
@@ -12796,30 +12867,72 @@ def collect_workspace_review_and_missing_rows(
             ja_cues_cache[key] = parse_subtitle_cues(ja_path)
         return ja_cues_cache[key]
 
+    def resolve_en_cues_for_workspace(
+        source_id: str,
+        video_id: str,
+        track_id: str,
+    ) -> list[dict[str, Any]]:
+        key = (source_id, video_id, str(track_id or ""))
+        if key in en_cues_cache:
+            return en_cues_cache[key]
+        track_path = resolve_workspace_context_track_path(
+            connection,
+            source_id,
+            video_id,
+            preferred_track_id=track_id,
+        )
+        if track_path is None:
+            en_cues_cache[key] = []
+        else:
+            en_cues_cache[key] = parse_subtitle_cues(track_path)
+        return en_cues_cache[key]
+
     def to_workspace_card(serialized: dict[str, Any], include_card_id: bool) -> dict[str, Any]:
         term_norm = str(serialized.get("term_norm") or "")
         stats = term_stats.get(term_norm, {})
+        source_id = str(serialized["source_id"])
+        video_id = str(serialized["video_id"])
+        track_id = str(serialized.get("track") or "")
         cue_start_ms = int(serialized["cue_start_ms"])
         cue_end_ms = int(serialized["cue_end_ms"])
+        cue_en_text = str(serialized.get("cue_text") or "")
+        ja_context = find_best_subtitle_context_for_range(
+            resolve_ja_cues_for_workspace(source_id, video_id),
+            cue_start_ms,
+            cue_end_ms,
+        )
+        en_context = find_best_subtitle_context_for_range(
+            resolve_en_cues_for_workspace(source_id, video_id, track_id),
+            cue_start_ms,
+            cue_end_ms,
+        )
+        cue_ja_text = str(ja_context.get("current_text") or "")
         card_id = f"dictbm:{int(serialized['id'])}"
         card = {
             "card_id": card_id,
-            "source_id": str(serialized["source_id"]),
-            "video_id": str(serialized["video_id"]),
-            "track": str(serialized.get("track") or ""),
+            "source_id": source_id,
+            "video_id": video_id,
+            "track": track_id,
             "cue_start_ms": cue_start_ms,
             "cue_end_ms": cue_end_ms,
             "cue_start_label": format_ms_to_clock(cue_start_ms),
             "cue_end_label": format_ms_to_clock(cue_end_ms),
-            "cue_en_text": str(serialized.get("cue_text") or ""),
-            "cue_ja_text": find_best_subtitle_text_for_range(
-                resolve_ja_cues_for_workspace(
-                    str(serialized["source_id"]),
-                    str(serialized["video_id"]),
-                ),
-                cue_start_ms,
-                cue_end_ms,
-            ),
+            "cue_en_text": cue_en_text,
+            "cue_ja_text": cue_ja_text,
+            "cue_context": {
+                "previous": {
+                    "en": str(en_context.get("previous_text") or ""),
+                    "ja": str(ja_context.get("previous_text") or ""),
+                },
+                "current": {
+                    "en": cue_en_text or str(en_context.get("current_text") or ""),
+                    "ja": cue_ja_text,
+                },
+                "next": {
+                    "en": str(en_context.get("next_text") or ""),
+                    "ja": str(ja_context.get("next_text") or ""),
+                },
+            },
             "term": str(serialized.get("term") or ""),
             "term_norm": term_norm,
             "lookup_term": str(serialized.get("lookup_term") or ""),
@@ -12834,8 +12947,8 @@ def collect_workspace_review_and_missing_rows(
                 "/?"
                 + urlencode(
                     {
-                        "source_id": str(serialized["source_id"]),
-                        "video_id": str(serialized["video_id"]),
+                        "source_id": source_id,
+                        "video_id": video_id,
                         "t": str(max(0, int(round(cue_start_ms / 1000)))),
                     }
                 )

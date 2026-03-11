@@ -9636,6 +9636,164 @@ async function jumpToWorkspaceCue(item) {
   throw new Error("対象動画が現在のフィード条件で見つかりません。");
 }
 
+function collectWorkspaceCopyWords(text) {
+  const words = [];
+  const seen = new Set();
+  const value = String(text || "");
+  SUBTITLE_WORD_PATTERN.lastIndex = 0;
+  let match = SUBTITLE_WORD_PATTERN.exec(value);
+  while (match) {
+    const word = String(match[0] || "")
+      .replace(/[’‘]/g, "'")
+      .replace(/[`]/g, "'");
+    const normalized = normalizeDictionaryTerm(word);
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      words.push(word);
+      if (words.length >= 24) {
+        break;
+      }
+    }
+    match = SUBTITLE_WORD_PATTERN.exec(value);
+  }
+  return words;
+}
+
+async function lookupDictionaryEntriesForWorkspaceCopy(terms) {
+  const normalizedTerms = Array.isArray(terms) ? terms : [];
+  if (!normalizedTerms.length) {
+    return [];
+  }
+  try {
+    return await lookupDictionaryBatch(normalizedTerms, 4, false, "term");
+  } catch (_batchError) {
+    const items = [];
+    for (const term of normalizedTerms) {
+      try {
+        items.push(await lookupDictionary(term));
+      } catch (_singleError) {
+        items.push({
+          term,
+          normalized: normalizeDictionaryTerm(term),
+          results: [],
+        });
+      }
+    }
+    return items;
+  }
+}
+
+function buildWorkspaceCopyDictionaryRows(items) {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+  return items.map((item) => ({
+    word: String(item?.term || ""),
+    normalized: String(item?.normalized || ""),
+    entries: Array.isArray(item?.results)
+      ? item.results.map((entry) => ({
+        term: String(entry?.term || ""),
+        term_norm: String(entry?.term_norm || ""),
+        definition: String(entry?.definition || ""),
+        source_name: String(entry?.source_name || ""),
+      }))
+      : [],
+  }));
+}
+
+function readWorkspaceCueContext(item, direction, language) {
+  const context = item?.cue_context;
+  if (!context || typeof context !== "object") {
+    return "";
+  }
+  const bucket = context[direction];
+  if (!bucket || typeof bucket !== "object") {
+    return "";
+  }
+  return String(bucket[language] || "");
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text || "");
+  if (!value) {
+    throw new Error("コピーするテキストがありません。");
+  }
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("クリップボードへのコピーに失敗しました。");
+  }
+}
+
+async function buildWorkspaceCopyPayload(item) {
+  const cueEnText = String(item?.cue_en_text || "");
+  const cueJaText = String(item?.cue_ja_text || "");
+  const dictionaryWords = collectWorkspaceCopyWords(cueEnText);
+  const dictionaryItems = await lookupDictionaryEntriesForWorkspaceCopy(dictionaryWords);
+  return {
+    card_id: String(item?.card_id || item?.id || ""),
+    source_id: String(item?.source_id || ""),
+    video_id: String(item?.video_id || ""),
+    track: String(item?.track || ""),
+    cue_start_ms: Number(item?.cue_start_ms || 0),
+    cue_end_ms: Number(item?.cue_end_ms || 0),
+    cue_start_label: String(item?.cue_start_label || ""),
+    cue_end_label: String(item?.cue_end_label || ""),
+    lookup_term: String(item?.lookup_term || ""),
+    term: String(item?.term || ""),
+    definition: String(item?.definition || ""),
+    english: cueEnText,
+    japanese: cueJaText,
+    dictionary_entries_by_word: buildWorkspaceCopyDictionaryRows(dictionaryItems),
+    context: {
+      previous: {
+        english: readWorkspaceCueContext(item, "previous", "en"),
+        japanese: readWorkspaceCueContext(item, "previous", "ja"),
+      },
+      next: {
+        english: readWorkspaceCueContext(item, "next", "en"),
+        japanese: readWorkspaceCueContext(item, "next", "ja"),
+      },
+    },
+  };
+}
+
+function createWorkspaceCopyButton(item) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "workspace-jump-btn workspace-artifact-btn";
+  button.textContent = "JSONコピー";
+  button.addEventListener("click", async () => {
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = "コピー中...";
+    try {
+      const payload = await buildWorkspaceCopyPayload(item);
+      await copyTextToClipboard(JSON.stringify(payload, null, 2));
+      setStatus("復習 JSON をクリップボードにコピーしました。", "ok");
+    } catch (error) {
+      setStatus(error?.message || "復習 JSON のコピーに失敗しました。", "error");
+    } finally {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  });
+  return button;
+}
+
 function renderWorkspaceReviewItem(item) {
   const row = document.createElement("article");
   row.className = "workspace-item";
@@ -9698,6 +9856,11 @@ function renderWorkspaceReviewItem(item) {
     jumpToWorkspaceCue(item).catch((error) => setStatus(error.message, "error"));
   });
 
+  const actions = document.createElement("div");
+  actions.className = "workspace-artifact-actions";
+  actions.appendChild(action);
+  actions.appendChild(createWorkspaceCopyButton(item));
+
   row.appendChild(head);
   row.appendChild(cue);
   if (ja.textContent) {
@@ -9716,7 +9879,7 @@ function renderWorkspaceReviewItem(item) {
     row.appendChild(qaWarning);
   }
   row.appendChild(meta);
-  row.appendChild(action);
+  row.appendChild(actions);
   return row;
 }
 
@@ -9770,13 +9933,18 @@ function renderWorkspaceMissingItem(item) {
     jumpToWorkspaceCue(item).catch((error) => setStatus(error.message, "error"));
   });
 
+  const actions = document.createElement("div");
+  actions.className = "workspace-artifact-actions";
+  actions.appendChild(action);
+  actions.appendChild(createWorkspaceCopyButton(item));
+
   row.appendChild(head);
   row.appendChild(cue);
   if (qaWarning.textContent) {
     row.appendChild(qaWarning);
   }
   row.appendChild(meta);
-  row.appendChild(action);
+  row.appendChild(actions);
   return row;
 }
 
