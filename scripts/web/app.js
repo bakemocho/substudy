@@ -366,6 +366,7 @@ const state = {
   workspaceMissingEntries: [],
   workspaceDownloadMonitor: null,
   workspaceSourceProcessing: null,
+  workspaceYtdlpStatus: null,
   workspaceImportMonitor: null,
   workspaceArtifacts: [],
   sourceTargets: [],
@@ -449,7 +450,11 @@ const elements = {
   workspaceSourceTrend: document.getElementById("workspaceSourceTrend"),
   workspaceSourceProcessingSummary: document.getElementById("workspaceSourceProcessingSummary"),
   workspaceSourceProcessingList: document.getElementById("workspaceSourceProcessingList"),
+  workspaceYtdlpSummary: document.getElementById("workspaceYtdlpSummary"),
+  workspaceYtdlpRuns: document.getElementById("workspaceYtdlpRuns"),
   workspaceDownloadSummary: document.getElementById("workspaceDownloadSummary"),
+  workspaceDownloadTrendSummary: document.getElementById("workspaceDownloadTrendSummary"),
+  workspaceDownloadTrend: document.getElementById("workspaceDownloadTrend"),
   workspaceDownloadRuns: document.getElementById("workspaceDownloadRuns"),
   workspacePendingFailures: document.getElementById("workspacePendingFailures"),
   workspaceImportSummary: document.getElementById("workspaceImportSummary"),
@@ -530,6 +535,51 @@ const WORKSPACE_SOURCE_TREND_BAR_METRICS = [
   WORKSPACE_SOURCE_TREND_METRICS[0],
   WORKSPACE_SOURCE_TREND_METRICS[2],
   WORKSPACE_SOURCE_TREND_METRICS[3],
+];
+
+const WORKSPACE_DOWNLOAD_TREND_METRICS = [
+  {
+    key: "pending_count",
+    deltaKey: "delta_pending_count",
+    label: "未解消",
+    note: "download_state error",
+    color: "#ff9a73",
+  },
+  {
+    key: "transient_count",
+    deltaKey: "delta_transient_count",
+    label: "transient",
+    note: "extractor/webpage",
+    color: "#7da3ff",
+  },
+  {
+    key: "blocked_count",
+    deltaKey: "delta_blocked_count",
+    label: "blocked",
+    note: "IP block / 403",
+    color: "#ff7e96",
+  },
+  {
+    key: "no_subtitles_count",
+    deltaKey: "delta_no_subtitles_count",
+    label: "字幕なし",
+    note: "requested langs",
+    color: "#f7c967",
+  },
+  {
+    key: "recent_error_runs",
+    deltaKey: "delta_recent_error_runs",
+    label: "24h runs",
+    note: "error run count",
+    color: "#4fd3c7",
+  },
+];
+
+const WORKSPACE_DOWNLOAD_TREND_BAR_METRICS = [
+  WORKSPACE_DOWNLOAD_TREND_METRICS[0],
+  WORKSPACE_DOWNLOAD_TREND_METRICS[1],
+  WORKSPACE_DOWNLOAD_TREND_METRICS[2],
+  WORKSPACE_DOWNLOAD_TREND_METRICS[4],
 ];
 
 function mountDictionaryOverlayIntoAppShell() {
@@ -8607,6 +8657,7 @@ function resetWorkspaceState() {
   state.workspaceMissingEntries = [];
   state.workspaceDownloadMonitor = null;
   state.workspaceSourceProcessing = null;
+  state.workspaceYtdlpStatus = null;
   state.workspaceImportMonitor = null;
   state.workspaceArtifacts = [];
 }
@@ -9658,6 +9709,37 @@ function formatWorkspaceSignedCount(value) {
   return rounded > 0 ? `+${rounded}` : String(rounded);
 }
 
+function formatWorkspaceErrorCategoryLabel(category) {
+  const normalized = String(category || "").trim().toLowerCase();
+  if (normalized === "blocked") {
+    return "blocked";
+  }
+  if (normalized === "transient") {
+    return "transient";
+  }
+  if (normalized === "no_subtitles") {
+    return "字幕なし";
+  }
+  if (normalized === "missing_artifact") {
+    return "欠落";
+  }
+  if (normalized === "other") {
+    return "other";
+  }
+  return "";
+}
+
+function trimWorkspaceMessage(message, maxLength = 180) {
+  const value = String(message || "").trim();
+  if (!value) {
+    return "";
+  }
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
 function createSvgNode(tagName, attributes = {}) {
   const node = document.createElementNS("http://www.w3.org/2000/svg", tagName);
   for (const [key, value] of Object.entries(attributes)) {
@@ -10209,6 +10291,138 @@ function renderWorkspaceSourceTrend() {
   panelNode.appendChild(panel);
 }
 
+function renderWorkspaceDownloadTrend() {
+  if (elements.workspaceDownloadTrend) {
+    elements.workspaceDownloadTrend.textContent = "";
+  }
+
+  const trend = state.workspaceDownloadMonitor?.daily_trend || null;
+  const points = Array.isArray(trend?.points) ? trend.points : [];
+  const summaryNode = elements.workspaceDownloadTrendSummary;
+  const panelNode = elements.workspaceDownloadTrend;
+  if (!summaryNode || !panelNode) {
+    return;
+  }
+
+  if (points.length <= 0) {
+    summaryNode.textContent = "download error の日次スナップショットがまだありません。";
+    const empty = document.createElement("p");
+    empty.className = "hint";
+    empty.textContent = "Ops を開いた日から 1 日 1 回の error backlog を記録します。";
+    panelNode.appendChild(empty);
+    return;
+  }
+
+  const latest = trend?.latest || {};
+  const netChange = trend?.net_change || {};
+  const snapshotDays = Math.max(0, Number(trend?.snapshot_days || 0));
+  const windowDays = Math.max(1, Number(trend?.window_days || points.length || WORKSPACE_SOURCE_TREND_DAYS));
+  const endDate = String(trend?.end_date || points[points.length - 1]?.date || "");
+  summaryNode.textContent = `${windowDays}日推移 • 記録済み ${snapshotDays}/${windowDays} 日 • 未解消 ${formatWorkspaceSignedCount(netChange?.pending_count)} • transient ${formatWorkspaceSignedCount(netChange?.transient_count)} • blocked ${formatWorkspaceSignedCount(netChange?.blocked_count)} • 24h runs ${formatWorkspaceSignedCount(netChange?.recent_error_runs)} • 最新 ${formatWorkspaceTrendDate(endDate)}`;
+
+  const panel = document.createElement("div");
+  panel.className = "workspace-source-trend-card";
+
+  const metricsGrid = document.createElement("div");
+  metricsGrid.className = "workspace-source-trend-metrics";
+  for (const metric of WORKSPACE_DOWNLOAD_TREND_METRICS) {
+    metricsGrid.appendChild(buildWorkspaceTrendMetricCard(metric, trend));
+  }
+
+  const deltaSection = document.createElement("div");
+  deltaSection.className = "workspace-source-delta-section";
+
+  const deltaHead = document.createElement("div");
+  deltaHead.className = "workspace-source-delta-head";
+
+  const deltaTitleWrap = document.createElement("div");
+  deltaTitleWrap.className = "workspace-source-delta-title-wrap";
+
+  const deltaTitle = document.createElement("strong");
+  deltaTitle.className = "workspace-source-delta-title";
+  deltaTitle.textContent = "日次差分";
+
+  const deltaSubtitle = document.createElement("span");
+  deltaSubtitle.className = "workspace-source-delta-subtitle";
+  deltaSubtitle.textContent = `終点: 未解消 ${Math.max(0, Number(latest?.pending_count || 0))} / transient ${Math.max(0, Number(latest?.transient_count || 0))} / blocked ${Math.max(0, Number(latest?.blocked_count || 0))} / 24h runs ${Math.max(0, Number(latest?.recent_error_runs || 0))}`;
+
+  deltaTitleWrap.appendChild(deltaTitle);
+  deltaTitleWrap.appendChild(deltaSubtitle);
+
+  const legend = document.createElement("div");
+  legend.className = "workspace-source-trend-legend";
+  for (const metric of WORKSPACE_DOWNLOAD_TREND_BAR_METRICS) {
+    legend.appendChild(createWorkspaceTrendLegendItem(metric.label, metric.color));
+  }
+
+  deltaHead.appendChild(deltaTitleWrap);
+  deltaHead.appendChild(legend);
+  deltaSection.appendChild(deltaHead);
+  deltaSection.appendChild(buildWorkspaceDeltaBarChartSvg(points, WORKSPACE_DOWNLOAD_TREND_BAR_METRICS));
+
+  panel.appendChild(metricsGrid);
+  panel.appendChild(deltaSection);
+  panelNode.appendChild(panel);
+}
+
+function renderWorkspaceYtdlpStatus() {
+  const summaryNode = elements.workspaceYtdlpSummary;
+  if (!summaryNode) {
+    return;
+  }
+  const status = state.workspaceYtdlpStatus || {};
+  const latest = status?.latest || null;
+  const latestUpdated = status?.latest_updated || null;
+  const configuredBin = String(status?.configured_bin || "").trim();
+  const currentVersion = String(status?.current_version || "").trim();
+
+  if (!latest) {
+    summaryNode.textContent = configuredBin
+      ? `target=${configuredBin} • 更新履歴はまだありません。`
+      : "yt-dlp 更新履歴はまだありません。";
+  } else {
+    const latestStatus = String(latest?.status || "");
+    const latestManager = String(latest?.manager || "");
+    const latestWhen = formatShortIso(latest?.finished_at || latest?.started_at);
+    const updateLabel = latestUpdated
+      ? `最終更新 ${formatShortIso(latestUpdated?.finished_at || latestUpdated?.started_at)}`
+      : "更新履歴なし";
+    summaryNode.textContent = `${updateLabel} • 現在 ${currentVersion || "unknown"} • 最新実行 ${latestWhen} (${latestStatus}/${latestManager || "unknown"})${configuredBin ? ` • target=${configuredBin}` : ""}`;
+  }
+
+  renderWorkspaceList(
+    elements.workspaceYtdlpRuns,
+    Array.isArray(status?.recent_runs) ? status.recent_runs : [],
+    (run) => {
+      const row = document.createElement("article");
+      row.className = "workspace-item compact";
+
+      const title = document.createElement("p");
+      title.className = "workspace-item-title";
+      title.textContent = `yt-dlp • ${String(run?.status || "")} • ${String(run?.trigger || "")}/${String(run?.manager || "")}`;
+
+      const meta = document.createElement("p");
+      meta.className = "workspace-item-meta";
+      const versionBefore = String(run?.version_before || "").trim() || "unknown";
+      const versionAfter = String(run?.version_after || "").trim() || versionBefore;
+      meta.textContent = `${formatShortIso(run?.finished_at || run?.started_at)} • ${versionBefore} -> ${versionAfter} • ${String(run?.mode || "")}`;
+
+      row.appendChild(title);
+      row.appendChild(meta);
+
+      const message = trimWorkspaceMessage(run?.message || "");
+      if (message) {
+        const detail = document.createElement("p");
+        detail.className = "workspace-item-meta";
+        detail.textContent = message;
+        row.appendChild(detail);
+      }
+      return row;
+    },
+    "yt-dlp 更新履歴はありません。"
+  );
+}
+
 function renderWorkspaceSourceProcessing() {
   if (elements.workspaceSourceProcessingList) {
     elements.workspaceSourceProcessingList.textContent = "";
@@ -10689,7 +10903,10 @@ function renderWorkspaceDownloadRuns() {
 
       const title = document.createElement("p");
       title.className = "workspace-item-title";
-      title.textContent = `${String(run?.stage || "")} • ${String(run?.status || "")} • ${String(run?.source_id || "")}`;
+      const errorCategory = formatWorkspaceErrorCategoryLabel(run?.error_category || "");
+      title.textContent = errorCategory
+        ? `${String(run?.stage || "")} • ${String(run?.status || "")} • ${errorCategory} • ${String(run?.source_id || "")}`
+        : `${String(run?.stage || "")} • ${String(run?.status || "")} • ${String(run?.source_id || "")}`;
 
       const meta = document.createElement("p");
       meta.className = "workspace-item-meta";
@@ -10724,7 +10941,7 @@ function renderWorkspaceDownloadRuns() {
       if (errorMessage) {
         const detail = document.createElement("p");
         detail.className = "workspace-item-meta";
-        detail.textContent = errorMessage;
+        detail.textContent = trimWorkspaceMessage(errorMessage, 220);
         row.appendChild(detail);
       }
       return row;
@@ -10743,7 +10960,10 @@ function renderWorkspacePendingFailures() {
 
       const title = document.createElement("p");
       title.className = "workspace-item-title";
-      title.textContent = `failure • ${String(failure?.source_id || "")}/${String(failure?.video_id || "")}`;
+      const errorCategory = formatWorkspaceErrorCategoryLabel(failure?.error_category || "");
+      title.textContent = errorCategory
+        ? `failure • ${errorCategory} • ${String(failure?.source_id || "")}/${String(failure?.video_id || "")}`
+        : `failure • ${String(failure?.source_id || "")}/${String(failure?.video_id || "")}`;
 
       const meta = document.createElement("p");
       meta.className = "workspace-item-meta";
@@ -10751,6 +10971,13 @@ function renderWorkspacePendingFailures() {
 
       row.appendChild(title);
       row.appendChild(meta);
+      const lastError = trimWorkspaceMessage(failure?.last_error || "", 220);
+      if (lastError) {
+        const detail = document.createElement("p");
+        detail.className = "workspace-item-meta";
+        detail.textContent = lastError;
+        row.appendChild(detail);
+      }
       return row;
     },
     "未解消エラーはありません。"
@@ -10856,10 +11083,16 @@ function renderWorkspacePanels() {
   }
   if (elements.workspaceDownloadSummary) {
     const sinceHours = Number(state.workspaceDownloadMonitor?.since_hours || WORKSPACE_SINCE_HOURS);
+    const trendRunLookbackHours = Number(state.workspaceDownloadMonitor?.trend_run_lookback_hours || 24);
     const recentRuns = Array.isArray(state.workspaceDownloadMonitor?.recent_runs)
       ? state.workspaceDownloadMonitor.recent_runs.length
       : 0;
-    elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} / 未解消エラー=${pendingCount}`;
+    const categoryCounts = state.workspaceDownloadMonitor?.pending_category_counts || {};
+    const transientCount = Number(categoryCounts?.transient || 0);
+    const blockedCount = Number(categoryCounts?.blocked || 0);
+    const noSubtitlesCount = Number(categoryCounts?.no_subtitles || 0);
+    const recentErrorRuns = Number(state.workspaceDownloadMonitor?.recent_error_runs || 0);
+    elements.workspaceDownloadSummary.textContent = `直近${sinceHours}h: runs=${recentRuns} • ${trendRunLookbackHours}h error runs=${recentErrorRuns} • 未解消=${pendingCount} (transient:${transientCount} blocked:${blockedCount} 字幕なし:${noSubtitlesCount})`;
   }
   if (elements.workspaceImportSummary) {
     const latest = state.workspaceImportMonitor?.latest || null;
@@ -10884,6 +11117,8 @@ function renderWorkspacePanels() {
   );
   renderWorkspaceSourceTrend();
   renderWorkspaceSourceProcessing();
+  renderWorkspaceYtdlpStatus();
+  renderWorkspaceDownloadTrend();
   renderWorkspaceDownloadRuns();
   renderWorkspacePendingFailures();
   renderWorkspaceImportRuns();
@@ -10927,6 +11162,7 @@ async function loadWorkspaceData(options = {}) {
   state.workspaceMissingEntries = Array.isArray(payload.missing_entries) ? payload.missing_entries : [];
   state.workspaceDownloadMonitor = payload.download_monitor || null;
   state.workspaceSourceProcessing = payload.source_processing || null;
+  state.workspaceYtdlpStatus = payload.ytdlp_status || null;
   state.workspaceImportMonitor = payload.import_monitor || null;
   state.workspaceArtifacts = Array.isArray(payload.artifacts) ? payload.artifacts : [];
   renderWorkspacePanels();

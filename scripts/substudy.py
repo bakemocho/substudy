@@ -188,7 +188,9 @@ RE_RETRY_REQUESTED_SUBTITLES_UNAVAILABLE = re.compile(
     re.IGNORECASE,
 )
 RE_RETRY_MISSING_ARTIFACT = re.compile(
-    r"(subtitle file missing after download attempt|did not write a terminal download_state row)",
+    r"(subtitle file missing after download attempt|"
+    r"metadata file missing after download attempt|"
+    r"did not write a terminal download_state row)",
     re.IGNORECASE,
 )
 RE_TIKTOK_ERROR_VIDEO_ID = re.compile(
@@ -202,6 +204,16 @@ TIKTOK_TRANSIENT_WEBPAGE_FAILURE_ERROR = (
     "ERROR: [TikTok] Unable to extract universal data for rehydration"
 )
 CHUNKED_STAGE_TRANSIENT_FAILURE_BREAKER_THRESHOLD = 2
+CHUNKED_STAGE_STOPWORTHY_FAILURE_RATIO_THRESHOLD = 0.6
+CHUNKED_STAGE_STOPWORTHY_FAILURE_MIN_COUNT = 2
+WORKSPACE_DOWNLOAD_TREND_RUN_LOOKBACK_HOURS = 24
+DOWNLOAD_ERROR_CATEGORY_KEYS = (
+    "blocked",
+    "transient",
+    "no_subtitles",
+    "missing_artifact",
+    "other",
+)
 
 _YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
 _YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
@@ -550,6 +562,81 @@ def resolve_executable_command(command: str) -> str:
     if is_path_like_command(value):
         return str(Path(value).expanduser())
     return value
+
+
+def read_toml_file(path: Path) -> dict[str, Any]:
+    with path.open("rb") as fh:
+        data = tomllib.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("Config root must be a TOML table.")
+    return cast(dict[str, Any], data)
+
+
+def resolve_configured_ytdlp_bin_from_config(config_path: Path) -> str:
+    try:
+        config = read_toml_file(config_path)
+    except (FileNotFoundError, tomllib.TOMLDecodeError, ValueError):
+        return ""
+    global_raw = config.get("global", {})
+    if not isinstance(global_raw, dict):
+        return ""
+    raw_value = global_raw.get("ytdlp_bin", "")
+    if raw_value in (None, ""):
+        return ""
+    return resolve_executable_command(str(raw_value))
+
+
+def resolve_effective_ytdlp_bin_from_config(config_path: Path) -> str:
+    configured = resolve_configured_ytdlp_bin_from_config(config_path)
+    if configured:
+        if is_path_like_command(configured):
+            candidate = Path(configured).expanduser()
+            if candidate.exists():
+                return str(candidate)
+        else:
+            resolved = find_executable_command(configured)
+            if resolved:
+                return resolved
+    fallback = find_executable_command("yt-dlp")
+    return str(fallback or "")
+
+
+def is_uv_managed_ytdlp_bin(ytdlp_bin: str | None) -> bool:
+    value = str(ytdlp_bin or "").strip()
+    if not value:
+        return False
+    expanded = str(Path(value).expanduser())
+    home_prefix = str(Path.home() / ".local")
+    if expanded == str(Path.home() / ".local" / "bin" / "yt-dlp"):
+        return True
+    return expanded.startswith(str(Path(home_prefix) / "share" / "uv" / "tools" / "yt-dlp"))
+
+
+def probe_command_version(command: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    output = "\n".join(
+        part.strip()
+        for part in (completed.stdout, completed.stderr)
+        if str(part or "").strip()
+    ).strip()
+    if completed.returncode != 0 or not output:
+        return ""
+    return output.splitlines()[0].strip()
+
+
+def probe_ytdlp_version(ytdlp_bin: str | None) -> str:
+    value = str(ytdlp_bin or "").strip()
+    if not value:
+        return ""
+    return probe_command_version([value, "--version"])
 
 
 def parse_optional_path(base: Path, raw_value: Any) -> Path | None:
@@ -1607,6 +1694,180 @@ def summarize_command_failure(output_text: str | None, exit_code: int) -> str:
     return f"command exit code {exit_code}"
 
 
+def summarize_output_excerpt(output_text: str | None, max_chars: int = 4000) -> str:
+    lines = [
+        line.strip()
+        for line in str(output_text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+    excerpt = " | ".join(lines[:12]).strip()
+    if len(excerpt) > max_chars:
+        return excerpt[: max(0, max_chars - 3)].rstrip() + "..."
+    return excerpt
+
+
+def build_ytdlp_update_command(
+    manager: str,
+    *,
+    uv_with_curl_cffi: bool,
+) -> tuple[list[str] | None, str | None]:
+    normalized_manager = str(manager or "").strip().lower()
+    if normalized_manager == "uv":
+        uv_bin = find_executable_command("uv")
+        if not uv_bin:
+            return None, "uv not found; cannot update yt-dlp via uv"
+        command = [uv_bin, "tool", "install", "yt-dlp"]
+        if uv_with_curl_cffi:
+            command.extend(["--with", "curl-cffi"])
+        command.append("--force")
+        return command, None
+    if normalized_manager == "brew":
+        brew_bin = find_executable_command("brew")
+        if not brew_bin:
+            return None, "Homebrew not found; cannot update yt-dlp via brew"
+        formula_check = subprocess.run(
+            [brew_bin, "list", "--formula", "yt-dlp"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if formula_check.returncode != 0:
+            return None, "yt-dlp is not installed as a Homebrew formula"
+        return [brew_bin, "upgrade", "yt-dlp"], None
+    if normalized_manager == "off":
+        return None, "yt-dlp update skipped (mode=off)"
+    return None, f"unsupported yt-dlp update manager: {manager}"
+
+
+def determine_ytdlp_update_manager(
+    *,
+    mode: str,
+    runtime_bin: str | None,
+) -> str:
+    normalized_mode = str(mode or "auto").strip().lower() or "auto"
+    if normalized_mode in {"off", "uv", "brew"}:
+        return normalized_mode
+    if is_uv_managed_ytdlp_bin(runtime_bin):
+        return "uv"
+    return "brew"
+
+
+def run_ytdlp_update(
+    *,
+    db_path: Path,
+    config_path: Path,
+    mode: str,
+    trigger: str,
+    uv_with_curl_cffi: bool,
+) -> int:
+    normalized_mode = str(mode or "auto").strip().lower() or "auto"
+    normalized_trigger = str(trigger or "manual").strip().lower() or "manual"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = now_utc_iso()
+    target_bin_before = resolve_effective_ytdlp_bin_from_config(config_path)
+    version_before = probe_ytdlp_version(target_bin_before)
+    manager = determine_ytdlp_update_manager(
+        mode=normalized_mode,
+        runtime_bin=target_bin_before,
+    )
+    command, build_error = build_ytdlp_update_command(
+        manager,
+        uv_with_curl_cffi=uv_with_curl_cffi,
+    )
+
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        create_schema(connection)
+
+        run_id = begin_ytdlp_update_run(
+            connection=connection,
+            trigger=normalized_trigger,
+            mode=normalized_mode,
+            manager=manager,
+            command=command,
+            target_bin_before=target_bin_before,
+            version_before=version_before,
+            started_at=started_at,
+        )
+
+        if build_error:
+            finish_ytdlp_update_run(
+                connection=connection,
+                run_id=run_id,
+                status="noop" if manager == "off" else "error",
+                finished_at=now_utc_iso(),
+                target_bin_after=target_bin_before,
+                version_after=version_before,
+                message=build_error,
+            )
+            connection.commit()
+            print(f"[yt-dlp-update] {build_error}")
+            return 0 if manager == "off" else 1
+
+        assert command is not None
+        print(
+            "[yt-dlp-update] "
+            f"trigger={normalized_trigger} mode={normalized_mode} manager={manager} "
+            f"target={target_bin_before or 'not-found'}"
+        )
+        exit_code, output_text = run_command_with_output(command, dry_run=False)
+        target_bin_after = resolve_effective_ytdlp_bin_from_config(config_path)
+        version_after = probe_ytdlp_version(target_bin_after)
+        output_excerpt = summarize_output_excerpt(output_text)
+
+        if exit_code != 0:
+            message = summarize_command_failure(output_text, exit_code)
+            finish_ytdlp_update_run(
+                connection=connection,
+                run_id=run_id,
+                status="error",
+                finished_at=now_utc_iso(),
+                target_bin_after=target_bin_after,
+                version_after=version_after,
+                message=message,
+            )
+            connection.commit()
+            print(f"[yt-dlp-update] error: {message}", file=sys.stderr)
+            return 1
+
+        updated = bool(version_after) and version_after != version_before
+        status = "updated" if updated else "noop"
+        if updated:
+            message = (
+                f"yt-dlp updated via {manager}: "
+                f"{version_before or 'unknown'} -> {version_after}"
+            )
+        else:
+            message = (
+                f"yt-dlp unchanged via {manager}: "
+                f"{version_after or version_before or 'unknown'}"
+            )
+        if output_excerpt:
+            message = f"{message} | {output_excerpt}"
+        finish_ytdlp_update_run(
+            connection=connection,
+            run_id=run_id,
+            status=status,
+            finished_at=now_utc_iso(),
+            target_bin_after=target_bin_after,
+            version_after=version_after,
+            message=message,
+        )
+        connection.commit()
+        print(
+            "[yt-dlp-update] "
+            f"status={status} version={version_before or 'unknown'} -> {version_after or 'unknown'}"
+        )
+        return 0
+    finally:
+        connection.close()
+
+
 def probe_network_quality(
     probe_url: str,
     timeout_sec: int,
@@ -2045,35 +2306,50 @@ def extract_tiktok_error_messages(
     return error_messages
 
 
-def extract_tiktok_transient_retry_video_ids(
-    output_text: str | None,
-    candidate_video_ids: Iterable[str],
+def extract_tiktok_transient_retry_video_ids_from_messages(
+    error_messages: dict[str, str],
 ) -> list[str]:
     retry_ids: list[str] = []
-    for video_id, message in extract_tiktok_error_messages(output_text, candidate_video_ids).items():
+    for video_id, message in error_messages.items():
         if RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message) is None:
             continue
         retry_ids.append(video_id)
     return retry_ids
 
 
-def extract_tiktok_transient_retry_error_messages(
+def extract_tiktok_transient_retry_video_ids(
     output_text: str | None,
     candidate_video_ids: Iterable[str],
+) -> list[str]:
+    return extract_tiktok_transient_retry_video_ids_from_messages(
+        extract_tiktok_error_messages(output_text, candidate_video_ids)
+    )
+
+
+def merge_retry_error_messages(
+    initial_error_messages: dict[str, str],
+    retry_video_ids: Iterable[str],
+    retry_error_messages: dict[str, str],
 ) -> dict[str, str]:
-    transient_messages: dict[str, str] = {}
-    for video_id, message in extract_tiktok_error_messages(output_text, candidate_video_ids).items():
-        if RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message) is None:
+    merged_messages = {
+        str(video_id).strip(): str(message or "").strip()
+        for video_id, message in initial_error_messages.items()
+        if str(video_id).strip() and str(message or "").strip()
+    }
+    retry_id_set = {
+        str(video_id or "").strip()
+        for video_id in retry_video_ids
+        if str(video_id or "").strip()
+    }
+    for video_id in retry_id_set:
+        merged_messages.pop(video_id, None)
+    for video_id, message in retry_error_messages.items():
+        normalized_video_id = str(video_id or "").strip()
+        normalized_message = str(message or "").strip()
+        if not normalized_video_id or not normalized_message:
             continue
-        transient_messages[video_id] = message
-    return transient_messages
-
-
-def extract_tiktok_error_video_ids(
-    output_text: str | None,
-    candidate_video_ids: Iterable[str],
-) -> set[str]:
-    return set(extract_tiktok_error_messages(output_text, candidate_video_ids))
+        merged_messages[normalized_video_id] = normalized_message
+    return merged_messages
 
 
 def extract_requested_subtitles_unavailable_video_ids(
@@ -2175,21 +2451,40 @@ def collect_chunked_plan_output_hints(
     )
 
 
-def record_chunked_plan_transient_webpage_errors(
+def record_chunked_plan_video_errors(
     plan: ChunkedYtdlpStagePlan,
     error_messages: dict[str, str],
 ) -> None:
     extend_payload_video_error_messages(
         plan.payload,
-        "transient_webpage_error_messages",
+        "video_error_messages",
         error_messages,
     )
+
+
+def summarize_chunked_plan_video_error_messages(
+    error_messages: dict[str, str],
+) -> str | None:
+    if not error_messages:
+        return None
+    categorized_messages: dict[str, str] = {}
+    for video_id, message in error_messages.items():
+        formatted_message = format_tiktok_video_error_message(video_id, message)
+        category = classify_download_error_category(formatted_message)
+        categorized_messages.setdefault(category, formatted_message)
+    for category in ("blocked", "transient", "other"):
+        candidate = categorized_messages.get(category)
+        if candidate:
+            if category == "transient":
+                return TIKTOK_TRANSIENT_WEBPAGE_FAILURE_ERROR
+            return candidate
+    return next(iter(categorized_messages.values()), None)
 
 
 def evaluate_chunked_plan_transient_circuit_breaker(
     plan: ChunkedYtdlpStagePlan,
     chunk_pairs: list[tuple[str, str]],
-    final_transient_error_messages: dict[str, str],
+    final_error_messages: dict[str, str],
 ) -> None:
     chunk_target_ids = [
         str(video_id or "").strip()
@@ -2199,37 +2494,65 @@ def evaluate_chunked_plan_transient_circuit_breaker(
     if not chunk_target_ids:
         return
 
-    transient_error_ids = {
-        str(video_id).strip()
-        for video_id in final_transient_error_messages
-        if str(video_id).strip()
-    }
-    all_targets_failed_transiently = all(
-        video_id in transient_error_ids
-        for video_id in chunk_target_ids
+    blocked_error_ids: set[str] = set()
+    transient_error_ids: set[str] = set()
+    for video_id, message in final_error_messages.items():
+        normalized_video_id = str(video_id or "").strip()
+        if not normalized_video_id:
+            continue
+        formatted_message = format_tiktok_video_error_message(normalized_video_id, message)
+        if is_blocked_or_forbidden_error(formatted_message):
+            blocked_error_ids.add(normalized_video_id)
+            continue
+        if is_tiktok_transient_webpage_error(formatted_message):
+            transient_error_ids.add(normalized_video_id)
+
+    stopworthy_error_ids = blocked_error_ids | transient_error_ids
+    chunk_target_count = len(chunk_target_ids)
+    stopworthy_failure_threshold = max(
+        CHUNKED_STAGE_STOPWORTHY_FAILURE_MIN_COUNT,
+        int(math.ceil(chunk_target_count * CHUNKED_STAGE_STOPWORTHY_FAILURE_RATIO_THRESHOLD)),
     )
+    high_rate_stopworthy_failures = len(stopworthy_error_ids) >= stopworthy_failure_threshold
     consecutive_failures = int(
         plan.payload.get("consecutive_transient_failure_chunks", 0) or 0
     )
-    if all_targets_failed_transiently:
+    if blocked_error_ids:
+        consecutive_failures = CHUNKED_STAGE_TRANSIENT_FAILURE_BREAKER_THRESHOLD
+    elif high_rate_stopworthy_failures:
         consecutive_failures += 1
     else:
         consecutive_failures = 0
     plan.payload["consecutive_transient_failure_chunks"] = consecutive_failures
 
     if (
-        all_targets_failed_transiently
+        blocked_error_ids
+        and plan.chunk_index + 1 < len(plan.url_chunks)
+    ):
+        plan.halt_reason = (
+            "circuit breaker: stop remaining chunks after TikTok blocked/forbidden errors; "
+            f"affected={len(blocked_error_ids)}/{chunk_target_count}"
+        )
+        print(
+            f"[{plan.stage}] {plan.source.id}: circuit breaker triggered "
+            f"after blocked/forbidden errors in current chunk "
+            f"({len(blocked_error_ids)}/{chunk_target_count}); stop remaining chunks"
+        )
+        return
+
+    if (
+        high_rate_stopworthy_failures
         and consecutive_failures >= CHUNKED_STAGE_TRANSIENT_FAILURE_BREAKER_THRESHOLD
         and plan.chunk_index + 1 < len(plan.url_chunks)
     ):
         plan.halt_reason = (
-            "circuit breaker: stop remaining chunks after consecutive all-target transient "
-            "TikTok webpage extractor failures"
+            "circuit breaker: stop remaining chunks after consecutive high-rate "
+            "TikTok transient failures"
         )
         print(
             f"[{plan.stage}] {plan.source.id}: circuit breaker triggered "
-            f"after {consecutive_failures} consecutive transient-failure chunks; "
-            "stop remaining chunks"
+            f"after {consecutive_failures} consecutive high-rate transient-failure chunks "
+            f"({len(stopworthy_error_ids)}/{chunk_target_count}); stop remaining chunks"
         )
 
 
@@ -2270,16 +2593,15 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                     dry_run=dry_run,
                 )
                 collect_chunked_plan_output_hints(plan, output_text, chunk_pairs)
-                final_transient_error_messages = extract_tiktok_transient_retry_error_messages(
+                final_error_messages = extract_tiktok_error_messages(
                     output_text,
                     [video_id for video_id, _url in chunk_pairs],
                 )
-                transient_retry_ids = list(final_transient_error_messages)
+                transient_retry_ids = extract_tiktok_transient_retry_video_ids_from_messages(
+                    final_error_messages
+                )
                 if transient_retry_ids:
-                    original_error_ids = extract_tiktok_error_video_ids(
-                        output_text,
-                        [video_id for video_id, _url in chunk_pairs],
-                    )
+                    original_error_ids = set(final_error_messages)
                     retry_id_set = set(transient_retry_ids)
                     retry_pairs = [
                         (video_id, url)
@@ -2305,9 +2627,14 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                             retry_output_text,
                             retry_pairs,
                         )
-                        final_transient_error_messages = extract_tiktok_transient_retry_error_messages(
+                        retry_error_messages = extract_tiktok_error_messages(
                             retry_output_text,
                             [video_id for video_id, _url in retry_pairs],
+                        )
+                        final_error_messages = merge_retry_error_messages(
+                            final_error_messages,
+                            retry_id_set,
+                            retry_error_messages,
                         )
                         if retry_exit_code == 0:
                             if plan.exit_code != 0 and original_error_ids.issubset(retry_id_set):
@@ -2322,15 +2649,15 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                             )
                 if plan.exit_code != 0:
                     plan.error = summarize_command_failure(output_text, plan.exit_code)
-                record_chunked_plan_transient_webpage_errors(
+                record_chunked_plan_video_errors(
                     plan,
-                    final_transient_error_messages,
+                    final_error_messages,
                 )
                 if plan.error is None:
                     evaluate_chunked_plan_transient_circuit_breaker(
                         plan,
                         chunk_pairs,
-                        final_transient_error_messages,
+                        final_error_messages,
                     )
             except Exception as exc:
                 plan.exit_code = 1
@@ -2763,14 +3090,19 @@ def summarize_chunked_plan_stage_error(
 ) -> str | None:
     if not failed_target_ids:
         return None
+    summarized_video_error = summarize_chunked_plan_video_error_messages(
+        get_payload_video_error_messages(plan.payload, "video_error_messages")
+    )
     if plan.halt_reason:
+        if summarized_video_error:
+            return f"{plan.halt_reason}; latest: {summarized_video_error}"
         return plan.halt_reason
     if plan.unresolved_target_ids and plan.error is None and plan.exit_code == 0:
         return unresolved_targets_message
-    if get_payload_video_error_messages(plan.payload, "transient_webpage_error_messages"):
+    if summarized_video_error:
         if plan.error:
             return plan.error
-        return TIKTOK_TRANSIENT_WEBPAGE_FAILURE_ERROR
+        return summarized_video_error
     if plan.error:
         return plan.error
     if plan.exit_code != 0:
@@ -2856,9 +3188,9 @@ def finalize_subtitle_download_plan(
         )
         if str(video_id).strip()
     }
-    transient_webpage_error_messages = get_payload_video_error_messages(
+    video_error_messages = get_payload_video_error_messages(
         plan.payload,
-        "transient_webpage_error_messages",
+        "video_error_messages",
     )
     if connection is not None:
         upsert_stage_download_success_states(
@@ -2883,10 +3215,10 @@ def finalize_subtitle_download_plan(
         def resolve_subtitle_failure_reason(video_id: str) -> str:
             if video_id in plan.unresolved_target_ids:
                 return "cannot build video URL for subtitle download target"
-            if video_id in transient_webpage_error_messages:
+            if video_id in video_error_messages:
                 return format_tiktok_video_error_message(
                     video_id,
-                    transient_webpage_error_messages[video_id],
+                    video_error_messages[video_id],
                 )
             if video_id in requested_subtitles_unavailable_ids:
                 return REQUESTED_SUBTITLES_UNAVAILABLE_ERROR
@@ -3115,9 +3447,9 @@ def finalize_metadata_download_plan(
         plan,
         successful_ids=list_meta_ids(source.meta_dir),
     )
-    transient_webpage_error_messages = get_payload_video_error_messages(
+    video_error_messages = get_payload_video_error_messages(
         plan.payload,
-        "transient_webpage_error_messages",
+        "video_error_messages",
     )
 
     if connection is not None:
@@ -3134,10 +3466,10 @@ def finalize_metadata_download_plan(
         def resolve_metadata_failure_reason(video_id: str) -> str:
             if video_id in plan.unresolved_target_ids:
                 return "cannot build video URL for metadata download target"
-            if video_id in transient_webpage_error_messages:
+            if video_id in video_error_messages:
                 return format_tiktok_video_error_message(
                     video_id,
-                    transient_webpage_error_messages[video_id],
+                    video_error_messages[video_id],
                 )
             if plan.error:
                 return plan.error
@@ -5004,6 +5336,43 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_playback_stats(last_played_at DESC, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_workspace_source_daily_metrics_date
             ON workspace_source_daily_metrics(snapshot_date DESC, source_id);
+
+        CREATE TABLE IF NOT EXISTS workspace_download_daily_metrics (
+            snapshot_date TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            pending_count INTEGER NOT NULL DEFAULT 0,
+            blocked_count INTEGER NOT NULL DEFAULT 0,
+            transient_count INTEGER NOT NULL DEFAULT 0,
+            no_subtitles_count INTEGER NOT NULL DEFAULT 0,
+            missing_artifact_count INTEGER NOT NULL DEFAULT 0,
+            other_count INTEGER NOT NULL DEFAULT 0,
+            recent_error_runs INTEGER NOT NULL DEFAULT 0,
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (snapshot_date, source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspace_download_daily_metrics_date
+            ON workspace_download_daily_metrics(snapshot_date DESC, source_id);
+
+        CREATE TABLE IF NOT EXISTS ytdlp_update_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            manager TEXT NOT NULL,
+            status TEXT NOT NULL,
+            command TEXT,
+            target_bin_before TEXT,
+            target_bin_after TEXT,
+            version_before TEXT,
+            version_after TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            message TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ytdlp_update_runs_finished
+            ON ytdlp_update_runs(finished_at DESC, started_at DESC, run_id DESC);
+
         CREATE INDEX IF NOT EXISTS idx_subtitle_bookmarks_lookup
             ON subtitle_bookmarks(source_id, video_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_notes_lookup
@@ -6301,6 +6670,18 @@ def is_missing_artifact_error(error_message: str | None) -> bool:
     return RE_RETRY_MISSING_ARTIFACT.search(text) is not None
 
 
+def classify_download_error_category(error_message: str | None) -> str:
+    if is_blocked_or_forbidden_error(error_message):
+        return "blocked"
+    if is_tiktok_transient_webpage_error(error_message):
+        return "transient"
+    if is_requested_subtitles_unavailable_error(error_message):
+        return "no_subtitles"
+    if is_missing_artifact_error(error_message):
+        return "missing_artifact"
+    return "other"
+
+
 def is_source_network_cooldown_error(error_message: str | None) -> bool:
     return is_blocked_or_forbidden_error(error_message)
 
@@ -6399,6 +6780,79 @@ def finish_download_run(
             failure_count,
             error_message,
             run_id,
+        ),
+    )
+
+
+def begin_ytdlp_update_run(
+    connection: sqlite3.Connection,
+    *,
+    trigger: str,
+    mode: str,
+    manager: str,
+    command: list[str] | None,
+    target_bin_before: str | None,
+    version_before: str | None,
+    started_at: str,
+) -> int:
+    command_text = shlex.join(command) if command else None
+    cursor = connection.execute(
+        """
+        INSERT INTO ytdlp_update_runs (
+            trigger,
+            mode,
+            manager,
+            status,
+            command,
+            target_bin_before,
+            version_before,
+            started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(trigger or "manual"),
+            str(mode or "auto"),
+            str(manager or "unknown"),
+            "running",
+            command_text,
+            str(target_bin_before or "").strip() or None,
+            str(version_before or "").strip() or None,
+            started_at,
+        ),
+    )
+    run_id = cursor.lastrowid
+    if run_id is None:
+        raise RuntimeError("Failed to create yt-dlp update run record")
+    return int(run_id)
+
+
+def finish_ytdlp_update_run(
+    connection: sqlite3.Connection,
+    *,
+    run_id: int,
+    status: str,
+    finished_at: str,
+    target_bin_after: str | None,
+    version_after: str | None,
+    message: str | None,
+) -> None:
+    connection.execute(
+        """
+        UPDATE ytdlp_update_runs
+        SET status = ?,
+            finished_at = ?,
+            target_bin_after = ?,
+            version_after = ?,
+            message = ?
+        WHERE run_id = ?
+        """,
+        (
+            str(status or "noop"),
+            finished_at,
+            str(target_bin_after or "").strip() or None,
+            str(version_after or "").strip() or None,
+            str(message or "").strip() or None,
+            int(run_id),
         ),
     )
 
@@ -14078,6 +14532,263 @@ def collect_workspace_source_processing_trend(
     }
 
 
+def build_workspace_download_error_summary(source_id: str = "") -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "pending_count": 0,
+        "blocked_count": 0,
+        "transient_count": 0,
+        "no_subtitles_count": 0,
+        "missing_artifact_count": 0,
+        "other_count": 0,
+        "recent_error_runs": 0,
+    }
+
+
+def accumulate_workspace_download_error_summary(
+    target: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    for key in (
+        "pending_count",
+        "blocked_count",
+        "transient_count",
+        "no_subtitles_count",
+        "missing_artifact_count",
+        "other_count",
+        "recent_error_runs",
+    ):
+        target[key] = int(target.get(key, 0) or 0) + int(summary.get(key, 0) or 0)
+
+
+def upsert_workspace_download_daily_metrics(
+    connection: sqlite3.Connection,
+    *,
+    source_ids: list[str],
+    download_monitor: dict[str, Any],
+    snapshot_at: dt.datetime | None = None,
+) -> str:
+    snapshot_at_value = (snapshot_at or dt.datetime.now(dt.timezone.utc)).astimezone(
+        dt.timezone.utc
+    )
+    snapshot_date = snapshot_at_value.date().isoformat()
+    recorded_at = snapshot_at_value.replace(microsecond=0).isoformat()
+    per_source = cast(dict[str, dict[str, Any]], download_monitor.get("per_source") or {})
+
+    tracked_source_ids = sorted(
+        {
+            str(source_id).strip()
+            for source_id in source_ids
+            if str(source_id).strip()
+        }
+    )
+    if not tracked_source_ids:
+        tracked_source_ids = sorted(
+            {
+                str(source_id).strip()
+                for source_id in per_source
+                if str(source_id).strip()
+            }
+        )
+
+    for source_id in tracked_source_ids:
+        summary = per_source.get(source_id) or build_workspace_download_error_summary(source_id)
+        connection.execute(
+            """
+            INSERT INTO workspace_download_daily_metrics (
+                snapshot_date,
+                source_id,
+                pending_count,
+                blocked_count,
+                transient_count,
+                no_subtitles_count,
+                missing_artifact_count,
+                other_count,
+                recent_error_runs,
+                recorded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_date, source_id) DO UPDATE SET
+                pending_count = excluded.pending_count,
+                blocked_count = excluded.blocked_count,
+                transient_count = excluded.transient_count,
+                no_subtitles_count = excluded.no_subtitles_count,
+                missing_artifact_count = excluded.missing_artifact_count,
+                other_count = excluded.other_count,
+                recent_error_runs = excluded.recent_error_runs,
+                recorded_at = excluded.recorded_at
+            """,
+            (
+                snapshot_date,
+                source_id,
+                int(summary.get("pending_count", 0) or 0),
+                int(summary.get("blocked_count", 0) or 0),
+                int(summary.get("transient_count", 0) or 0),
+                int(summary.get("no_subtitles_count", 0) or 0),
+                int(summary.get("missing_artifact_count", 0) or 0),
+                int(summary.get("other_count", 0) or 0),
+                int(summary.get("recent_error_runs", 0) or 0),
+                recorded_at,
+            ),
+        )
+    return snapshot_date
+
+
+def collect_workspace_download_error_trend(
+    connection: sqlite3.Connection,
+    source_ids: list[str],
+    window_days: int,
+    end_date: dt.date | None = None,
+) -> dict[str, Any]:
+    safe_window_days = max(7, min(180, int(window_days or 30)))
+    end_date_value = end_date or dt.datetime.now(dt.timezone.utc).date()
+    start_date_value = end_date_value - dt.timedelta(days=safe_window_days - 1)
+    requested_source_ids = sorted(
+        {
+            str(source_id).strip()
+            for source_id in source_ids
+            if str(source_id).strip()
+        }
+    )
+
+    params: list[Any] = [end_date_value.isoformat()]
+    source_filter_sql = ""
+    if requested_source_ids:
+        placeholders = ",".join("?" for _ in requested_source_ids)
+        source_filter_sql = f"AND source_id IN ({placeholders})"
+        params.extend(requested_source_ids)
+
+    rows = connection.execute(
+        f"""
+        SELECT
+            snapshot_date,
+            source_id,
+            pending_count,
+            blocked_count,
+            transient_count,
+            no_subtitles_count,
+            missing_artifact_count,
+            other_count,
+            recent_error_runs
+        FROM workspace_download_daily_metrics
+        WHERE snapshot_date <= ?
+          {source_filter_sql}
+        ORDER BY snapshot_date ASC, source_id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+
+    source_ids_in_rows: set[str] = set()
+    rows_by_date: dict[str, list[sqlite3.Row]] = {}
+    snapshot_days: set[str] = set()
+    for row in rows:
+        snapshot_date = str(row["snapshot_date"] or "").strip()
+        source_id = str(row["source_id"] or "").strip()
+        if not snapshot_date or not source_id:
+            continue
+        source_ids_in_rows.add(source_id)
+        rows_by_date.setdefault(snapshot_date, []).append(row)
+        if start_date_value.isoformat() <= snapshot_date <= end_date_value.isoformat():
+            snapshot_days.add(snapshot_date)
+
+    tracked_source_ids = requested_source_ids or sorted(source_ids_in_rows)
+    if not tracked_source_ids:
+        return {
+            "window_days": safe_window_days,
+            "start_date": start_date_value.isoformat(),
+            "end_date": end_date_value.isoformat(),
+            "snapshot_days": 0,
+            "points": [],
+            "latest": {},
+            "net_change": {},
+        }
+
+    metric_keys = (
+        "pending_count",
+        "blocked_count",
+        "transient_count",
+        "no_subtitles_count",
+        "missing_artifact_count",
+        "other_count",
+        "recent_error_runs",
+    )
+    current_by_source: dict[str, dict[str, int]] = {
+        source_id: {key: 0 for key in metric_keys}
+        for source_id in tracked_source_ids
+    }
+    observed_source_ids: set[str] = set()
+    start_date_iso = start_date_value.isoformat()
+    for row in rows:
+        snapshot_date = str(row["snapshot_date"] or "").strip()
+        if not snapshot_date or snapshot_date >= start_date_iso:
+            continue
+        source_id = str(row["source_id"] or "").strip()
+        if source_id not in current_by_source:
+            continue
+        current_by_source[source_id] = {
+            key: max(0, int(row[key] or 0))
+            for key in metric_keys
+        }
+        observed_source_ids.add(source_id)
+
+    points: list[dict[str, Any]] = []
+    previous_totals: dict[str, int] | None = None
+    for day_offset in range(safe_window_days):
+        current_date = start_date_value + dt.timedelta(days=day_offset)
+        current_date_iso = current_date.isoformat()
+        for row in rows_by_date.get(current_date_iso, []):
+            source_id = str(row["source_id"] or "").strip()
+            if source_id not in current_by_source:
+                continue
+            current_by_source[source_id] = {
+                key: max(0, int(row[key] or 0))
+                for key in metric_keys
+            }
+            observed_source_ids.add(source_id)
+
+        totals = {key: 0 for key in metric_keys}
+        for counts in current_by_source.values():
+            for key in metric_keys:
+                totals[key] += int(counts.get(key, 0) or 0)
+
+        point: dict[str, Any] = {
+            "date": current_date_iso,
+            "has_snapshot": current_date_iso in snapshot_days,
+            "has_observation": bool(observed_source_ids),
+        }
+        for key in metric_keys:
+            point[key] = int(totals[key])
+            delta_key = f"delta_{key}"
+            if previous_totals is None:
+                point[delta_key] = 0
+            else:
+                point[delta_key] = int(totals[key]) - int(previous_totals.get(key, 0))
+        points.append(point)
+        previous_totals = totals
+
+    latest_point = dict(points[-1]) if points else {}
+    first_point = dict(
+        next((point for point in points if bool(point.get("has_observation"))), points[0] if points else {})
+    )
+    net_change = {
+        key: int(latest_point.get(key, 0) or 0) - int(first_point.get(key, 0) or 0)
+        for key in metric_keys
+    }
+
+    return {
+        "window_days": safe_window_days,
+        "start_date": start_date_value.isoformat(),
+        "end_date": end_date_value.isoformat(),
+        "snapshot_days": len(snapshot_days),
+        "points": points,
+        "latest": {
+            key: int(latest_point.get(key, 0) or 0)
+            for key in metric_keys
+        },
+        "net_change": net_change,
+    }
+
+
 def collect_workspace_download_monitor(
     connection: sqlite3.Connection,
     source_ids: list[str],
@@ -14090,6 +14801,10 @@ def collect_workspace_download_monitor(
     safe_pending_limit = max(1, int(pending_limit))
     since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=safe_hours)
     since_iso = since_dt.replace(microsecond=0).isoformat()
+    trend_since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        hours=WORKSPACE_DOWNLOAD_TREND_RUN_LOOKBACK_HOURS
+    )
+    trend_since_iso = trend_since_dt.replace(microsecond=0).isoformat()
 
     source_filter_sql_runs = ""
     source_filter_sql_pending = ""
@@ -14121,7 +14836,7 @@ def collect_workspace_download_monitor(
         (since_iso, *source_params, safe_run_limit),
     ).fetchall()
 
-    pending_rows = connection.execute(
+    pending_rows_all = connection.execute(
         f"""
         SELECT
             source_id,
@@ -14135,24 +14850,71 @@ def collect_workspace_download_monitor(
         WHERE status = 'error'
           {source_filter_sql_pending}
         ORDER BY updated_at DESC
-        LIMIT ?
-        """,
-        (*source_params, safe_pending_limit),
-    ).fetchall()
-
-    pending_count_row = connection.execute(
-        f"""
-        SELECT COUNT(*) AS pending_count
-        FROM download_state
-        WHERE status = 'error'
-          {source_filter_sql_pending}
         """,
         tuple(source_params),
-    ).fetchone()
-    pending_count = int(pending_count_row["pending_count"]) if pending_count_row else 0
+    ).fetchall()
+
+    recent_error_rows = connection.execute(
+        f"""
+        SELECT
+            source_id,
+            stage,
+            status,
+            COALESCE(failure_count, 0) AS failure_count,
+            COALESCE(error_message, '') AS error_message,
+            started_at
+        FROM download_runs
+        WHERE started_at >= ?
+          {source_filter_sql_runs}
+          AND (
+            LOWER(COALESCE(status, '')) = 'error'
+            OR COALESCE(failure_count, 0) > 0
+            OR COALESCE(error_message, '') <> ''
+          )
+        ORDER BY started_at DESC, run_id DESC
+        """,
+        (trend_since_iso, *source_params),
+    ).fetchall()
+
+    pending_rows = list(pending_rows_all[:safe_pending_limit])
+    summaries_by_source: dict[str, dict[str, Any]] = {}
+
+    for row in pending_rows_all:
+        source_id = str(row["source_id"] or "").strip()
+        if not source_id:
+            continue
+        summary = summaries_by_source.setdefault(
+            source_id,
+            build_workspace_download_error_summary(source_id),
+        )
+        summary["pending_count"] = int(summary["pending_count"]) + 1
+        category = classify_download_error_category(str(row["last_error"] or ""))
+        summary[f"{category}_count"] = int(summary.get(f"{category}_count", 0) or 0) + 1
+
+    for row in recent_error_rows:
+        source_id = str(row["source_id"] or "").strip()
+        if not source_id:
+            continue
+        summary = summaries_by_source.setdefault(
+            source_id,
+            build_workspace_download_error_summary(source_id),
+        )
+        summary["recent_error_runs"] = int(summary["recent_error_runs"]) + 1
+
+    totals = build_workspace_download_error_summary()
+    for summary in summaries_by_source.values():
+        accumulate_workspace_download_error_summary(totals, summary)
+
+    pending_count = int(totals.get("pending_count", 0) or 0)
+    pending_category_counts = {
+        key: int(totals.get(f"{key}_count", 0) or 0)
+        for key in DOWNLOAD_ERROR_CATEGORY_KEYS
+    }
+    recent_error_run_count = int(totals.get("recent_error_runs", 0) or 0)
 
     return {
         "since_hours": safe_hours,
+        "trend_run_lookback_hours": WORKSPACE_DOWNLOAD_TREND_RUN_LOOKBACK_HOURS,
         "recent_runs": [
             {
                 "source_id": str(row["source_id"] or ""),
@@ -14164,6 +14926,11 @@ def collect_workspace_download_monitor(
                 "failure_count": int(row["failure_count"] or 0),
                 "exit_code": int(row["exit_code"] or 0),
                 "error_message": str(row["error_message"] or ""),
+                "error_category": (
+                    classify_download_error_category(str(row["error_message"] or ""))
+                    if str(row["error_message"] or "").strip()
+                    else ""
+                ),
             }
             for row in recent_runs
         ],
@@ -14176,10 +14943,82 @@ def collect_workspace_download_monitor(
                 "next_retry_at": str(row["next_retry_at"] or ""),
                 "last_error": str(row["last_error"] or ""),
                 "updated_at": str(row["updated_at"] or ""),
+                "error_category": classify_download_error_category(str(row["last_error"] or "")),
             }
             for row in pending_rows
         ],
         "pending_count": pending_count,
+        "pending_category_counts": pending_category_counts,
+        "recent_error_runs": recent_error_run_count,
+        "per_source": summaries_by_source,
+    }
+
+
+def collect_workspace_ytdlp_status(
+    connection: sqlite3.Connection,
+    *,
+    config_path: Path,
+    run_limit: int = 6,
+) -> dict[str, Any]:
+    safe_run_limit = max(1, int(run_limit))
+    rows = connection.execute(
+        """
+        SELECT
+            run_id,
+            trigger,
+            mode,
+            manager,
+            status,
+            COALESCE(command, '') AS command,
+            COALESCE(target_bin_before, '') AS target_bin_before,
+            COALESCE(target_bin_after, '') AS target_bin_after,
+            COALESCE(version_before, '') AS version_before,
+            COALESCE(version_after, '') AS version_after,
+            started_at,
+            finished_at,
+            COALESCE(message, '') AS message
+        FROM ytdlp_update_runs
+        ORDER BY COALESCE(finished_at, started_at) DESC, run_id DESC
+        LIMIT ?
+        """,
+        (safe_run_limit,),
+    ).fetchall()
+
+    recent_runs = [
+        {
+            "run_id": int(row["run_id"] or 0),
+            "trigger": str(row["trigger"] or ""),
+            "mode": str(row["mode"] or ""),
+            "manager": str(row["manager"] or ""),
+            "status": str(row["status"] or ""),
+            "command": str(row["command"] or ""),
+            "target_bin_before": str(row["target_bin_before"] or ""),
+            "target_bin_after": str(row["target_bin_after"] or ""),
+            "version_before": str(row["version_before"] or ""),
+            "version_after": str(row["version_after"] or ""),
+            "started_at": str(row["started_at"] or ""),
+            "finished_at": str(row["finished_at"] or ""),
+            "message": str(row["message"] or ""),
+        }
+        for row in rows
+    ]
+
+    latest = recent_runs[0] if recent_runs else None
+    latest_updated = next(
+        (item for item in recent_runs if str(item.get("status") or "").strip().lower() == "updated"),
+        None,
+    )
+    configured_bin = resolve_effective_ytdlp_bin_from_config(config_path)
+    current_version = ""
+    if latest is not None:
+        current_version = str(latest.get("version_after") or latest.get("version_before") or "").strip()
+
+    return {
+        "configured_bin": configured_bin,
+        "current_version": current_version,
+        "latest": latest,
+        "latest_updated": latest_updated,
+        "recent_runs": recent_runs,
     }
 
 
@@ -15614,6 +16453,25 @@ def build_web_handler(
                     source_ids=source_scope,
                     window_days=trend_days,
                 )
+                upsert_workspace_download_daily_metrics(
+                    connection=connection,
+                    source_ids=[
+                        str(item.get("source_id") or "").strip()
+                        for item in cast(list[dict[str, Any]], source_processing.get("sources") or [])
+                        if str(item.get("source_id") or "").strip()
+                    ],
+                    download_monitor=download_monitor,
+                )
+                download_monitor["daily_trend"] = collect_workspace_download_error_trend(
+                    connection=connection,
+                    source_ids=source_scope,
+                    window_days=trend_days,
+                )
+                download_monitor.pop("per_source", None)
+                ytdlp_status = collect_workspace_ytdlp_status(
+                    connection=connection,
+                    config_path=resolve_output_path(config_path, DEFAULT_CONFIG),
+                )
                 import_monitor = collect_workspace_import_monitor(
                     connection=connection,
                     source_ids=source_scope,
@@ -15653,11 +16511,12 @@ def build_web_handler(
                 {
                     "source_id": source_filter or "",
                     "review_cards": review_cards,
-                    "missing_entries": missing_entries,
-                    "download_monitor": download_monitor,
-                    "source_processing": source_processing,
-                    "import_monitor": import_monitor,
-                    "artifacts": artifacts,
+                "missing_entries": missing_entries,
+                "download_monitor": download_monitor,
+                "source_processing": source_processing,
+                "ytdlp_status": ytdlp_status,
+                "import_monitor": import_monitor,
+                "artifacts": artifacts,
                 }
             )
 
@@ -18994,6 +19853,38 @@ def parse_args() -> argparse.Namespace:
     )
     translate_local_parser.add_argument("--dry-run", action="store_true")
 
+    ytdlp_update_parser = subparsers.add_parser(
+        "ytdlp-update",
+        help="Update configured yt-dlp runtime and record the result",
+    )
+    ytdlp_update_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ytdlp_update_parser.add_argument("--ledger-db", type=Path)
+    ytdlp_update_parser.add_argument(
+        "--mode",
+        choices=["auto", "uv", "brew", "off"],
+        default="auto",
+        help="Update mode (default: auto).",
+    )
+    ytdlp_update_parser.add_argument(
+        "--trigger",
+        choices=["manual", "daily", "weekly"],
+        default="manual",
+        help="Caller label stored in history (default: manual).",
+    )
+    ytdlp_update_parser.add_argument(
+        "--uv-with-curl-cffi",
+        dest="uv_with_curl_cffi",
+        action="store_true",
+        help="Install/update uv tool with curl-cffi support.",
+    )
+    ytdlp_update_parser.add_argument(
+        "--no-uv-with-curl-cffi",
+        dest="uv_with_curl_cffi",
+        action="store_false",
+        help="Install/update uv tool without curl-cffi.",
+    )
+    ytdlp_update_parser.set_defaults(uv_with_curl_cffi=True)
+
     web_parser = subparsers.add_parser(
         "web",
         help="Run local TikTok-style study web UI",
@@ -19023,7 +19914,7 @@ def main() -> int:
 
     try:
         global_config, all_sources = load_config(args.config)
-        sources = select_sources(all_sources, args.sources)
+        sources = select_sources(all_sources, getattr(args, "sources", None))
         sources = apply_upstream_sub_langs_override(
             sources,
             getattr(args, "upstream_sub_langs_override", None),
@@ -19472,6 +20363,15 @@ def main() -> int:
             video_ids=args.video_ids,
         )
         return 0
+
+    if args.command == "ytdlp-update":
+        return run_ytdlp_update(
+            db_path=ledger_db_path,
+            config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
+            mode=str(args.mode or "auto"),
+            trigger=str(args.trigger or "manual"),
+            uv_with_curl_cffi=bool(getattr(args, "uv_with_curl_cffi", True)),
+        )
 
     if args.command == "web":
         run_web_ui(

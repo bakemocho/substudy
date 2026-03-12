@@ -341,11 +341,19 @@ fi
 
 EFFECTIVE_YTDLP_BIN="$(resolve_effective_ytdlp_bin)"
 echo "[weekly] yt-dlp target=${EFFECTIVE_YTDLP_BIN:-not-found} update-mode=${YTDLP_UPDATE_MODE}"
-run_ytdlp_update "${YTDLP_UPDATE_MODE}" "${EFFECTIVE_YTDLP_BIN}"
-EFFECTIVE_YTDLP_BIN="$(resolve_effective_ytdlp_bin)"
-if [[ -n "${EFFECTIVE_YTDLP_BIN}" ]]; then
-  echo "[weekly] yt-dlp version: $("${EFFECTIVE_YTDLP_BIN}" --version 2>/dev/null || echo unknown)"
+YTDLP_UPDATE_ARGS=(
+  ytdlp-update
+  --config "${CONFIG_PATH}"
+  --ledger-db "${LEDGER_DB}"
+  --mode "${YTDLP_UPDATE_MODE}"
+  --trigger weekly
+)
+if [[ "${YTDLP_UV_WITH_CURL_CFFI}" == "0" ]]; then
+  YTDLP_UPDATE_ARGS+=(--no-uv-with-curl-cffi)
+else
+  YTDLP_UPDATE_ARGS+=(--uv-with-curl-cffi)
 fi
+run_substudy "${YTDLP_UPDATE_ARGS[@]}" || true
 
 SYNC_PID=""
 declare -a WORKER_PIDS=()

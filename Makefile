@@ -9,12 +9,16 @@ QUEUE_REQUEUE_ARGS ?=
 QUEUE_RECOVER_KNOWN_ARGS ?=
 QUEUE_STATUS_ARGS ?=
 UPSTREAM_JA_SUB_LANGS ?= ja.*,ja,jp.*,jpn.*
+YTDLP_UPDATE_MODE ?= auto
+YTDLP_UPDATE_TRIGGER ?= manual
+YTDLP_UPDATE_CURL_CFFI ?= 1
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 SYNC_LIMIT_ARG := $(if $(strip $(LIMIT)),--limit $(LIMIT),)
 SYNC_BASE_CMD = $(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG)
 SYNC_META_ARGS = --skip-media --skip-subs
 SYNC_SUBS_ARGS = --skip-media --skip-meta
 SYNC_SUBS_JA_ARGS = $(SYNC_SUBS_ARGS) --upstream-sub-langs-override "$(UPSTREAM_JA_SUB_LANGS)"
+YTDLP_UPDATE_CURL_ARG := $(if $(filter 0 false off,$(strip $(YTDLP_UPDATE_CURL_CFFI))),--no-uv-with-curl-cffi,--uv-with-curl-cffi)
 
 define require-source
 	@if [ -z "$(SOURCE)" ]; then \
@@ -23,7 +27,7 @@ define require-source
 	fi
 endef
 
-.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all daily daily-source privacy-check test
+.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all ytdlp-update daily daily-source privacy-check test
 
 init-local:
 	./scripts/init_local.sh
@@ -113,6 +117,9 @@ translate-local:
 
 translate-local-all:
 	$(PYTHON) scripts/substudy.py translate-local --config $(CONFIG) $(LEDGER_DB_ARG) --target-lang $(TRANSLATE_TARGET_LANG) --source-track $(TRANSLATE_SOURCE_TRACK) --limit 0 --timeout-sec $(TRANSLATE_TIMEOUT)
+
+ytdlp-update:
+	$(PYTHON) scripts/substudy.py ytdlp-update --config $(CONFIG) $(LEDGER_DB_ARG) --mode $(YTDLP_UPDATE_MODE) --trigger $(YTDLP_UPDATE_TRIGGER) $(YTDLP_UPDATE_CURL_ARG)
 
 daily:
 	./scripts/run_daily_sync.sh

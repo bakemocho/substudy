@@ -815,6 +815,322 @@ data_dir = "{source_root}"
         self.assertEqual(trend["latest"]["upstream_ja_subtitles_ready_playable"], 1)
         self.assertEqual(trend["net_change"]["media_ready"], 2)
 
+    def test_collect_workspace_download_monitor_classifies_errors(self):
+        now_dt = dt.datetime(2026, 3, 12, 2, 0, tzinfo=dt.timezone.utc)
+        now_iso = now_dt.isoformat()
+        recent_iso = (now_dt - dt.timedelta(hours=2)).isoformat()
+        older_iso = (now_dt - dt.timedelta(hours=4)).isoformat()
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            self.mod.create_schema(connection)
+            connection.executemany(
+                """
+                INSERT INTO download_state(
+                    source_id,
+                    stage,
+                    video_id,
+                    status,
+                    retry_count,
+                    last_error,
+                    last_attempt_at,
+                    next_retry_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, 'error', ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "alpha",
+                        "subs",
+                        "a1",
+                        1,
+                        "ERROR: [TikTok] a1: Unable to extract universal data for rehydration",
+                        now_iso,
+                        now_iso,
+                        now_iso,
+                    ),
+                    (
+                        "alpha",
+                        "subs",
+                        "a2",
+                        2,
+                        "ERROR: [TikTok] a2: Your IP address is blocked from accessing this post",
+                        now_iso,
+                        now_iso,
+                        now_iso,
+                    ),
+                    (
+                        "beta",
+                        "subs",
+                        "b1",
+                        1,
+                        "There are no subtitles for the requested languages",
+                        now_iso,
+                        now_iso,
+                        now_iso,
+                    ),
+                    (
+                        "beta",
+                        "meta",
+                        "b2",
+                        1,
+                        "metadata file missing after download attempt",
+                        now_iso,
+                        now_iso,
+                        now_iso,
+                    ),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO download_runs(
+                    source_id,
+                    stage,
+                    status,
+                    started_at,
+                    finished_at,
+                    exit_code,
+                    target_count,
+                    success_count,
+                    failure_count,
+                    error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "alpha",
+                        "subs",
+                        "error",
+                        recent_iso,
+                        recent_iso,
+                        0,
+                        5,
+                        0,
+                        5,
+                        "ERROR: [TikTok] Unable to extract universal data for rehydration",
+                    ),
+                    (
+                        "beta",
+                        "subs",
+                        "error",
+                        older_iso,
+                        older_iso,
+                        0,
+                        5,
+                        2,
+                        3,
+                        "ERROR: [TikTok] 7451812681822080264: Your IP address is blocked from accessing this post",
+                    ),
+                ],
+            )
+            connection.commit()
+
+            with mock.patch.object(
+                self.mod.dt,
+                "datetime",
+                mock.Mock(wraps=dt.datetime, now=mock.Mock(return_value=now_dt)),
+            ):
+                monitor = self.mod.collect_workspace_download_monitor(
+                    connection=connection,
+                    source_ids=[],
+                    since_hours=72,
+                    run_limit=10,
+                    pending_limit=10,
+                )
+        finally:
+            connection.close()
+
+        self.assertEqual(monitor["pending_count"], 4)
+        self.assertEqual(monitor["pending_category_counts"]["transient"], 1)
+        self.assertEqual(monitor["pending_category_counts"]["blocked"], 1)
+        self.assertEqual(monitor["pending_category_counts"]["no_subtitles"], 1)
+        self.assertEqual(monitor["pending_category_counts"]["missing_artifact"], 1)
+        self.assertEqual(monitor["recent_error_runs"], 2)
+        self.assertEqual(monitor["recent_runs"][0]["error_category"], "transient")
+        pending_by_key = {
+            (item["source_id"], item["video_id"]): item
+            for item in monitor["pending_failures"]
+        }
+        self.assertEqual(pending_by_key[("alpha", "a2")]["error_category"], "blocked")
+        self.assertEqual(monitor["per_source"]["alpha"]["pending_count"], 2)
+        self.assertEqual(monitor["per_source"]["beta"]["recent_error_runs"], 1)
+
+    def test_collect_workspace_download_error_trend_carries_forward_snapshots(self):
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            self.mod.create_schema(connection)
+            self.mod.upsert_workspace_download_daily_metrics(
+                connection=connection,
+                source_ids=["alpha", "beta"],
+                download_monitor={
+                    "per_source": {
+                        "alpha": {
+                            "source_id": "alpha",
+                            "pending_count": 3,
+                            "blocked_count": 1,
+                            "transient_count": 2,
+                            "no_subtitles_count": 0,
+                            "missing_artifact_count": 0,
+                            "other_count": 0,
+                            "recent_error_runs": 2,
+                        },
+                        "beta": {
+                            "source_id": "beta",
+                            "pending_count": 1,
+                            "blocked_count": 0,
+                            "transient_count": 0,
+                            "no_subtitles_count": 1,
+                            "missing_artifact_count": 0,
+                            "other_count": 0,
+                            "recent_error_runs": 1,
+                        },
+                    },
+                },
+                snapshot_at=dt.datetime(2026, 3, 10, 1, 0, tzinfo=dt.timezone.utc),
+            )
+            self.mod.upsert_workspace_download_daily_metrics(
+                connection=connection,
+                source_ids=["alpha", "beta"],
+                download_monitor={
+                    "per_source": {
+                        "alpha": {
+                            "source_id": "alpha",
+                            "pending_count": 2,
+                            "blocked_count": 1,
+                            "transient_count": 1,
+                            "no_subtitles_count": 0,
+                            "missing_artifact_count": 0,
+                            "other_count": 0,
+                            "recent_error_runs": 3,
+                        },
+                        "beta": {
+                            "source_id": "beta",
+                            "pending_count": 0,
+                            "blocked_count": 0,
+                            "transient_count": 0,
+                            "no_subtitles_count": 0,
+                            "missing_artifact_count": 0,
+                            "other_count": 0,
+                            "recent_error_runs": 0,
+                        },
+                    },
+                },
+                snapshot_at=dt.datetime(2026, 3, 12, 1, 0, tzinfo=dt.timezone.utc),
+            )
+            connection.commit()
+
+            trend = self.mod.collect_workspace_download_error_trend(
+                connection=connection,
+                source_ids=[],
+                window_days=7,
+                end_date=dt.date(2026, 3, 12),
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(trend["window_days"], 7)
+        self.assertEqual(trend["snapshot_days"], 2)
+        points_by_date = {point["date"]: point for point in trend["points"]}
+        self.assertEqual(points_by_date["2026-03-10"]["pending_count"], 4)
+        self.assertEqual(points_by_date["2026-03-11"]["pending_count"], 4)
+        self.assertEqual(points_by_date["2026-03-11"]["delta_pending_count"], 0)
+        self.assertEqual(points_by_date["2026-03-12"]["pending_count"], 2)
+        self.assertEqual(points_by_date["2026-03-12"]["transient_count"], 1)
+        self.assertEqual(points_by_date["2026-03-12"]["recent_error_runs"], 3)
+        self.assertEqual(trend["net_change"]["pending_count"], -2)
+
+    def test_run_ytdlp_update_records_history_and_status(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+data_dir = "alpha"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/tmp/fake-ytdlp",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_version",
+                side_effect=["2026.3.1", "2026.3.3"],
+            ),
+            mock.patch.object(
+                self.mod,
+                "build_ytdlp_update_command",
+                return_value=(["uv", "tool", "install", "yt-dlp", "--force"], None),
+            ),
+            mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                return_value=(0, "uv tool install yt-dlp --force"),
+            ),
+        ):
+            rc = self.mod.run_ytdlp_update(
+                db_path=self.db_path,
+                config_path=config_path,
+                mode="uv",
+                trigger="manual",
+                uv_with_curl_cffi=True,
+            )
+
+        self.assertEqual(rc, 0)
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                """
+                SELECT status, manager, version_before, version_after, message
+                FROM ytdlp_update_runs
+                ORDER BY run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "updated")
+            self.assertEqual(str(row["manager"]), "uv")
+            self.assertEqual(str(row["version_before"]), "2026.3.1")
+            self.assertEqual(str(row["version_after"]), "2026.3.3")
+            self.assertIn("updated via uv", str(row["message"]))
+
+            with mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/tmp/fake-ytdlp",
+            ):
+                status = self.mod.collect_workspace_ytdlp_status(
+                    connection=connection,
+                    config_path=config_path,
+                    run_limit=4,
+                )
+        finally:
+            connection.close()
+
+        self.assertEqual(status["current_version"], "2026.3.3")
+        self.assertIsNotNone(status["latest_updated"])
+        self.assertEqual(status["latest_updated"]["status"], "updated")
+
     def test_artifact_open_and_download_headers(self):
         artifact_path = self.workspace_root / "exports" / "llm" / "sample.jsonl"
         artifact_body = '{"hello":"world"}\n'
@@ -5061,6 +5377,236 @@ data_dir = "{source_root}"
             self.assertEqual(int(run_row[1] or 0), 0)
             self.assertEqual(int(run_row[2] or 0), 10)
             self.assertIn("circuit breaker", str(run_row[3]).lower())
+        finally:
+            connection.close()
+
+    def test_sync_source_meta_chunk_transient_breaker_stops_after_high_rate_failed_chunks(self):
+        source_root = self.workspace_root / "storiesofcz_meta_chunk_transient_rate_breaker"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        video_ids = [
+            "7621111111111111111",
+            "7621111111111111112",
+            "7621111111111111113",
+            "7621111111111111114",
+            "7621111111111111115",
+            "7621111111111111116",
+            "7621111111111111117",
+            "7621111111111111118",
+            "7621111111111111119",
+            "7621111111111111120",
+            "7621111111111111121",
+        ]
+        source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+        source.media_archive.write_text(
+            "".join(f"tiktok {video_id}\n" for video_id in video_ids),
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            commands: list[list[str]] = []
+
+            def fake_run_command_with_output(command, dry_run):
+                commands.append(list(command))
+                urls_file = command[command.index("-a") + 1]
+                chunk_urls = Path(urls_file).read_text(encoding="utf-8").splitlines()
+                chunk_video_ids = [
+                    str(url).rstrip("/").split("/")[-1]
+                    for url in chunk_urls
+                    if str(url).strip()
+                ]
+                transient_ids = chunk_video_ids[:3]
+                output_lines = [
+                    (
+                        f"ERROR: [TikTok] {video_id}: "
+                        "Unable to extract universal data for rehydration"
+                    )
+                    for video_id in transient_ids
+                ]
+                return (0, "\n".join(output_lines))
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                side_effect=fake_run_command_with_output,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                )
+
+            self.assertEqual(len(commands), 4)
+
+            state_rows = connection.execute(
+                """
+                SELECT video_id, last_error
+                FROM download_state
+                WHERE source_id = ? AND stage = 'meta'
+                ORDER BY video_id
+                """,
+                (source.id,),
+            ).fetchall()
+            self.assertEqual(len(state_rows), 10)
+            self.assertTrue(
+                any("rehydration" in str(row[1]).lower() for row in state_rows)
+            )
+            self.assertTrue(
+                any("missing after download attempt" in str(row[1]).lower() for row in state_rows)
+            )
+
+            run_row = connection.execute(
+                """
+                SELECT failure_count, error_message
+                FROM download_runs
+                WHERE source_id = ? AND stage = 'meta'
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(run_row)
+            self.assertEqual(int(run_row[0] or 0), 10)
+            self.assertIn("circuit breaker", str(run_row[1]).lower())
+            self.assertIn("transient", str(run_row[1]).lower())
+        finally:
+            connection.close()
+
+    def test_sync_source_meta_chunk_blocked_error_stops_remaining_chunks_immediately(self):
+        source_root = self.workspace_root / "storiesofcz_meta_chunk_blocked_breaker"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        video_ids = [
+            "7631111111111111111",
+            "7631111111111111112",
+            "7631111111111111113",
+            "7631111111111111114",
+            "7631111111111111115",
+            "7631111111111111116",
+        ]
+        source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+        source.media_archive.write_text(
+            "".join(f"tiktok {video_id}\n" for video_id in video_ids),
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            commands: list[list[str]] = []
+
+            def fake_run_command_with_output(command, dry_run):
+                commands.append(list(command))
+                urls_file = command[command.index("-a") + 1]
+                chunk_urls = Path(urls_file).read_text(encoding="utf-8").splitlines()
+                chunk_video_ids = [
+                    str(url).rstrip("/").split("/")[-1]
+                    for url in chunk_urls
+                    if str(url).strip()
+                ]
+                return (
+                    0,
+                    (
+                        f"ERROR: [TikTok] {chunk_video_ids[0]}: "
+                        "Your IP address is blocked from accessing this post"
+                    ),
+                )
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                side_effect=fake_run_command_with_output,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                )
+
+            self.assertEqual(len(commands), 1)
+
+            run_row = connection.execute(
+                """
+                SELECT failure_count, error_message
+                FROM download_runs
+                WHERE source_id = ? AND stage = 'meta'
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(run_row)
+            self.assertEqual(int(run_row[0] or 0), 5)
+            self.assertIn("blocked", str(run_row[1]).lower())
+
+            blocked_row = connection.execute(
+                """
+                SELECT last_error
+                FROM download_state
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (source.id, video_ids[0]),
+            ).fetchone()
+            self.assertIsNotNone(blocked_row)
+            self.assertIn("blocked", str(blocked_row[0]).lower())
+
+            unattempted_row = connection.execute(
+                """
+                SELECT status
+                FROM download_state
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (source.id, video_ids[-1]),
+            ).fetchone()
+            self.assertIsNone(unattempted_row)
         finally:
             connection.close()
 

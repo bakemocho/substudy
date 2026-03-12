@@ -269,13 +269,20 @@ run_daily_ytdlp_update_guarded() {
 
     effective_bin="$(resolve_effective_ytdlp_bin)"
     echo "[daily] yt-dlp target=${effective_bin:-not-found} update-mode=${YTDLP_UPDATE_MODE} interval=${YTDLP_UPDATE_INTERVAL_SEC}s"
-    run_ytdlp_update "${YTDLP_UPDATE_MODE}" "${effective_bin}" || true
-    write_ytdlp_last_update_epoch "${now_epoch}"
-
-    effective_bin="$(resolve_effective_ytdlp_bin)"
-    if [[ -n "${effective_bin}" ]]; then
-      echo "[daily] yt-dlp version: $("${effective_bin}" --version 2>/dev/null || echo unknown)"
+    local -a ytdlp_update_args=(
+      ytdlp-update
+      --config "${CONFIG_PATH}"
+      --ledger-db "${LEDGER_DB}"
+      --mode "${YTDLP_UPDATE_MODE}"
+      --trigger daily
+    )
+    if [[ "${YTDLP_UV_WITH_CURL_CFFI}" == "0" ]]; then
+      ytdlp_update_args+=(--no-uv-with-curl-cffi)
+    else
+      ytdlp_update_args+=(--uv-with-curl-cffi)
     fi
+    run_substudy "${ytdlp_update_args[@]}" || true
+    write_ytdlp_last_update_epoch "${now_epoch}"
   } || rc=$?
   rm -rf "${YTDLP_UPDATE_LOCK_DIR}" 2>/dev/null || true
   return "${rc}"
