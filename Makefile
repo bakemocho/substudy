@@ -12,9 +12,11 @@ UPSTREAM_JA_SUB_LANGS ?= ja.*,ja,jp.*,jpn.*
 YTDLP_UPDATE_MODE ?= auto
 YTDLP_UPDATE_TRIGGER ?= manual
 YTDLP_UPDATE_CURL_CFFI ?= 1
+YTDLP_REQUIRE_LATEST ?= 0
 LEDGER_DB_ARG := $(if $(strip $(LEDGER_DB)),--ledger-db $(LEDGER_DB),)
 SYNC_LIMIT_ARG := $(if $(strip $(LIMIT)),--limit $(LIMIT),)
-SYNC_BASE_CMD = $(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG)
+YTDLP_REQUIRE_LATEST_ARG := $(if $(filter 1 true yes on,$(strip $(YTDLP_REQUIRE_LATEST))),--require-current-ytdlp --ytdlp-check-mode $(YTDLP_UPDATE_MODE),)
+SYNC_BASE_CMD = $(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(SYNC_LIMIT_ARG) $(YTDLP_REQUIRE_LATEST_ARG)
 SYNC_META_ARGS = --skip-media --skip-subs
 SYNC_SUBS_ARGS = --skip-media --skip-meta
 SYNC_SUBS_JA_ARGS = $(SYNC_SUBS_ARGS) --upstream-sub-langs-override "$(UPSTREAM_JA_SUB_LANGS)"
@@ -27,16 +29,16 @@ define require-source
 	fi
 endef
 
-.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all ytdlp-update daily daily-source privacy-check test
+.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all ytdlp-check ytdlp-update daily daily-source privacy-check test
 
 init-local:
 	./scripts/init_local.sh
 
 sync:
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG)
+	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(YTDLP_REQUIRE_LATEST_ARG)
 
 sync-dry:
-	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) --dry-run
+	$(PYTHON) scripts/substudy.py sync --config $(CONFIG) $(LEDGER_DB_ARG) $(YTDLP_REQUIRE_LATEST_ARG) --dry-run
 
 sync-meta-only:
 	$(SYNC_BASE_CMD) $(SYNC_META_ARGS)
@@ -71,10 +73,10 @@ ledger-inc:
 	$(PYTHON) scripts/substudy.py ledger --config $(CONFIG) $(LEDGER_DB_ARG) --incremental
 
 backfill:
-	$(PYTHON) scripts/substudy.py backfill --config $(CONFIG)
+	$(PYTHON) scripts/substudy.py backfill --config $(CONFIG) $(LEDGER_DB_ARG) $(YTDLP_REQUIRE_LATEST_ARG)
 
 backfill-dry:
-	$(PYTHON) scripts/substudy.py backfill --config $(CONFIG) --dry-run
+	$(PYTHON) scripts/substudy.py backfill --config $(CONFIG) $(LEDGER_DB_ARG) $(YTDLP_REQUIRE_LATEST_ARG) --dry-run
 
 asr:
 	$(PYTHON) scripts/substudy.py asr --config $(CONFIG)
@@ -117,6 +119,9 @@ translate-local:
 
 translate-local-all:
 	$(PYTHON) scripts/substudy.py translate-local --config $(CONFIG) $(LEDGER_DB_ARG) --target-lang $(TRANSLATE_TARGET_LANG) --source-track $(TRANSLATE_SOURCE_TRACK) --limit 0 --timeout-sec $(TRANSLATE_TIMEOUT)
+
+ytdlp-check:
+	$(PYTHON) scripts/substudy.py ytdlp-check --config $(CONFIG) $(LEDGER_DB_ARG) --mode $(YTDLP_UPDATE_MODE) --trigger $(YTDLP_UPDATE_TRIGGER)
 
 ytdlp-update:
 	$(PYTHON) scripts/substudy.py ytdlp-update --config $(CONFIG) $(LEDGER_DB_ARG) --mode $(YTDLP_UPDATE_MODE) --trigger $(YTDLP_UPDATE_TRIGGER) $(YTDLP_UPDATE_CURL_ARG)

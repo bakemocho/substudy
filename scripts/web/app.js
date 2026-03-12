@@ -10371,35 +10371,100 @@ function renderWorkspaceYtdlpStatus() {
     return;
   }
   const status = state.workspaceYtdlpStatus || {};
+  const latestCheck = status?.latest_check || null;
   const latest = status?.latest || null;
   const latestUpdated = status?.latest_updated || null;
-  const configuredBin = String(status?.configured_bin || "").trim();
+  const targetBin = String(status?.target_bin || status?.configured_bin || "").trim();
+  const latestToolBin = String(status?.latest_update_tool_bin || latest?.update_tool_bin || "").trim();
   const currentVersion = String(status?.current_version || "").trim();
+  const latestVersion = String(status?.latest_version || latestCheck?.latest_version || "").trim();
+  const freshnessStatus = String(status?.freshness_status || latestCheck?.status || "").trim();
+  const recentChecks = Array.isArray(status?.recent_checks) ? status.recent_checks : [];
+  const recentRuns = Array.isArray(status?.recent_runs) ? status.recent_runs : [];
 
-  if (!latest) {
-    summaryNode.textContent = configuredBin
-      ? `target=${configuredBin} • 更新履歴はまだありません。`
+  if (!latest && !latestCheck) {
+    summaryNode.textContent = targetBin
+      ? `target=${targetBin} • 更新履歴はまだありません。`
       : "yt-dlp 更新履歴はまだありません。";
   } else {
-    const latestStatus = String(latest?.status || "");
-    const latestManager = String(latest?.manager || "");
-    const latestWhen = formatShortIso(latest?.finished_at || latest?.started_at);
+    const checkLabel = latestCheck
+      ? `最新確認 ${formatShortIso(latestCheck?.checked_at)} (${freshnessStatus || "unknown"}/${String(latestCheck?.manager || "unknown")})`
+      : "最新確認なし";
     const updateLabel = latestUpdated
       ? `最終更新 ${formatShortIso(latestUpdated?.finished_at || latestUpdated?.started_at)}`
       : "更新履歴なし";
-    summaryNode.textContent = `${updateLabel} • 現在 ${currentVersion || "unknown"} • 最新実行 ${latestWhen} (${latestStatus}/${latestManager || "unknown"})${configuredBin ? ` • target=${configuredBin}` : ""}`;
+    const pathBits = [];
+    if (latestToolBin) {
+      pathBits.push(`tool=${latestToolBin}`);
+    }
+    if (targetBin) {
+      pathBits.push(`target=${targetBin}`);
+    }
+    summaryNode.textContent = `${checkLabel} • 現在 ${currentVersion || "unknown"} / 最新 ${latestVersion || "unknown"} • ${updateLabel}${pathBits.length ? ` • ${pathBits.join(" • ")}` : ""}`;
   }
+
+  const historyItems = [];
+  for (const check of recentChecks) {
+    historyItems.push({
+      kind: "check",
+      sortAt: String(check?.checked_at || ""),
+      payload: check,
+    });
+  }
+  for (const run of recentRuns) {
+    historyItems.push({
+      kind: "update",
+      sortAt: String(run?.finished_at || run?.started_at || ""),
+      payload: run,
+    });
+  }
+  historyItems.sort((left, right) => String(right.sortAt || "").localeCompare(String(left.sortAt || "")));
 
   renderWorkspaceList(
     elements.workspaceYtdlpRuns,
-    Array.isArray(status?.recent_runs) ? status.recent_runs : [],
-    (run) => {
+    historyItems,
+    (item) => {
+      if (item?.kind === "check") {
+        const check = item?.payload || {};
+        const row = document.createElement("article");
+        row.className = "workspace-item compact";
+
+        const title = document.createElement("p");
+        title.className = "workspace-item-title";
+        title.textContent = `yt-dlp check • ${String(check?.status || "")} • ${String(check?.trigger || "")}/${String(check?.manager || "")}`;
+
+        const meta = document.createElement("p");
+        meta.className = "workspace-item-meta";
+        meta.textContent = `${formatShortIso(check?.checked_at)} • ${String(check?.current_version || "unknown")} -> ${String(check?.latest_version || "unknown")} • ${String(check?.requested_mode || "")}`;
+
+        row.appendChild(title);
+        row.appendChild(meta);
+
+        const runTargetBin = String(check?.target_bin || "").trim();
+        if (runTargetBin) {
+          const pathMeta = document.createElement("p");
+          pathMeta.className = "workspace-item-meta";
+          pathMeta.textContent = `target=${runTargetBin}`;
+          row.appendChild(pathMeta);
+        }
+
+        const message = trimWorkspaceMessage(check?.message || "");
+        if (message) {
+          const detail = document.createElement("p");
+          detail.className = "workspace-item-meta";
+          detail.textContent = message;
+          row.appendChild(detail);
+        }
+        return row;
+      }
+
+      const run = item?.payload || {};
       const row = document.createElement("article");
       row.className = "workspace-item compact";
 
       const title = document.createElement("p");
       title.className = "workspace-item-title";
-      title.textContent = `yt-dlp • ${String(run?.status || "")} • ${String(run?.trigger || "")}/${String(run?.manager || "")}`;
+      title.textContent = `yt-dlp update • ${String(run?.status || "")} • ${String(run?.trigger || "")}/${String(run?.manager || "")}`;
 
       const meta = document.createElement("p");
       meta.className = "workspace-item-meta";
@@ -10410,6 +10475,22 @@ function renderWorkspaceYtdlpStatus() {
       row.appendChild(title);
       row.appendChild(meta);
 
+      const updateToolBin = String(run?.update_tool_bin || "").trim();
+      const runTargetBin = String(run?.target_bin_after || run?.target_bin_before || "").trim();
+      if (updateToolBin || runTargetBin) {
+        const pathMeta = document.createElement("p");
+        pathMeta.className = "workspace-item-meta";
+        const pathBits = [];
+        if (updateToolBin) {
+          pathBits.push(`tool=${updateToolBin}`);
+        }
+        if (runTargetBin) {
+          pathBits.push(`target=${runTargetBin}`);
+        }
+        pathMeta.textContent = pathBits.join(" • ");
+        row.appendChild(pathMeta);
+      }
+
       const message = trimWorkspaceMessage(run?.message || "");
       if (message) {
         const detail = document.createElement("p");
@@ -10419,7 +10500,7 @@ function renderWorkspaceYtdlpStatus() {
       }
       return row;
     },
-    "yt-dlp 更新履歴はありません。"
+    "yt-dlp 履歴はありません。"
   );
 }
 

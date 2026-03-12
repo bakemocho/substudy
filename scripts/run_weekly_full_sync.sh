@@ -73,6 +73,14 @@ QUEUE_RECOVER_KNOWN_PROFILES="${SUBSTUDY_QUEUE_RECOVER_KNOWN_PROFILES:-all}"
 QUEUE_RECOVER_KNOWN_LIMIT="${SUBSTUDY_QUEUE_RECOVER_KNOWN_LIMIT:-0}"
 YTDLP_UPDATE_MODE="${SUBSTUDY_YTDLP_UPDATE_MODE:-auto}"
 YTDLP_UV_WITH_CURL_CFFI="${SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI:-1}"
+YTDLP_REQUIRE_LATEST="${SUBSTUDY_YTDLP_REQUIRE_LATEST:-0}"
+YTDLP_REQUIRE_ARGS=()
+if [[ "${YTDLP_REQUIRE_LATEST}" != "0" ]]; then
+  YTDLP_REQUIRE_ARGS=(
+    --require-current-ytdlp
+    --ytdlp-check-mode "${YTDLP_UPDATE_MODE}"
+  )
+fi
 
 while (($# > 0)); do
   case "$1" in
@@ -355,6 +363,16 @@ else
 fi
 run_substudy "${YTDLP_UPDATE_ARGS[@]}" || true
 
+if [[ "${YTDLP_REQUIRE_LATEST}" != "0" ]]; then
+  echo "[weekly] yt-dlp latest preflight enabled"
+  run_substudy ytdlp-check \
+    --config "${CONFIG_PATH}" \
+    --ledger-db "${LEDGER_DB}" \
+    --mode "${YTDLP_UPDATE_MODE}" \
+    --trigger weekly \
+    --fail-if-outdated
+fi
+
 SYNC_PID=""
 declare -a WORKER_PIDS=()
 
@@ -458,6 +476,7 @@ run_substudy sync \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
+  "${YTDLP_REQUIRE_ARGS[@]}" \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" &
 SYNC_PID=$!

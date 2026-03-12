@@ -92,6 +92,7 @@ DEFAULT_LOCAL_TRANSLATE_QUALITY_UNCHANGED_THRESHOLD = 0.15
 DEFAULT_NETWORK_PROBE_URL = "https://www.tiktok.com/robots.txt"
 DEFAULT_NETWORK_PROBE_TIMEOUT_SEC = 8
 DEFAULT_NETWORK_PROBE_BYTES = 131072
+DEFAULT_YTDLP_FRESHNESS_TIMEOUT_SEC = 10
 DEFAULT_WEAK_NET_MIN_KBPS = 900.0
 DEFAULT_WEAK_NET_MAX_RTT_MS = 900.0
 DEFAULT_METERED_MEDIA_MODE = "off"
@@ -637,6 +638,106 @@ def probe_ytdlp_version(ytdlp_bin: str | None) -> str:
     if not value:
         return ""
     return probe_command_version([value, "--version"])
+
+
+def normalize_comparable_version(raw_value: str | None) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)+", value):
+        return ".".join(str(int(part)) for part in value.split("."))
+    return value.lower()
+
+
+def ytdlp_versions_match(left: str | None, right: str | None) -> bool:
+    normalized_left = normalize_comparable_version(left)
+    normalized_right = normalize_comparable_version(right)
+    return bool(normalized_left and normalized_right and normalized_left == normalized_right)
+
+
+def probe_pypi_package_version(
+    package_name: str,
+    *,
+    timeout_sec: int = DEFAULT_YTDLP_FRESHNESS_TIMEOUT_SEC,
+) -> str:
+    safe_package = str(package_name or "").strip()
+    if not safe_package:
+        return ""
+    request = urllib_request.Request(
+        f"https://pypi.org/pypi/{safe_package}/json",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "substudy-ytdlp-check/1.0",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=max(3, int(timeout_sec))) as response:
+            payload = json.load(response)
+    except (OSError, ValueError, json.JSONDecodeError, urllib_error.URLError):
+        return ""
+    info = payload.get("info") if isinstance(payload, dict) else {}
+    if not isinstance(info, dict):
+        return ""
+    return str(info.get("version") or "").strip()
+
+
+def probe_brew_formula_stable_version(formula_name: str) -> str:
+    safe_formula = str(formula_name or "").strip()
+    if not safe_formula:
+        return ""
+    brew_bin = find_executable_command("brew")
+    if not brew_bin:
+        return ""
+    try:
+        completed = subprocess.run(
+            [brew_bin, "info", "--json=v2", safe_formula],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    if completed.returncode != 0 or not str(completed.stdout or "").strip():
+        return ""
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return ""
+    formulae = payload.get("formulae") if isinstance(payload, dict) else []
+    if not isinstance(formulae, list) or not formulae:
+        return ""
+    first_formula = formulae[0]
+    if not isinstance(first_formula, dict):
+        return ""
+    versions = first_formula.get("versions")
+    if not isinstance(versions, dict):
+        return ""
+    return str(versions.get("stable") or "").strip()
+
+
+def determine_ytdlp_check_manager(
+    *,
+    mode: str,
+    runtime_bin: str | None,
+) -> str:
+    normalized_mode = str(mode or "auto").strip().lower() or "auto"
+    if normalized_mode == "off":
+        normalized_mode = "auto"
+    return determine_ytdlp_update_manager(mode=normalized_mode, runtime_bin=runtime_bin)
+
+
+def describe_ytdlp_latest_provider(manager: str) -> str:
+    normalized_manager = str(manager or "").strip().lower()
+    if normalized_manager == "brew":
+        return "Homebrew"
+    return "PyPI"
+
+
+def probe_ytdlp_latest_version(manager: str) -> tuple[str, str]:
+    provider_label = describe_ytdlp_latest_provider(manager)
+    if str(manager or "").strip().lower() == "brew":
+        return probe_brew_formula_stable_version("yt-dlp"), provider_label
+    return probe_pypi_package_version("yt-dlp"), provider_label
 
 
 def parse_optional_path(base: Path, raw_value: Any) -> Path | None:
@@ -1708,9 +1809,23 @@ def summarize_output_excerpt(output_text: str | None, max_chars: int = 4000) -> 
     return excerpt
 
 
+def extract_command_executable(command_text: str | None) -> str:
+    safe_command = str(command_text or "").strip()
+    if not safe_command:
+        return ""
+    try:
+        parts = shlex.split(safe_command)
+    except ValueError:
+        parts = safe_command.split()
+    if not parts:
+        return ""
+    return str(parts[0] or "").strip()
+
+
 def build_ytdlp_update_command(
     manager: str,
     *,
+    runtime_bin: str | None,
     uv_with_curl_cffi: bool,
 ) -> tuple[list[str] | None, str | None]:
     normalized_manager = str(manager or "").strip().lower()
@@ -1718,10 +1833,15 @@ def build_ytdlp_update_command(
         uv_bin = find_executable_command("uv")
         if not uv_bin:
             return None, "uv not found; cannot update yt-dlp via uv"
-        command = [uv_bin, "tool", "install", "yt-dlp"]
-        if uv_with_curl_cffi:
-            command.extend(["--with", "curl-cffi"])
-        command.append("--force")
+        runtime_path = str(runtime_bin or "").strip()
+        use_upgrade = bool(runtime_path) and is_uv_managed_ytdlp_bin(runtime_path) and Path(runtime_path).expanduser().exists()
+        if use_upgrade:
+            command = [uv_bin, "tool", "upgrade", "yt-dlp"]
+        else:
+            command = [uv_bin, "tool", "install", "yt-dlp"]
+            if uv_with_curl_cffi:
+                command.extend(["--with", "curl-cffi"])
+            command.append("--force")
         return command, None
     if normalized_manager == "brew":
         brew_bin = find_executable_command("brew")
@@ -1754,6 +1874,206 @@ def determine_ytdlp_update_manager(
     return "brew"
 
 
+def evaluate_ytdlp_freshness(
+    *,
+    trigger: str,
+    requested_mode: str,
+    manager: str,
+    target_bin: str | None,
+    current_version: str | None,
+    latest_version: str | None,
+    provider_label: str,
+    checked_at: str | None = None,
+) -> dict[str, Any]:
+    safe_target_bin = str(target_bin or "").strip()
+    safe_current_version = str(current_version or "").strip()
+    safe_latest_version = str(latest_version or "").strip()
+    safe_provider_label = str(provider_label or "latest-source").strip() or "latest-source"
+    safe_checked_at = str(checked_at or now_utc_iso())
+
+    status = "error"
+    message = ""
+    if not safe_target_bin:
+        message = "configured yt-dlp target not found"
+    elif not safe_current_version:
+        message = f"failed to probe current yt-dlp version from {safe_target_bin}"
+    elif not safe_latest_version:
+        message = f"failed to resolve latest yt-dlp version via {safe_provider_label}"
+    else:
+        is_outdated = not ytdlp_versions_match(safe_current_version, safe_latest_version)
+        status = "outdated" if is_outdated else "current"
+        message = (
+            f"yt-dlp freshness via {safe_provider_label}: "
+            f"current={safe_current_version} latest={safe_latest_version}"
+        )
+        return {
+            "trigger": str(trigger or "manual"),
+            "requested_mode": str(requested_mode or "auto"),
+            "manager": str(manager or "unknown"),
+            "status": status,
+            "target_bin": safe_target_bin,
+            "current_version": safe_current_version,
+            "latest_version": safe_latest_version,
+            "provider_label": safe_provider_label,
+            "checked_at": safe_checked_at,
+            "message": message,
+            "is_outdated": is_outdated,
+        }
+    return {
+        "trigger": str(trigger or "manual"),
+        "requested_mode": str(requested_mode or "auto"),
+        "manager": str(manager or "unknown"),
+        "status": status,
+        "target_bin": safe_target_bin,
+        "current_version": safe_current_version,
+        "latest_version": safe_latest_version,
+        "provider_label": safe_provider_label,
+        "checked_at": safe_checked_at,
+        "message": message,
+        "is_outdated": False,
+    }
+
+
+def run_ytdlp_freshness_check(
+    *,
+    connection: sqlite3.Connection,
+    config_path: Path,
+    mode: str,
+    trigger: str,
+    latest_version_override: str | None = None,
+    current_version_override: str | None = None,
+    checked_at: str | None = None,
+    record: bool = True,
+) -> dict[str, Any]:
+    normalized_mode = str(mode or "auto").strip().lower() or "auto"
+    normalized_trigger = str(trigger or "manual").strip().lower() or "manual"
+    target_bin = resolve_effective_ytdlp_bin_from_config(config_path)
+    manager = determine_ytdlp_check_manager(
+        mode=normalized_mode,
+        runtime_bin=target_bin,
+    )
+    current_version = (
+        str(current_version_override).strip()
+        if current_version_override is not None
+        else probe_ytdlp_version(target_bin)
+    )
+    provider_label = ""
+    latest_version = ""
+    if latest_version_override is not None:
+        latest_version = str(latest_version_override).strip()
+        provider_label = describe_ytdlp_latest_provider(manager)
+    else:
+        latest_version, provider_label = probe_ytdlp_latest_version(manager)
+
+    result = evaluate_ytdlp_freshness(
+        trigger=normalized_trigger,
+        requested_mode=normalized_mode,
+        manager=manager,
+        target_bin=target_bin,
+        current_version=current_version,
+        latest_version=latest_version,
+        provider_label=provider_label,
+        checked_at=checked_at,
+    )
+    if record:
+        record_ytdlp_check_run(
+            connection=connection,
+            trigger=str(result.get("trigger") or normalized_trigger),
+            requested_mode=str(result.get("requested_mode") or normalized_mode),
+            manager=str(result.get("manager") or manager),
+            status=str(result.get("status") or "error"),
+            target_bin=str(result.get("target_bin") or ""),
+            current_version=str(result.get("current_version") or ""),
+            latest_version=str(result.get("latest_version") or ""),
+            checked_at=str(result.get("checked_at") or now_utc_iso()),
+            message=str(result.get("message") or ""),
+        )
+    return result
+
+
+def ensure_current_ytdlp(
+    *,
+    db_path: Path,
+    config_path: Path,
+    mode: str,
+    trigger: str,
+) -> dict[str, Any]:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        create_schema(connection)
+        result = run_ytdlp_freshness_check(
+            connection=connection,
+            config_path=config_path,
+            mode=mode,
+            trigger=trigger,
+            record=True,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    if str(result.get("status") or "") == "error":
+        raise RuntimeError(str(result.get("message") or "yt-dlp freshness check failed"))
+    if bool(result.get("is_outdated")):
+        current_version = str(result.get("current_version") or "unknown")
+        latest_version = str(result.get("latest_version") or "unknown")
+        raise RuntimeError(
+            f"yt-dlp is outdated ({current_version} < {latest_version}); run `make ytdlp-update` first"
+        )
+    return result
+
+
+def run_ytdlp_check(
+    *,
+    db_path: Path,
+    config_path: Path,
+    mode: str,
+    trigger: str,
+    fail_if_outdated: bool,
+) -> int:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys = ON")
+        create_schema(connection)
+        result = run_ytdlp_freshness_check(
+            connection=connection,
+            config_path=config_path,
+            mode=mode,
+            trigger=trigger,
+            record=True,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    print(
+        "[yt-dlp-check] "
+        f"status={result.get('status') or 'error'} "
+        f"current={result.get('current_version') or 'unknown'} "
+        f"latest={result.get('latest_version') or 'unknown'} "
+        f"manager={result.get('manager') or 'unknown'} "
+        f"target={result.get('target_bin') or 'not-found'}"
+    )
+    if str(result.get("status") or "") == "error":
+        print(f"[yt-dlp-check] error: {result.get('message') or 'freshness check failed'}", file=sys.stderr)
+        return 1
+    if fail_if_outdated and bool(result.get("is_outdated")):
+        print(
+            f"[yt-dlp-check] outdated: {result.get('current_version') or 'unknown'} "
+            f"< {result.get('latest_version') or 'unknown'}",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def run_ytdlp_update(
     *,
     db_path: Path,
@@ -1766,16 +2086,6 @@ def run_ytdlp_update(
     normalized_trigger = str(trigger or "manual").strip().lower() or "manual"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = now_utc_iso()
-    target_bin_before = resolve_effective_ytdlp_bin_from_config(config_path)
-    version_before = probe_ytdlp_version(target_bin_before)
-    manager = determine_ytdlp_update_manager(
-        mode=normalized_mode,
-        runtime_bin=target_bin_before,
-    )
-    command, build_error = build_ytdlp_update_command(
-        manager,
-        uv_with_curl_cffi=uv_with_curl_cffi,
-    )
 
     connection = sqlite3.connect(str(db_path), timeout=30)
     try:
@@ -1783,6 +2093,25 @@ def run_ytdlp_update(
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA foreign_keys = ON")
         create_schema(connection)
+
+        precheck = run_ytdlp_freshness_check(
+            connection=connection,
+            config_path=config_path,
+            mode=normalized_mode,
+            trigger=normalized_trigger,
+            record=True,
+        )
+        target_bin_before = str(precheck.get("target_bin") or "").strip()
+        version_before = str(precheck.get("current_version") or "").strip()
+        manager = determine_ytdlp_update_manager(
+            mode=normalized_mode,
+            runtime_bin=target_bin_before,
+        )
+        command, build_error = build_ytdlp_update_command(
+            manager,
+            runtime_bin=target_bin_before,
+            uv_with_curl_cffi=uv_with_curl_cffi,
+        )
 
         run_id = begin_ytdlp_update_run(
             connection=connection,
@@ -1795,19 +2124,74 @@ def run_ytdlp_update(
             started_at=started_at,
         )
 
+        if manager == "off":
+            message = "yt-dlp update skipped (mode=off)"
+            precheck_message = str(precheck.get("message") or "").strip()
+            if precheck_message:
+                message = f"{message} | {precheck_message}"
+            finish_ytdlp_update_run(
+                connection=connection,
+                run_id=run_id,
+                status="noop",
+                finished_at=now_utc_iso(),
+                target_bin_after=target_bin_before,
+                version_after=version_before,
+                message=message,
+            )
+            connection.commit()
+            print(f"[yt-dlp-update] {message}")
+            return 0
+
+        if str(precheck.get("status") or "") == "error":
+            message = str(precheck.get("message") or "yt-dlp freshness check failed")
+            finish_ytdlp_update_run(
+                connection=connection,
+                run_id=run_id,
+                status="error",
+                finished_at=now_utc_iso(),
+                target_bin_after=target_bin_before,
+                version_after=version_before,
+                message=message,
+            )
+            connection.commit()
+            print(f"[yt-dlp-update] error: {message}", file=sys.stderr)
+            return 1
+
+        if not bool(precheck.get("is_outdated")):
+            latest_version = str(precheck.get("latest_version") or version_before or "unknown")
+            message = (
+                f"yt-dlp already current via {precheck.get('manager') or manager}: "
+                f"{version_before or 'unknown'} (latest {latest_version})"
+            )
+            finish_ytdlp_update_run(
+                connection=connection,
+                run_id=run_id,
+                status="noop",
+                finished_at=now_utc_iso(),
+                target_bin_after=target_bin_before,
+                version_after=version_before,
+                message=message,
+            )
+            connection.commit()
+            print(
+                "[yt-dlp-update] "
+                f"status=noop version={version_before or 'unknown'} -> {version_before or 'unknown'}"
+            )
+            return 0
+
         if build_error:
             finish_ytdlp_update_run(
                 connection=connection,
                 run_id=run_id,
-                status="noop" if manager == "off" else "error",
+                status="error",
                 finished_at=now_utc_iso(),
                 target_bin_after=target_bin_before,
                 version_after=version_before,
                 message=build_error,
             )
             connection.commit()
-            print(f"[yt-dlp-update] {build_error}")
-            return 0 if manager == "off" else 1
+            print(f"[yt-dlp-update] error: {build_error}", file=sys.stderr)
+            return 1
 
         assert command is not None
         print(
@@ -1835,17 +2219,33 @@ def run_ytdlp_update(
             print(f"[yt-dlp-update] error: {message}", file=sys.stderr)
             return 1
 
-        updated = bool(version_after) and version_after != version_before
-        status = "updated" if updated else "noop"
+        postcheck = run_ytdlp_freshness_check(
+            connection=connection,
+            config_path=config_path,
+            mode=normalized_mode,
+            trigger=normalized_trigger,
+            latest_version_override=str(precheck.get("latest_version") or ""),
+            current_version_override=version_after,
+            checked_at=now_utc_iso(),
+            record=True,
+        )
+        updated = bool(version_after) and not ytdlp_versions_match(version_after, version_before)
+        status = "updated" if updated else "reinstalled"
         if updated:
             message = (
                 f"yt-dlp updated via {manager}: "
                 f"{version_before or 'unknown'} -> {version_after}"
             )
         else:
+            stable_version = version_after or version_before or "unknown"
             message = (
-                f"yt-dlp unchanged via {manager}: "
-                f"{version_after or version_before or 'unknown'}"
+                f"yt-dlp reinstalled via {manager}: "
+                f"{stable_version} (same version)"
+            )
+        if bool(postcheck.get("is_outdated")):
+            message = (
+                f"{message} | still behind latest "
+                f"{postcheck.get('latest_version') or 'unknown'}"
             )
         if output_excerpt:
             message = f"{message} | {output_excerpt}"
@@ -5354,6 +5754,22 @@ def create_schema(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_workspace_download_daily_metrics_date
             ON workspace_download_daily_metrics(snapshot_date DESC, source_id);
 
+        CREATE TABLE IF NOT EXISTS ytdlp_check_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL,
+            requested_mode TEXT NOT NULL,
+            manager TEXT NOT NULL,
+            status TEXT NOT NULL,
+            target_bin TEXT,
+            current_version TEXT,
+            latest_version TEXT,
+            checked_at TEXT NOT NULL,
+            message TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ytdlp_check_runs_checked
+            ON ytdlp_check_runs(checked_at DESC, run_id DESC);
+
         CREATE TABLE IF NOT EXISTS ytdlp_update_runs (
             run_id INTEGER PRIMARY KEY AUTOINCREMENT,
             trigger TEXT NOT NULL,
@@ -6823,6 +7239,51 @@ def begin_ytdlp_update_run(
     run_id = cursor.lastrowid
     if run_id is None:
         raise RuntimeError("Failed to create yt-dlp update run record")
+    return int(run_id)
+
+
+def record_ytdlp_check_run(
+    connection: sqlite3.Connection,
+    *,
+    trigger: str,
+    requested_mode: str,
+    manager: str,
+    status: str,
+    target_bin: str | None,
+    current_version: str | None,
+    latest_version: str | None,
+    checked_at: str,
+    message: str | None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO ytdlp_check_runs (
+            trigger,
+            requested_mode,
+            manager,
+            status,
+            target_bin,
+            current_version,
+            latest_version,
+            checked_at,
+            message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(trigger or "manual"),
+            str(requested_mode or "auto"),
+            str(manager or "unknown"),
+            str(status or "error"),
+            str(target_bin or "").strip() or None,
+            str(current_version or "").strip() or None,
+            str(latest_version or "").strip() or None,
+            str(checked_at or now_utc_iso()),
+            str(message or "").strip() or None,
+        ),
+    )
+    run_id = cursor.lastrowid
+    if run_id is None:
+        raise RuntimeError("Failed to record yt-dlp freshness check")
     return int(run_id)
 
 
@@ -14961,7 +15422,42 @@ def collect_workspace_ytdlp_status(
     run_limit: int = 6,
 ) -> dict[str, Any]:
     safe_run_limit = max(1, int(run_limit))
-    rows = connection.execute(
+    check_rows = connection.execute(
+        """
+        SELECT
+            run_id,
+            trigger,
+            requested_mode,
+            manager,
+            status,
+            COALESCE(target_bin, '') AS target_bin,
+            COALESCE(current_version, '') AS current_version,
+            COALESCE(latest_version, '') AS latest_version,
+            checked_at,
+            COALESCE(message, '') AS message
+        FROM ytdlp_check_runs
+        ORDER BY checked_at DESC, run_id DESC
+        LIMIT ?
+        """,
+        (safe_run_limit,),
+    ).fetchall()
+    recent_checks = [
+        {
+            "run_id": int(row["run_id"] or 0),
+            "trigger": str(row["trigger"] or ""),
+            "requested_mode": str(row["requested_mode"] or ""),
+            "manager": str(row["manager"] or ""),
+            "status": str(row["status"] or ""),
+            "target_bin": str(row["target_bin"] or ""),
+            "current_version": str(row["current_version"] or ""),
+            "latest_version": str(row["latest_version"] or ""),
+            "checked_at": str(row["checked_at"] or ""),
+            "message": str(row["message"] or ""),
+        }
+        for row in check_rows
+    ]
+
+    update_rows = connection.execute(
         """
         SELECT
             run_id,
@@ -14992,6 +15488,7 @@ def collect_workspace_ytdlp_status(
             "manager": str(row["manager"] or ""),
             "status": str(row["status"] or ""),
             "command": str(row["command"] or ""),
+            "update_tool_bin": extract_command_executable(str(row["command"] or "")),
             "target_bin_before": str(row["target_bin_before"] or ""),
             "target_bin_after": str(row["target_bin_after"] or ""),
             "version_before": str(row["version_before"] or ""),
@@ -15000,9 +15497,10 @@ def collect_workspace_ytdlp_status(
             "finished_at": str(row["finished_at"] or ""),
             "message": str(row["message"] or ""),
         }
-        for row in rows
+        for row in update_rows
     ]
 
+    latest_check = recent_checks[0] if recent_checks else None
     latest = recent_runs[0] if recent_runs else None
     latest_updated = next(
         (item for item in recent_runs if str(item.get("status") or "").strip().lower() == "updated"),
@@ -15010,14 +15508,27 @@ def collect_workspace_ytdlp_status(
     )
     configured_bin = resolve_effective_ytdlp_bin_from_config(config_path)
     current_version = ""
-    if latest is not None:
+    latest_version = ""
+    freshness_status = ""
+    if latest_check is not None:
+        current_version = str(latest_check.get("current_version") or "").strip()
+        latest_version = str(latest_check.get("latest_version") or "").strip()
+        freshness_status = str(latest_check.get("status") or "").strip()
+    elif latest is not None:
         current_version = str(latest.get("version_after") or latest.get("version_before") or "").strip()
 
     return {
         "configured_bin": configured_bin,
+        "target_bin": configured_bin,
         "current_version": current_version,
+        "latest_version": latest_version,
+        "freshness_status": freshness_status,
+        "is_outdated": freshness_status == "outdated",
+        "latest_check": latest_check,
         "latest": latest,
         "latest_updated": latest_updated,
+        "latest_update_tool_bin": str(latest.get("update_tool_bin") or "").strip() if latest else "",
+        "recent_checks": recent_checks,
         "recent_runs": recent_runs,
     }
 
@@ -19013,6 +19524,17 @@ def parse_args() -> argparse.Namespace:
             f"(default: {DEFAULT_METERED_PLAYLIST_END})."
         ),
     )
+    sync_parser.add_argument(
+        "--require-current-ytdlp",
+        action="store_true",
+        help="Fail fast when configured yt-dlp is not on the latest available version.",
+    )
+    sync_parser.add_argument(
+        "--ytdlp-check-mode",
+        choices=["auto", "uv", "brew", "off"],
+        default="auto",
+        help="Freshness check mode used by --require-current-ytdlp (default: auto).",
+    )
     sync_parser.add_argument("--skip-ledger", action="store_true")
     sync_parser.add_argument(
         "--full-ledger",
@@ -19120,6 +19642,17 @@ def parse_args() -> argparse.Namespace:
             "Reserved for sync compatibility in updates-only mode "
             f"(default: {DEFAULT_METERED_PLAYLIST_END})."
         ),
+    )
+    backfill_parser.add_argument(
+        "--require-current-ytdlp",
+        action="store_true",
+        help="Fail fast when configured yt-dlp is not on the latest available version.",
+    )
+    backfill_parser.add_argument(
+        "--ytdlp-check-mode",
+        choices=["auto", "uv", "brew", "off"],
+        default="auto",
+        help="Freshness check mode used by --require-current-ytdlp (default: auto).",
     )
     backfill_parser.add_argument("--skip-ledger", action="store_true")
     backfill_parser.add_argument(
@@ -19853,6 +20386,30 @@ def parse_args() -> argparse.Namespace:
     )
     translate_local_parser.add_argument("--dry-run", action="store_true")
 
+    ytdlp_check_parser = subparsers.add_parser(
+        "ytdlp-check",
+        help="Check whether configured yt-dlp is current and record the result",
+    )
+    ytdlp_check_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    ytdlp_check_parser.add_argument("--ledger-db", type=Path)
+    ytdlp_check_parser.add_argument(
+        "--mode",
+        choices=["auto", "uv", "brew", "off"],
+        default="auto",
+        help="Freshness check mode (default: auto).",
+    )
+    ytdlp_check_parser.add_argument(
+        "--trigger",
+        choices=["manual", "daily", "weekly", "sync", "backfill"],
+        default="manual",
+        help="Caller label stored in history (default: manual).",
+    )
+    ytdlp_check_parser.add_argument(
+        "--fail-if-outdated",
+        action="store_true",
+        help="Return non-zero when yt-dlp is outdated.",
+    )
+
     ytdlp_update_parser = subparsers.add_parser(
         "ytdlp-update",
         help="Update configured yt-dlp runtime and record the result",
@@ -19867,7 +20424,7 @@ def parse_args() -> argparse.Namespace:
     )
     ytdlp_update_parser.add_argument(
         "--trigger",
-        choices=["manual", "daily", "weekly"],
+        choices=["manual", "daily", "weekly", "sync", "backfill"],
         default="manual",
         help="Caller label stored in history (default: manual).",
     )
@@ -19927,6 +20484,17 @@ def main() -> int:
     ledger_csv_path = resolve_output_path(getattr(args, "ledger_csv", None), global_config.ledger_csv)
 
     if args.command == "sync":
+        if bool(getattr(args, "require_current_ytdlp", False)):
+            try:
+                ensure_current_ytdlp(
+                    db_path=ledger_db_path,
+                    config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
+                    mode=str(getattr(args, "ytdlp_check_mode", "auto") or "auto"),
+                    trigger="sync",
+                )
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
         source_order_mode = normalize_source_order_mode(
             getattr(args, "source_order", None) or global_config.source_order,
             fallback="random",
@@ -20064,6 +20632,17 @@ def main() -> int:
         return 0
 
     if args.command == "backfill":
+        if bool(getattr(args, "require_current_ytdlp", False)):
+            try:
+                ensure_current_ytdlp(
+                    db_path=ledger_db_path,
+                    config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
+                    mode=str(getattr(args, "ytdlp_check_mode", "auto") or "auto"),
+                    trigger="backfill",
+                )
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
         source_order_mode = normalize_source_order_mode(
             getattr(args, "source_order", None) or global_config.source_order,
             fallback="random",
@@ -20363,6 +20942,15 @@ def main() -> int:
             video_ids=args.video_ids,
         )
         return 0
+
+    if args.command == "ytdlp-check":
+        return run_ytdlp_check(
+            db_path=ledger_db_path,
+            config_path=resolve_output_path(args.config, DEFAULT_CONFIG),
+            mode=str(args.mode or "auto"),
+            trigger=str(args.trigger or "manual"),
+            fail_if_outdated=bool(getattr(args, "fail_if_outdated", False)),
+        )
 
     if args.command == "ytdlp-update":
         return run_ytdlp_update(

@@ -1077,6 +1077,11 @@ data_dir = "alpha"
             ),
             mock.patch.object(
                 self.mod,
+                "probe_ytdlp_latest_version",
+                return_value=("2026.3.3", "PyPI"),
+            ),
+            mock.patch.object(
+                self.mod,
                 "build_ytdlp_update_command",
                 return_value=(["uv", "tool", "install", "yt-dlp", "--force"], None),
             ),
@@ -1128,8 +1133,251 @@ data_dir = "alpha"
             connection.close()
 
         self.assertEqual(status["current_version"], "2026.3.3")
+        self.assertEqual(status["latest_version"], "2026.3.3")
+        self.assertEqual(status["freshness_status"], "current")
+        self.assertFalse(status["is_outdated"])
+        self.assertIsNotNone(status["latest_check"])
         self.assertIsNotNone(status["latest_updated"])
         self.assertEqual(status["latest_updated"]["status"], "updated")
+        self.assertEqual(status["target_bin"], "/tmp/fake-ytdlp")
+        self.assertEqual(status["latest_update_tool_bin"], "uv")
+        self.assertEqual(status["recent_checks"][0]["status"], "current")
+        self.assertEqual(status["recent_runs"][0]["update_tool_bin"], "uv")
+
+    def test_run_ytdlp_check_records_outdated_status(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+data_dir = "alpha"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/Users/bakemocho/.local/bin/yt-dlp",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_version",
+                return_value="2026.03.02",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_latest_version",
+                return_value=("2026.3.3", "PyPI"),
+            ),
+        ):
+            rc = self.mod.run_ytdlp_check(
+                db_path=self.db_path,
+                config_path=config_path,
+                mode="auto",
+                trigger="manual",
+                fail_if_outdated=False,
+            )
+
+        self.assertEqual(rc, 0)
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                """
+                SELECT status, manager, target_bin, current_version, latest_version, message
+                FROM ytdlp_check_runs
+                ORDER BY run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "outdated")
+            self.assertEqual(str(row["manager"]), "uv")
+            self.assertEqual(str(row["current_version"]), "2026.03.02")
+            self.assertEqual(str(row["latest_version"]), "2026.3.3")
+            self.assertIn("current=2026.03.02", str(row["message"]))
+
+            with mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/Users/bakemocho/.local/bin/yt-dlp",
+            ):
+                status = self.mod.collect_workspace_ytdlp_status(
+                    connection=connection,
+                    config_path=config_path,
+                    run_limit=4,
+                )
+        finally:
+            connection.close()
+
+        self.assertEqual(status["current_version"], "2026.03.02")
+        self.assertEqual(status["latest_version"], "2026.3.3")
+        self.assertEqual(status["freshness_status"], "outdated")
+        self.assertTrue(status["is_outdated"])
+        self.assertIsNotNone(status["latest_check"])
+        self.assertEqual(status["latest_check"]["status"], "outdated")
+
+    def test_run_ytdlp_update_skips_when_already_current(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+data_dir = "alpha"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/Users/bakemocho/.local/bin/yt-dlp",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_version",
+                return_value="2026.03.03",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_latest_version",
+                return_value=("2026.3.3", "PyPI"),
+            ),
+            mock.patch.object(
+                self.mod,
+                "build_ytdlp_update_command",
+                return_value=(
+                    ["/opt/homebrew/bin/uv", "tool", "upgrade", "yt-dlp"],
+                    None,
+                ),
+            ),
+            mock.patch.object(self.mod, "run_command_with_output") as run_command_mock,
+        ):
+            rc = self.mod.run_ytdlp_update(
+                db_path=self.db_path,
+                config_path=config_path,
+                mode="auto",
+                trigger="manual",
+                uv_with_curl_cffi=True,
+            )
+
+        self.assertEqual(rc, 0)
+        run_command_mock.assert_not_called()
+
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute(
+                """
+                SELECT status, manager, command, target_bin_before, target_bin_after, version_before, version_after, message
+                FROM ytdlp_update_runs
+                ORDER BY run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row["status"]), "noop")
+            self.assertEqual(str(row["manager"]), "uv")
+            self.assertEqual(str(row["target_bin_before"]), "/Users/bakemocho/.local/bin/yt-dlp")
+            self.assertEqual(str(row["target_bin_after"]), "/Users/bakemocho/.local/bin/yt-dlp")
+            self.assertEqual(str(row["version_before"]), "2026.03.03")
+            self.assertEqual(str(row["version_after"]), "2026.03.03")
+            self.assertIn("already current via uv", str(row["message"]))
+            self.assertIn("latest 2026.3.3", str(row["message"]))
+
+            with mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/Users/bakemocho/.local/bin/yt-dlp",
+            ):
+                status = self.mod.collect_workspace_ytdlp_status(
+                    connection=connection,
+                    config_path=config_path,
+                    run_limit=4,
+                )
+        finally:
+            connection.close()
+
+        self.assertEqual(status["current_version"], "2026.03.03")
+        self.assertEqual(status["latest_version"], "2026.3.3")
+        self.assertEqual(status["freshness_status"], "current")
+        self.assertFalse(status["is_outdated"])
+        self.assertIsNone(status["latest_updated"])
+        self.assertEqual(status["target_bin"], "/Users/bakemocho/.local/bin/yt-dlp")
+        self.assertEqual(status["latest"]["status"], "noop")
+        self.assertEqual(status["latest_check"]["status"], "current")
+        self.assertEqual(status["latest_update_tool_bin"], "/opt/homebrew/bin/uv")
+        self.assertEqual(status["recent_runs"][0]["update_tool_bin"], "/opt/homebrew/bin/uv")
+
+    def test_ensure_current_ytdlp_raises_when_outdated(self):
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            """
+[global]
+ledger_db = "data/master_ledger.sqlite"
+ledger_csv = "data/master_ledger.csv"
+
+[[sources]]
+id = "alpha"
+platform = "tiktok"
+url = "https://example.com/@alpha"
+enabled = true
+data_dir = "alpha"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                self.mod,
+                "resolve_effective_ytdlp_bin_from_config",
+                return_value="/Users/bakemocho/.local/bin/yt-dlp",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_version",
+                return_value="2026.03.01",
+            ),
+            mock.patch.object(
+                self.mod,
+                "probe_ytdlp_latest_version",
+                return_value=("2026.3.3", "PyPI"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "yt-dlp is outdated"):
+                self.mod.ensure_current_ytdlp(
+                    db_path=self.db_path,
+                    config_path=config_path,
+                    mode="auto",
+                    trigger="sync",
+                )
 
     def test_artifact_open_and_download_headers(self):
         artifact_path = self.workspace_root / "exports" / "llm" / "sample.jsonl"

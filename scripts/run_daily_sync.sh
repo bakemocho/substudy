@@ -77,6 +77,14 @@ YTDLP_UV_WITH_CURL_CFFI="${SUBSTUDY_YTDLP_UV_WITH_CURL_CFFI:-1}"
 YTDLP_UPDATE_INTERVAL_SEC="${SUBSTUDY_YTDLP_UPDATE_INTERVAL_SEC:-86400}"
 YTDLP_UPDATE_STATE_FILE="${SUBSTUDY_YTDLP_UPDATE_STATE_FILE:-${REPO_ROOT}/data/runtime/yt_dlp_update_state}"
 YTDLP_UPDATE_LOCK_DIR="${SUBSTUDY_YTDLP_UPDATE_LOCK_DIR:-${REPO_ROOT}/data/locks/ytdlp_update.lock}"
+YTDLP_REQUIRE_LATEST="${SUBSTUDY_YTDLP_REQUIRE_LATEST:-0}"
+YTDLP_REQUIRE_ARGS=()
+if [[ "${YTDLP_REQUIRE_LATEST}" != "0" ]]; then
+  YTDLP_REQUIRE_ARGS=(
+    --require-current-ytdlp
+    --ytdlp-check-mode "${YTDLP_UPDATE_MODE}"
+  )
+fi
 while (($# > 0)); do
   case "$1" in
     --source)
@@ -288,6 +296,23 @@ run_daily_ytdlp_update_guarded() {
   return "${rc}"
 }
 
+run_daily_ytdlp_latest_preflight() {
+  if [[ "${YTDLP_REQUIRE_LATEST}" == "0" ]]; then
+    return 0
+  fi
+
+  echo "[daily] yt-dlp latest preflight enabled"
+  local -a ytdlp_check_args=(
+    ytdlp-check
+    --config "${CONFIG_PATH}"
+    --ledger-db "${LEDGER_DB}"
+    --mode "${YTDLP_UPDATE_MODE}"
+    --trigger daily
+    --fail-if-outdated
+  )
+  run_substudy "${ytdlp_check_args[@]}"
+}
+
 route_default_field() {
   local field="$1"
   route -n get default 2>/dev/null | awk -v key="${field}" '$1 == key {print $2; exit}'
@@ -419,6 +444,7 @@ if [[ "${IS_METERED_LINK}" == "1" ]]; then
 fi
 
 run_daily_ytdlp_update_guarded
+run_daily_ytdlp_latest_preflight
 
 SYNC_PID=""
 declare -a WORKER_PIDS=()
@@ -523,6 +549,7 @@ run_substudy sync \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
+  "${YTDLP_REQUIRE_ARGS[@]}" \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" &
 SYNC_PID=$!
@@ -554,6 +581,7 @@ run_substudy backfill \
   --skip-ledger \
   --config "${CONFIG_PATH}" \
   --ledger-db "${LEDGER_DB}" \
+  "${YTDLP_REQUIRE_ARGS[@]}" \
   "${METERED_MEDIA_ARGS[@]}" \
   "${NETWORK_ARGS[@]}" || true
 
