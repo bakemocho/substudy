@@ -8,6 +8,7 @@ TRANSLATE_TIMEOUT ?= 300
 QUEUE_REQUEUE_ARGS ?=
 QUEUE_RECOVER_KNOWN_ARGS ?=
 QUEUE_STATUS_ARGS ?=
+LAUNCHD_ARGS ?=
 UPSTREAM_JA_SUB_LANGS ?= ja.*,ja,jp.*,jpn.*
 YTDLP_UPDATE_MODE ?= auto
 YTDLP_UPDATE_TRIGGER ?= manual
@@ -29,7 +30,33 @@ define require-source
 	fi
 endef
 
-.PHONY: init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all ytdlp-check ytdlp-update daily daily-source privacy-check test
+.PHONY: help init-local sync sync-dry sync-meta-only sync-meta-missing sync-meta-source sync-subs-missing sync-subs-ja-missing sync-subs-source sync-subs-ja-source backfill backfill-dry ledger ledger-full ledger-inc asr asr-dry downloads queue-status queue-status-unresolved queue-requeue queue-recover-known queue-recover-known-dry queue-heal loudness dict-index translate-local translate-local-all ytdlp-check ytdlp-update install-launchd daily daily-source privacy-check test
+
+help:
+	@printf '%s\n' \
+		'Common targets:' \
+		'  make init-local                     Initialize local-only config/files' \
+		'  make sync                          Incremental sync' \
+		'  make sync-subs-ja-missing          Fetch missing upstream JA subtitles' \
+		'  make sync-subs-ja-source SOURCE=s  Fetch upstream JA subtitles for one source' \
+		'  make backfill                      Backfill historical videos' \
+		'  make daily                         Run daily queue flow' \
+		'  make daily-source SOURCE=s         Run daily flow for one source' \
+		'  make ledger-inc                    Incremental ledger rebuild' \
+		'  make queue-status-unresolved       Show unresolved queue failures' \
+		'  make queue-heal                    Recover known queue failures + show unresolved' \
+		'  make ytdlp-check                   Check current/latest yt-dlp version and record it' \
+		'  make ytdlp-update                  Update yt-dlp only when outdated' \
+		'  make install-launchd               Install/update daily+weekly launchd jobs' \
+		'  make privacy-check                 Run privacy checks' \
+		'  make test                          Run unit tests' \
+		'' \
+		'Common variables:' \
+		'  SOURCE=<source_id>                 Restrict source-scoped targets' \
+		'  LIMIT=<n>                          Cap sync subtitle/meta targets' \
+		'  YTDLP_REQUIRE_LATEST=1             Fail sync/backfill if yt-dlp is outdated' \
+		'  YTDLP_UPDATE_MODE=auto|uv|brew     Freshness/update manager selection' \
+		'  LAUNCHD_ARGS="6 30 0 7 0 com.substudy"  Override install_launchd.sh args'
 
 init-local:
 	./scripts/init_local.sh
@@ -125,6 +152,9 @@ ytdlp-check:
 
 ytdlp-update:
 	$(PYTHON) scripts/substudy.py ytdlp-update --config $(CONFIG) $(LEDGER_DB_ARG) --mode $(YTDLP_UPDATE_MODE) --trigger $(YTDLP_UPDATE_TRIGGER) $(YTDLP_UPDATE_CURL_ARG)
+
+install-launchd:
+	./scripts/install_launchd.sh $(LAUNCHD_ARGS)
 
 daily:
 	./scripts/run_daily_sync.sh

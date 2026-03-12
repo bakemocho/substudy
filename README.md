@@ -14,8 +14,9 @@ This repository provides a local study tool focused on:
 If you are new here, start with:
 
 1. local-only files initialization (`make init-local`)
-2. basic sync (`sync`)
-3. web UI launch (`web`)
+2. command list (`make help`)
+3. basic sync (`make sync`)
+4. web UI launch (`python3 scripts/substudy.py web --host 127.0.0.1 --port 8876`)
 
 ## Quick start
 
@@ -50,6 +51,12 @@ Open `http://127.0.0.1:8876`.
 
 Use `make` for common operations first. Use `python3 scripts/substudy.py ...` when you need detailed flags.
 
+Show the common `make` targets:
+
+```bash
+make help
+```
+
 ### Local bootstrap
 
 - Initialize local-only files without overwriting existing values:
@@ -63,12 +70,14 @@ Use `make` for common operations first. Use `python3 scripts/substudy.py ...` wh
   - `make daily-source SOURCE=<source_id>`
 - Run one sync manually:
   - `make sync`
+  - require latest `yt-dlp`: `YTDLP_REQUIRE_LATEST=1 make sync`
   - weak/auto network profile: `python3 scripts/substudy.py sync --config config/sources.toml --network-profile auto`
 - Run only metadata fetch (no media, no subtitles):
   - `make sync-meta-only`
   - alias: `make sync-meta-missing`
 - Run subtitle fetch for missing subtitles (no media, no metadata):
   - `make sync-subs-missing`
+  - upstream JA only: `make sync-subs-ja-missing`
 - Note:
   - Daily/weekly automation currently excludes queue-based `translate` processing (temporary quality hold).
 
@@ -123,6 +132,13 @@ Use `make` for common operations first. Use `python3 scripts/substudy.py ...` wh
 
 ### Notifications and checks
 
+- `yt-dlp` freshness/update:
+  - `make ytdlp-check`
+  - `make ytdlp-update`
+  - strict mode for sync/backfill: `YTDLP_REQUIRE_LATEST=1 make sync-subs-ja-missing`
+- macOS launchd install/update:
+  - `make install-launchd`
+  - custom schedule/label: `make install-launchd LAUNCHD_ARGS="6 30 0 7 0 com.substudy"`
 - Local notifications:
   - `python3 scripts/substudy.py notify --kind all`
   - `python3 scripts/substudy.py notify-install-macos --interval-minutes 90 --kind all`
