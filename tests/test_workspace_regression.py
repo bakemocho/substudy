@@ -454,6 +454,100 @@ data_dir = "{source_root}"
         finally:
             connection.close()
 
+    def test_finalize_subtitle_download_plan_records_transient_webpage_error_when_exit_zero(self):
+        source_root = self.workspace_root / "requested_subtitles_transient_source"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "summer_exe"
+platform = "tiktok"
+url = "https://www.tiktok.com/@summer_exe"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = self.mod.apply_upstream_sub_langs_override(
+            sources,
+            "ja.*,ja,jp.*,jpn.*",
+        )[0]
+        video_id = "7558055850082848018"
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            source.media_dir.mkdir(parents=True, exist_ok=True)
+            source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+            source.media_archive.write_text(
+                f"tiktok {video_id}\n",
+                encoding="utf-8",
+            )
+            connection.execute(
+                """
+                INSERT INTO videos(source_id, video_id, media_path, has_media, has_subtitles, synced_at)
+                VALUES (?, ?, ?, 1, 0, ?)
+                """,
+                (
+                    source.id,
+                    video_id,
+                    str(source.media_dir / f"{video_id}.mp4"),
+                    "2026-03-10T00:00:00+00:00",
+                ),
+            )
+            connection.commit()
+
+            commands: list[list[str]] = []
+
+            def fake_run_command_with_output(command, dry_run):
+                commands.append(list(command))
+                return (
+                    0,
+                    (
+                        f"ERROR: [TikTok] {video_id}: "
+                        "Unable to extract universal data for rehydration"
+                    ),
+                )
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                side_effect=fake_run_command_with_output,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=False,
+                    skip_meta=True,
+                    connection=connection,
+                )
+
+            self.assertEqual(len(commands), 2)
+            row = connection.execute(
+                """
+                SELECT status, last_error
+                FROM download_state
+                WHERE source_id = ? AND stage = 'subs' AND video_id = ?
+                """,
+                (source.id, video_id),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "error")
+            self.assertIn("rehydration", str(row[1]).lower())
+            self.assertNotIn("missing after download attempt", str(row[1]).lower())
+        finally:
+            connection.close()
+
     def test_import_monitor_records_latest_summary(self):
         input_path = self.workspace_root / "exports" / "llm" / "enriched_missing.jsonl"
         input_path.write_text("", encoding="utf-8")
@@ -4842,6 +4936,131 @@ data_dir = "{source_root}"
             self.assertIsNotNone(access_row)
             self.assertIsNone(access_row[0])
             self.assertIn("rehydration", str(access_row[1]).lower())
+        finally:
+            connection.close()
+
+    def test_sync_source_meta_chunk_transient_breaker_stops_after_two_failed_chunks(self):
+        source_root = self.workspace_root / "storiesofcz_meta_chunk_transient_breaker"
+        source_root.mkdir(parents=True, exist_ok=True)
+        config_dir = self.workspace_root / "config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "sources.toml"
+        config_path.write_text(
+            f"""
+[global]
+ledger_db = "{self.db_path}"
+ledger_csv = "{self.workspace_root / 'data' / 'master_ledger.csv'}"
+
+[[sources]]
+id = "storiesofcz"
+platform = "tiktok"
+url = "https://www.tiktok.com/@storiesofcz"
+enabled = true
+data_dir = "{source_root}"
+            """.strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        _, sources = self.mod.load_config(config_path)
+        source = sources[0]
+        video_ids = [
+            "7611111111111111111",
+            "7611111111111111112",
+            "7611111111111111113",
+            "7611111111111111114",
+            "7611111111111111115",
+            "7611111111111111116",
+            "7611111111111111117",
+            "7611111111111111118",
+            "7611111111111111119",
+            "7611111111111111120",
+            "7611111111111111121",
+        ]
+        source.media_archive.parent.mkdir(parents=True, exist_ok=True)
+        source.media_archive.write_text(
+            "".join(f"tiktok {video_id}\n" for video_id in video_ids),
+            encoding="utf-8",
+        )
+
+        connection = sqlite3.connect(str(self.db_path))
+        try:
+            self.mod.create_schema(connection)
+            commands: list[list[str]] = []
+
+            def fake_run_command_with_output(command, dry_run):
+                commands.append(list(command))
+                urls_file = command[command.index("-a") + 1]
+                chunk_urls = Path(urls_file).read_text(encoding="utf-8").splitlines()
+                chunk_video_ids = [
+                    str(url).rstrip("/").split("/")[-1]
+                    for url in chunk_urls
+                    if str(url).strip()
+                ]
+                output_lines = [
+                    (
+                        f"ERROR: [TikTok] {video_id}: "
+                        "Unable to extract universal data for rehydration"
+                    )
+                    for video_id in chunk_video_ids
+                ]
+                return (0, "\n".join(output_lines))
+
+            with mock.patch.object(
+                self.mod,
+                "run_command_with_output",
+                side_effect=fake_run_command_with_output,
+            ):
+                self.mod.sync_source(
+                    source=source,
+                    dry_run=False,
+                    skip_media=True,
+                    skip_subs=True,
+                    skip_meta=False,
+                    connection=connection,
+                )
+
+            self.assertEqual(len(commands), 4)
+
+            state_rows = connection.execute(
+                """
+                SELECT video_id, status, last_error
+                FROM download_state
+                WHERE source_id = ? AND stage = 'meta'
+                ORDER BY video_id
+                """,
+                (source.id,),
+            ).fetchall()
+            self.assertEqual(len(state_rows), 10)
+            self.assertEqual({str(row[0]) for row in state_rows}, set(video_ids[:10]))
+            for row in state_rows:
+                self.assertEqual(str(row[1]), "error")
+                self.assertIn("rehydration", str(row[2]).lower())
+
+            missing_row = connection.execute(
+                """
+                SELECT status
+                FROM download_state
+                WHERE source_id = ? AND stage = 'meta' AND video_id = ?
+                """,
+                (source.id, video_ids[-1]),
+            ).fetchone()
+            self.assertIsNone(missing_row)
+
+            run_row = connection.execute(
+                """
+                SELECT status, success_count, failure_count, error_message
+                FROM download_runs
+                WHERE source_id = ? AND stage = 'meta'
+                ORDER BY run_id DESC
+                LIMIT 1
+                """,
+                (source.id,),
+            ).fetchone()
+            self.assertIsNotNone(run_row)
+            self.assertEqual(str(run_row[0]), "error")
+            self.assertEqual(int(run_row[1] or 0), 0)
+            self.assertEqual(int(run_row[2] or 0), 10)
+            self.assertIn("circuit breaker", str(run_row[3]).lower())
         finally:
             connection.close()
 

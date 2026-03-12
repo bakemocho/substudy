@@ -198,6 +198,10 @@ RE_TIKTOK_ERROR_VIDEO_ID = re.compile(
 REQUESTED_SUBTITLES_UNAVAILABLE_ERROR = "There are no subtitles for the requested languages"
 SUBTITLE_MISSING_AFTER_DOWNLOAD_ERROR = "subtitle file missing after download attempt"
 METADATA_MISSING_AFTER_DOWNLOAD_ERROR = "metadata file missing after download attempt"
+TIKTOK_TRANSIENT_WEBPAGE_FAILURE_ERROR = (
+    "ERROR: [TikTok] Unable to extract universal data for rehydration"
+)
+CHUNKED_STAGE_TRANSIENT_FAILURE_BREAKER_THRESHOLD = 2
 
 _YTDLP_IMPERSONATE_TARGETS_CACHE: dict[str, list[str]] = {}
 _YTDLP_IMPERSONATE_WARNED_KEYS: set[tuple[str, str]] = set()
@@ -1994,6 +1998,7 @@ class ChunkedYtdlpStagePlan:
     exit_code: int = 0
     error: str | None = None
     blocked_error: str | None = None
+    halt_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2017,54 +2022,58 @@ def attempted_chunk_target_ids(plan: ChunkedYtdlpStagePlan) -> list[str]:
     return attempted_ids
 
 
-def extract_tiktok_transient_retry_video_ids(
+def extract_tiktok_error_messages(
     output_text: str | None,
     candidate_video_ids: Iterable[str],
-) -> list[str]:
+) -> dict[str, str]:
     candidate_set = {
         str(video_id or "").strip()
         for video_id in candidate_video_ids
         if str(video_id or "").strip()
     }
     if not candidate_set:
-        return []
-    retry_ids: list[str] = []
-    seen_ids: set[str] = set()
+        return {}
+    error_messages: dict[str, str] = {}
     for line in str(output_text or "").splitlines():
         match = RE_TIKTOK_ERROR_VIDEO_ID.search(line)
         if match is None:
             continue
         video_id = str(match.group("video_id") or "").strip()
-        if video_id not in candidate_set or video_id in seen_ids:
+        if video_id not in candidate_set or video_id in error_messages:
             continue
-        message = str(match.group("message") or "").strip()
-        if not RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message):
+        error_messages[video_id] = str(match.group("message") or "").strip()
+    return error_messages
+
+
+def extract_tiktok_transient_retry_video_ids(
+    output_text: str | None,
+    candidate_video_ids: Iterable[str],
+) -> list[str]:
+    retry_ids: list[str] = []
+    for video_id, message in extract_tiktok_error_messages(output_text, candidate_video_ids).items():
+        if RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message) is None:
             continue
-        seen_ids.add(video_id)
         retry_ids.append(video_id)
     return retry_ids
+
+
+def extract_tiktok_transient_retry_error_messages(
+    output_text: str | None,
+    candidate_video_ids: Iterable[str],
+) -> dict[str, str]:
+    transient_messages: dict[str, str] = {}
+    for video_id, message in extract_tiktok_error_messages(output_text, candidate_video_ids).items():
+        if RE_RETRY_TIKTOK_WEBPAGE_TRANSIENT.search(message) is None:
+            continue
+        transient_messages[video_id] = message
+    return transient_messages
 
 
 def extract_tiktok_error_video_ids(
     output_text: str | None,
     candidate_video_ids: Iterable[str],
 ) -> set[str]:
-    candidate_set = {
-        str(video_id or "").strip()
-        for video_id in candidate_video_ids
-        if str(video_id or "").strip()
-    }
-    if not candidate_set:
-        return set()
-    error_ids: set[str] = set()
-    for line in str(output_text or "").splitlines():
-        match = RE_TIKTOK_ERROR_VIDEO_ID.search(line)
-        if match is None:
-            continue
-        video_id = str(match.group("video_id") or "").strip()
-        if video_id in candidate_set:
-            error_ids.add(video_id)
-    return error_ids
+    return set(extract_tiktok_error_messages(output_text, candidate_video_ids))
 
 
 def extract_requested_subtitles_unavailable_video_ids(
@@ -2126,6 +2135,28 @@ def extend_payload_unique_video_ids(
     payload[payload_key] = recorded_ids
 
 
+def extend_payload_video_error_messages(
+    payload: dict[str, Any],
+    payload_key: str,
+    error_messages: dict[str, str],
+) -> None:
+    normalized_messages = {
+        str(video_id or "").strip(): str(message or "").strip()
+        for video_id, message in error_messages.items()
+        if str(video_id or "").strip() and str(message or "").strip()
+    }
+    if not normalized_messages:
+        return
+    recorded_messages = {
+        str(video_id).strip(): str(message or "").strip()
+        for video_id, message in cast(dict[Any, Any], payload.get(payload_key) or {}).items()
+        if str(video_id).strip() and str(message or "").strip()
+    }
+    for video_id, message in normalized_messages.items():
+        recorded_messages[video_id] = message
+    payload[payload_key] = recorded_messages
+
+
 def collect_chunked_plan_output_hints(
     plan: ChunkedYtdlpStagePlan,
     output_text: str | None,
@@ -2144,6 +2175,64 @@ def collect_chunked_plan_output_hints(
     )
 
 
+def record_chunked_plan_transient_webpage_errors(
+    plan: ChunkedYtdlpStagePlan,
+    error_messages: dict[str, str],
+) -> None:
+    extend_payload_video_error_messages(
+        plan.payload,
+        "transient_webpage_error_messages",
+        error_messages,
+    )
+
+
+def evaluate_chunked_plan_transient_circuit_breaker(
+    plan: ChunkedYtdlpStagePlan,
+    chunk_pairs: list[tuple[str, str]],
+    final_transient_error_messages: dict[str, str],
+) -> None:
+    chunk_target_ids = [
+        str(video_id or "").strip()
+        for video_id, _url in chunk_pairs
+        if str(video_id or "").strip()
+    ]
+    if not chunk_target_ids:
+        return
+
+    transient_error_ids = {
+        str(video_id).strip()
+        for video_id in final_transient_error_messages
+        if str(video_id).strip()
+    }
+    all_targets_failed_transiently = all(
+        video_id in transient_error_ids
+        for video_id in chunk_target_ids
+    )
+    consecutive_failures = int(
+        plan.payload.get("consecutive_transient_failure_chunks", 0) or 0
+    )
+    if all_targets_failed_transiently:
+        consecutive_failures += 1
+    else:
+        consecutive_failures = 0
+    plan.payload["consecutive_transient_failure_chunks"] = consecutive_failures
+
+    if (
+        all_targets_failed_transiently
+        and consecutive_failures >= CHUNKED_STAGE_TRANSIENT_FAILURE_BREAKER_THRESHOLD
+        and plan.chunk_index + 1 < len(plan.url_chunks)
+    ):
+        plan.halt_reason = (
+            "circuit breaker: stop remaining chunks after consecutive all-target transient "
+            "TikTok webpage extractor failures"
+        )
+        print(
+            f"[{plan.stage}] {plan.source.id}: circuit breaker triggered "
+            f"after {consecutive_failures} consecutive transient-failure chunks; "
+            "stop remaining chunks"
+        )
+
+
 def run_interleaved_chunked_ytdlp_stage_plans(
     plans: list[ChunkedYtdlpStagePlan],
     dry_run: bool,
@@ -2156,7 +2245,11 @@ def run_interleaved_chunked_ytdlp_stage_plans(
     while True:
         progress_made = False
         for plan in active_plans:
-            if plan.error is not None or plan.chunk_index >= len(plan.url_chunks):
+            if (
+                plan.error is not None
+                or plan.halt_reason is not None
+                or plan.chunk_index >= len(plan.url_chunks)
+            ):
                 continue
             progress_made = True
             chunk_pairs = plan.url_chunks[plan.chunk_index]
@@ -2177,10 +2270,11 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                     dry_run=dry_run,
                 )
                 collect_chunked_plan_output_hints(plan, output_text, chunk_pairs)
-                transient_retry_ids = extract_tiktok_transient_retry_video_ids(
+                final_transient_error_messages = extract_tiktok_transient_retry_error_messages(
                     output_text,
                     [video_id for video_id, _url in chunk_pairs],
                 )
+                transient_retry_ids = list(final_transient_error_messages)
                 if transient_retry_ids:
                     original_error_ids = extract_tiktok_error_video_ids(
                         output_text,
@@ -2211,6 +2305,10 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                             retry_output_text,
                             retry_pairs,
                         )
+                        final_transient_error_messages = extract_tiktok_transient_retry_error_messages(
+                            retry_output_text,
+                            [video_id for video_id, _url in retry_pairs],
+                        )
                         if retry_exit_code == 0:
                             if plan.exit_code != 0 and original_error_ids.issubset(retry_id_set):
                                 plan.exit_code = 0
@@ -2224,6 +2322,16 @@ def run_interleaved_chunked_ytdlp_stage_plans(
                             )
                 if plan.exit_code != 0:
                     plan.error = summarize_command_failure(output_text, plan.exit_code)
+                record_chunked_plan_transient_webpage_errors(
+                    plan,
+                    final_transient_error_messages,
+                )
+                if plan.error is None:
+                    evaluate_chunked_plan_transient_circuit_breaker(
+                        plan,
+                        chunk_pairs,
+                        final_transient_error_messages,
+                    )
             except Exception as exc:
                 plan.exit_code = 1
                 plan.error = str(exc)
@@ -2625,6 +2733,27 @@ def upsert_stage_download_error_states(
     return blocked_error
 
 
+def get_payload_video_error_messages(
+    payload: dict[str, Any],
+    payload_key: str,
+) -> dict[str, str]:
+    return {
+        str(video_id).strip(): str(message or "").strip()
+        for video_id, message in cast(dict[Any, Any], payload.get(payload_key) or {}).items()
+        if str(video_id).strip() and str(message or "").strip()
+    }
+
+
+def format_tiktok_video_error_message(video_id: str, message: str) -> str:
+    normalized_video_id = str(video_id or "").strip()
+    normalized_message = str(message or "").strip()
+    if not normalized_video_id:
+        return normalized_message
+    if not normalized_message:
+        return f"ERROR: [TikTok] {normalized_video_id}"
+    return f"ERROR: [TikTok] {normalized_video_id}: {normalized_message}"
+
+
 def summarize_chunked_plan_stage_error(
     plan: ChunkedYtdlpStagePlan,
     *,
@@ -2634,8 +2763,14 @@ def summarize_chunked_plan_stage_error(
 ) -> str | None:
     if not failed_target_ids:
         return None
+    if plan.halt_reason:
+        return plan.halt_reason
     if plan.unresolved_target_ids and plan.error is None and plan.exit_code == 0:
         return unresolved_targets_message
+    if get_payload_video_error_messages(plan.payload, "transient_webpage_error_messages"):
+        if plan.error:
+            return plan.error
+        return TIKTOK_TRANSIENT_WEBPAGE_FAILURE_ERROR
     if plan.error:
         return plan.error
     if plan.exit_code != 0:
@@ -2721,6 +2856,10 @@ def finalize_subtitle_download_plan(
         )
         if str(video_id).strip()
     }
+    transient_webpage_error_messages = get_payload_video_error_messages(
+        plan.payload,
+        "transient_webpage_error_messages",
+    )
     if connection is not None:
         upsert_stage_download_success_states(
             connection=connection,
@@ -2744,6 +2883,11 @@ def finalize_subtitle_download_plan(
         def resolve_subtitle_failure_reason(video_id: str) -> str:
             if video_id in plan.unresolved_target_ids:
                 return "cannot build video URL for subtitle download target"
+            if video_id in transient_webpage_error_messages:
+                return format_tiktok_video_error_message(
+                    video_id,
+                    transient_webpage_error_messages[video_id],
+                )
             if video_id in requested_subtitles_unavailable_ids:
                 return REQUESTED_SUBTITLES_UNAVAILABLE_ERROR
             if plan.error:
@@ -2971,6 +3115,10 @@ def finalize_metadata_download_plan(
         plan,
         successful_ids=list_meta_ids(source.meta_dir),
     )
+    transient_webpage_error_messages = get_payload_video_error_messages(
+        plan.payload,
+        "transient_webpage_error_messages",
+    )
 
     if connection is not None:
         upsert_stage_download_success_states(
@@ -2986,6 +3134,11 @@ def finalize_metadata_download_plan(
         def resolve_metadata_failure_reason(video_id: str) -> str:
             if video_id in plan.unresolved_target_ids:
                 return "cannot build video URL for metadata download target"
+            if video_id in transient_webpage_error_messages:
+                return format_tiktok_video_error_message(
+                    video_id,
+                    transient_webpage_error_messages[video_id],
+                )
             if plan.error:
                 return plan.error
             if plan.exit_code != 0:
