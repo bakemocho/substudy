@@ -5665,6 +5665,21 @@ def create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
         );
 
+        CREATE TABLE IF NOT EXISTS playback_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id TEXT NOT NULL,
+            video_id TEXT NOT NULL,
+            impression_increment INTEGER NOT NULL DEFAULT 0,
+            play_increment INTEGER NOT NULL DEFAULT 0,
+            watch_seconds REAL NOT NULL DEFAULT 0,
+            completed_increment INTEGER NOT NULL DEFAULT 0,
+            fast_skip_increment INTEGER NOT NULL DEFAULT 0,
+            shallow_skip_increment INTEGER NOT NULL DEFAULT 0,
+            last_position_seconds REAL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (source_id, video_id) REFERENCES videos(source_id, video_id)
+        );
+
         CREATE TABLE IF NOT EXISTS workspace_source_daily_metrics (
             snapshot_date TEXT NOT NULL,
             source_id TEXT NOT NULL,
@@ -5734,6 +5749,10 @@ def create_schema(connection: sqlite3.Connection) -> None:
             ON video_not_interested(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_video_playback_stats_last_played
             ON video_playback_stats(last_played_at DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_playback_events_created
+            ON playback_events(created_at DESC, event_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_playback_events_video_time
+            ON playback_events(source_id, video_id, created_at DESC, event_id DESC);
         CREATE INDEX IF NOT EXISTS idx_workspace_source_daily_metrics_date
             ON workspace_source_daily_metrics(snapshot_date DESC, source_id);
 
@@ -17391,6 +17410,59 @@ def build_web_handler(
                 "last_position_seconds": safe_float(row["last_position_seconds"]),
             }
 
+        def _record_video_playback_event(
+            self,
+            connection: sqlite3.Connection,
+            source_id: str,
+            video_id: str,
+            impression_increment: int,
+            play_increment: int,
+            watch_seconds: float,
+            completed_increment: int,
+            fast_skip_increment: int,
+            shallow_skip_increment: int,
+            last_position_seconds: float | None,
+            created_at: str,
+        ) -> None:
+            if (
+                impression_increment <= 0
+                and play_increment <= 0
+                and watch_seconds <= 0
+                and completed_increment <= 0
+                and fast_skip_increment <= 0
+                and shallow_skip_increment <= 0
+                and last_position_seconds is None
+            ):
+                return
+            connection.execute(
+                """
+                INSERT INTO playback_events (
+                    source_id,
+                    video_id,
+                    impression_increment,
+                    play_increment,
+                    watch_seconds,
+                    completed_increment,
+                    fast_skip_increment,
+                    shallow_skip_increment,
+                    last_position_seconds,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    video_id,
+                    max(0, int(impression_increment)),
+                    max(0, int(play_increment)),
+                    max(0.0, float(watch_seconds)),
+                    max(0, int(completed_increment)),
+                    max(0, int(fast_skip_increment)),
+                    max(0, int(shallow_skip_increment)),
+                    None if last_position_seconds is None else max(0.0, float(last_position_seconds)),
+                    created_at,
+                ),
+            )
+
         def _record_video_playback_stats(
             self,
             connection: sqlite3.Connection,
@@ -17573,6 +17645,19 @@ def build_web_handler(
                     ),
                 )
 
+            self._record_video_playback_event(
+                connection=connection,
+                source_id=source_id,
+                video_id=video_id,
+                impression_increment=safe_impression_increment,
+                play_increment=safe_play_increment,
+                watch_seconds=safe_watch_seconds,
+                completed_increment=safe_completed_increment,
+                fast_skip_increment=safe_fast_skip_increment,
+                shallow_skip_increment=safe_shallow_skip_increment,
+                last_position_seconds=safe_last_position_seconds,
+                created_at=now_iso,
+            )
             return self._fetch_video_playback_stats(connection, source_id, video_id)
 
         def _toggle_video_preference_mark(

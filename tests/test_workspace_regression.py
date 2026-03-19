@@ -6433,6 +6433,47 @@ enabled = true
         self.assertTrue(stats["last_served_at"])
         self.assertTrue(stats["last_completed_at"])
 
+        connection = sqlite3.connect(str(self.db_path))
+        connection.row_factory = sqlite3.Row
+        try:
+            playback_events = connection.execute(
+                """
+                SELECT
+                    source_id,
+                    video_id,
+                    impression_increment,
+                    play_increment,
+                    watch_seconds,
+                    completed_increment,
+                    fast_skip_increment,
+                    shallow_skip_increment,
+                    last_position_seconds
+                FROM playback_events
+                WHERE source_id = ?
+                  AND video_id = ?
+                ORDER BY event_id ASC
+                """,
+                ("storiesofcz", "7622222222222222222"),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        self.assertEqual(len(playback_events), 2)
+        self.assertEqual(int(playback_events[0]["impression_increment"]), 1)
+        self.assertEqual(int(playback_events[0]["play_increment"]), 1)
+        self.assertAlmostEqual(float(playback_events[0]["watch_seconds"]), 12.5, places=3)
+        self.assertEqual(int(playback_events[0]["completed_increment"]), 0)
+        self.assertEqual(int(playback_events[0]["fast_skip_increment"]), 0)
+        self.assertEqual(int(playback_events[0]["shallow_skip_increment"]), 1)
+        self.assertAlmostEqual(float(playback_events[0]["last_position_seconds"]), 13.0, places=3)
+        self.assertEqual(int(playback_events[1]["impression_increment"]), 0)
+        self.assertEqual(int(playback_events[1]["play_increment"]), 0)
+        self.assertAlmostEqual(float(playback_events[1]["watch_seconds"]), 7.25, places=3)
+        self.assertEqual(int(playback_events[1]["completed_increment"]), 1)
+        self.assertEqual(int(playback_events[1]["fast_skip_increment"]), 1)
+        self.assertEqual(int(playback_events[1]["shallow_skip_increment"]), 0)
+        self.assertAlmostEqual(float(playback_events[1]["last_position_seconds"]), 61.0, places=3)
+
     def test_feed_translation_filter_supports_variants(self):
         now_iso = dt.datetime(2026, 3, 10, 0, 0, tzinfo=dt.timezone.utc).isoformat()
         upstream_video_id = "video-upstream"

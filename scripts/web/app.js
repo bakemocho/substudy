@@ -60,6 +60,7 @@ const RANKED_SESSION_AGE_WINDOW = 8;
 const RANKED_SESSION_CATALOG_TARGET = 2;
 const RANKED_SESSION_ARCHIVE_TARGET = 1;
 const RANKED_SOURCE_FATIGUE_WINDOW = 10;
+const RANKED_RECENT_VIDEO_COOLDOWN_WINDOW = 6;
 const TRANSLATION_FILTER_VALUES = new Set([
   "all",
   "ja_only",
@@ -1456,13 +1457,30 @@ function computeRecentTagPenalty(candidateSourceTags) {
   return -1.2 - ((overlapCount - 1) * 0.75);
 }
 
+function computeReplayPenaltyScale() {
+  if (state.videos.length >= 240) {
+    return 1.55;
+  }
+  if (state.videos.length >= 120) {
+    return 1.35;
+  }
+  if (state.videos.length >= 48) {
+    return 1.15;
+  }
+  return 1;
+}
+
 function computeRecentVideoPenalty(candidateIndex) {
   const recentIndices = state.playbackHistory.slice(-RECENT_HISTORY_LOOKBACK);
-  if (recentIndices.slice(-4).includes(candidateIndex)) {
-    return -6.0;
+  const penaltyScale = computeReplayPenaltyScale();
+  if (recentIndices.slice(-RANKED_RECENT_VIDEO_COOLDOWN_WINDOW).includes(candidateIndex)) {
+    return -9.5 * penaltyScale;
+  }
+  if (recentIndices.slice(-10).includes(candidateIndex)) {
+    return -5.4 * penaltyScale;
   }
   if (recentIndices.includes(candidateIndex)) {
-    return -2.5;
+    return -2.8 * penaltyScale;
   }
   return 0;
 }
@@ -1483,6 +1501,36 @@ function computeRecentPlaybackPenalty(stats) {
     return 0.75;
   }
   return 0.2;
+}
+
+function computeShortTermReplayCooldownPenalty(stats) {
+  const lastServedAtMs = parseIsoTimestampMs(stats?.last_served_at);
+  if (!Number.isFinite(lastServedAtMs)) {
+    return 0;
+  }
+  const ageHours = Math.max(0, (Date.now() - lastServedAtMs) / 3600000);
+  const impressionCount = Math.max(0, Number(stats?.impression_count) || 0);
+  const completedCount = Math.max(0, Number(stats?.completed_count) || 0);
+  let penalty = 0;
+  if (ageHours <= 0.5) {
+    penalty = 11.0;
+  } else if (ageHours <= 2) {
+    penalty = 7.5;
+  } else if (ageHours <= 6) {
+    penalty = 5.0;
+  } else if (ageHours <= 24) {
+    penalty = 2.2;
+  } else if (ageHours <= 72) {
+    penalty = 0.9;
+  }
+  if (penalty <= 0) {
+    return 0;
+  }
+  penalty += Math.min(
+    4.5,
+    (0.72 * Math.log1p(impressionCount)) + (0.55 * Math.log1p(completedCount))
+  );
+  return penalty * computeReplayPenaltyScale();
 }
 
 function summarizeRecentAgeBucketExposures(entries) {
@@ -1677,6 +1725,7 @@ function computeCandidateShuffleScore(index, rankingContext) {
     + computeRecentVideoPenalty(index)
     - repetitionPenalty
     - computeRecentPlaybackPenalty(stats)
+    - computeShortTermReplayCooldownPenalty(stats)
     - computeDirectReplayPenalty(video, stats, rankingContext.multipleSourceChoices)
     - favoriteExposurePenalty
     - softNegativePenalty
