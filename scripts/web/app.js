@@ -45,7 +45,7 @@ const SHALLOW_SKIP_RATIO = 0.2;
 const COMPLETE_WATCH_RATIO = 0.9;
 const RANKED_POOL_SIZE = 24;
 const RANKED_UNSEEN_POOL_SIZE = 18;
-const RANKED_UNSEEN_PICK_PROBABILITY = 0.82;
+const RANKED_UNSEEN_PICK_PROBABILITY = 0.74;
 const RECENT_HISTORY_LOOKBACK = 12;
 const RANKED_SOURCE_AFFINITY_PRIOR_WEIGHT = 3.5;
 const RANKED_TAG_AFFINITY_PRIOR_WEIGHT = 5.0;
@@ -56,6 +56,9 @@ const RANKED_SOURCE_TIMELINE_MAX_GAP_DAYS = 75;
 const RANKED_SESSION_NOVELTY_WINDOW = 6;
 const RANKED_SESSION_UNSEEN_TARGET = 2;
 const RANKED_SESSION_NEW_SOURCE_TARGET = 2;
+const RANKED_SESSION_AGE_WINDOW = 8;
+const RANKED_SESSION_CATALOG_TARGET = 2;
+const RANKED_SESSION_ARCHIVE_TARGET = 1;
 const RANKED_SOURCE_FATIGUE_WINDOW = 10;
 const TRANSLATION_FILTER_VALUES = new Set([
   "all",
@@ -924,6 +927,31 @@ function parseVideoUploadTimestamp(video) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function getVideoUploadAgeDays(video) {
+  const uploadedAtMs = parseVideoUploadTimestamp(video);
+  if (!Number.isFinite(uploadedAtMs)) {
+    return null;
+  }
+  return Math.max(0, (Date.now() - uploadedAtMs) / 86400000);
+}
+
+function classifyVideoAgeBucket(video) {
+  const ageDays = getVideoUploadAgeDays(video);
+  if (!Number.isFinite(ageDays)) {
+    return "unknown";
+  }
+  if (ageDays <= 14) {
+    return "fresh";
+  }
+  if (ageDays <= 60) {
+    return "recent";
+  }
+  if (ageDays <= 180) {
+    return "catalog";
+  }
+  return "archive";
+}
+
 function buildVideoSessionKey(video) {
   const sourceId = String(video?.source_id || "").trim();
   const videoId = String(video?.video_id || "").trim();
@@ -999,22 +1027,21 @@ function feedHasMultipleSourceChoices() {
 }
 
 function computeUploadRecencyBonus(video) {
-  const uploadedAtMs = parseVideoUploadTimestamp(video);
-  if (!Number.isFinite(uploadedAtMs)) {
+  const ageDays = getVideoUploadAgeDays(video);
+  if (!Number.isFinite(ageDays)) {
     return 0;
   }
-  const ageDays = Math.max(0, (Date.now() - uploadedAtMs) / 86400000);
   if (ageDays <= 3) {
-    return 2.3;
+    return 1.45;
   }
   if (ageDays <= 14) {
-    return 1.5;
+    return 0.85;
   }
   if (ageDays <= 45) {
-    return 0.9;
+    return 0.35;
   }
   if (ageDays <= 120) {
-    return 0.35;
+    return 0.1;
   }
   return 0;
 }
@@ -1046,6 +1073,7 @@ function computeVideoInterestValue(video) {
     return 0;
   }
   const stats = normalizePlaybackStats(video.playback_stats);
+  const completedCount = Math.max(0, Number(stats.completed_count) || 0);
   const cueBookmarkCount = Math.max(0, Number(video?.cue_bookmark_count) || 0);
   const dictionaryBookmarkCount = Math.max(0, Number(video?.dictionary_bookmark_count) || 0);
   const dictionaryUniqueTermCount = Math.max(
@@ -1092,7 +1120,10 @@ function computeVideoInterestValue(video) {
   if (video.is_not_interested) {
     score -= 4.2 * notInterestedDecay;
   }
-  score += stats.completed_count * 1.45 * completionDecay;
+  score += Math.log1p(completedCount) * 2.2 * completionDecay;
+  if (completedCount > 3) {
+    score -= Math.log1p(completedCount - 3) * 0.75 * completionDecay;
+  }
   score += watchRatio * 1.15 * activityDecay;
   score += Math.max(0, stats.play_count - 1) * 0.18 * activityDecay;
   score += Math.log1p(cueBookmarkCount) * 1.25 * activityDecay;
@@ -1454,6 +1485,72 @@ function computeRecentPlaybackPenalty(stats) {
   return 0.2;
 }
 
+function summarizeRecentAgeBucketExposures(entries) {
+  const counts = {
+    fresh: 0,
+    recent: 0,
+    catalog: 0,
+    archive: 0,
+    unknown: 0,
+  };
+  for (const entry of entries) {
+    const bucket = String(entry?.ageBucket || "").trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(counts, bucket)) {
+      counts[bucket] += 1;
+    } else {
+      counts.unknown += 1;
+    }
+  }
+  return counts;
+}
+
+function computeAgeDiversityQuotaBonus(video, stats) {
+  const ageBucket = classifyVideoAgeBucket(video);
+  const recentEntries = state.recommendationSessionEntries.slice(-RANKED_SESSION_AGE_WINDOW);
+  const counts = summarizeRecentAgeBucketExposures(recentEntries);
+  const recentishCount = counts.fresh + counts.recent;
+  if (ageBucket === "archive") {
+    const archiveDeficit = Math.max(0, RANKED_SESSION_ARCHIVE_TARGET - counts.archive);
+    let bonus = archiveDeficit > 0 ? 2.4 + (archiveDeficit * 0.85) : 0.6;
+    if (stats.impression_count === 0) {
+      bonus += 1.25;
+    } else if (stats.impression_count <= 1) {
+      bonus += 0.55;
+    }
+    if (recentishCount >= 3) {
+      bonus += 0.45 * Math.min(3, recentishCount - 2);
+    }
+    return bonus;
+  }
+  if (ageBucket === "catalog") {
+    const catalogSeenCount = counts.catalog + counts.archive;
+    const catalogDeficit = Math.max(0, RANKED_SESSION_CATALOG_TARGET - catalogSeenCount);
+    let bonus = catalogDeficit > 0 ? 1.45 + (catalogDeficit * 0.7) : 0.2;
+    if (stats.impression_count === 0) {
+      bonus += 0.8;
+    } else if (stats.impression_count <= 1) {
+      bonus += 0.35;
+    }
+    if (recentishCount >= 4) {
+      bonus += 0.25 * Math.min(3, recentishCount - 3);
+    }
+    return bonus;
+  }
+  if (ageBucket === "fresh") {
+    if (recentishCount >= 4) {
+      return -0.8 - (0.4 * Math.min(4, recentishCount - 3));
+    }
+    return 0;
+  }
+  if (ageBucket === "recent") {
+    if (recentishCount >= 5) {
+      return -0.35 - (0.25 * Math.min(4, recentishCount - 4));
+    }
+    return 0;
+  }
+  return stats.impression_count === 0 ? 0.25 : 0;
+}
+
 function computeSessionNoveltyQuotaBonus(video, stats, sourceId, multipleSourceChoices) {
   const recentEntries = state.recommendationSessionEntries.slice(-RANKED_SESSION_NOVELTY_WINDOW);
   const wasUnseenBeforeExposure = stats.impression_count === 0;
@@ -1496,8 +1593,9 @@ function computeDirectReplayPenalty(video, stats, multipleSourceChoices) {
     + (0.8 * Math.log1p(stats.play_count))
     + (0.45 * Math.log1p(stats.completed_count))
   );
+  const completionPenalty = 0.9 * Math.log1p(stats.completed_count);
   const favoritePenalty = video.is_favorite ? (0.95 * Math.log1p(stats.impression_count)) : 0;
-  return (multipleSourceChoices ? 1.3 : 0.85) * (basePenalty + favoritePenalty);
+  return (multipleSourceChoices ? 1.3 : 0.85) * (basePenalty + completionPenalty + favoritePenalty);
 }
 
 function buildRankingContext() {
@@ -1506,8 +1604,21 @@ function buildRankingContext() {
   return {
     ...affinityMaps,
     multipleSourceChoices: feedHasMultipleSourceChoices(),
+    timelineContext,
     neighborhoodBoost: buildNeighborhoodBoostMap(timelineContext),
   };
+}
+
+function computeSourceCatalogDepthBonus(index, rankingContext, stats) {
+  const position = rankingContext.timelineContext?.sourcePositionByIndex.get(index);
+  if (!Number.isInteger(position) || position < 2) {
+    return 0;
+  }
+  let bonus = Math.min(1.9, Math.log1p(position) * 0.55);
+  if (stats.impression_count > 0) {
+    bonus *= 0.55;
+  }
+  return bonus;
 }
 
 function computeCandidateShuffleScore(index, rankingContext) {
@@ -1540,6 +1651,8 @@ function computeCandidateShuffleScore(index, rankingContext) {
   const favoriteExposurePenalty = video.is_favorite ? 1.05 * Math.log1p(stats.impression_count) : 0;
   const softNegativePenalty = video.is_not_interested ? 2.0 : 0;
   const neighborhoodBoost = rankingContext.neighborhoodBoost.get(index) || 0;
+  const ageDiversityQuotaBonus = computeAgeDiversityQuotaBonus(video, stats);
+  const sourceCatalogDepthBonus = computeSourceCatalogDepthBonus(index, rankingContext, stats);
   const noveltyQuotaBonus = computeSessionNoveltyQuotaBonus(
     video,
     stats,
@@ -1554,6 +1667,8 @@ function computeCandidateShuffleScore(index, rankingContext) {
     + unseenBonus
     + allSourcesNoveltyBonus
     + noveltyQuotaBonus
+    + ageDiversityQuotaBonus
+    + sourceCatalogDepthBonus
     + translationBonus
     + watchRatio * 0.4
     + computeRecentSourcePenalty(sourceId)
@@ -1631,10 +1746,10 @@ function computeRankedShuffleIndex() {
   const recentUnseenCount = recentEntries.filter((entry) => entry?.wasUnseenBeforeExposure).length;
   const unseenDeficit = Math.max(0, RANKED_SESSION_UNSEEN_TARGET - recentUnseenCount);
   const unseenPickProbability = unseenDeficit >= 2
-    ? 0.97
+    ? 0.84
     : unseenDeficit === 1
-      ? 0.9
-      : Math.max(0.45, RANKED_UNSEEN_PICK_PROBABILITY - 0.2);
+      ? 0.72
+      : Math.max(0.32, RANKED_UNSEEN_PICK_PROBABILITY - 0.16);
   if (unseenCandidates.length && Math.random() < unseenPickProbability) {
     return chooseWeightedRankedIndex(unseenCandidates.slice(0, RANKED_UNSEEN_POOL_SIZE));
   }
@@ -1678,6 +1793,7 @@ function recordRecommendationExposure(index) {
   state.recommendationSessionEntries.push({
     videoKey,
     sourceId,
+    ageBucket: classifyVideoAgeBucket(video),
     wasUnseenBeforeExposure,
     wasNewSourceBeforeExposure: Boolean(sourceId) && previousSourceExposureCount <= 0,
     viewedAtMs: Date.now(),
